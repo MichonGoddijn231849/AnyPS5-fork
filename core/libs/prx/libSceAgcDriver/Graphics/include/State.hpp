@@ -47,6 +47,7 @@ struct ColorTarget {
     std::uint32_t mip = 0;
     bool mipTail = false;
     std::array<std::uint32_t, 2> clearWords{};
+    std::uint32_t slot = 0;
 };
 
 struct DepthTarget {
@@ -67,7 +68,11 @@ struct State {
     bool stencilTest = false;
     VkStencilOpState stencilFront{};
     VkStencilOpState stencilBack{};
-    // MRT slot 0; `colors`/`blends` hold every written slot, attachment i being slot i.
+    // The first written MRT slot. `colors` holds the written slots in slot order, attachment i being
+    // colors[i] (its ColorTarget::slot names the color reference). `blends` holds one state per color
+    // reference, slots 0 up to the highest written one, indexed by slot: a slot between written
+    // slots that is not written (CB_TARGET_MASK gap) has a VK_ATTACHMENT_UNUSED reference and a
+    // disabled blend writing nothing. Without gaps both have one entry per slot, attachment i being slot i.
     ColorTarget color;
     std::vector<ColorTarget> colors;
     std::vector<VkPipelineColorBlendAttachmentState> blends;

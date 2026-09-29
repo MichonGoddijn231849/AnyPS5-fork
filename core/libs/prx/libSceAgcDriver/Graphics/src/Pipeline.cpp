@@ -45,8 +45,9 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
     // A cached pipeline may outlive its device's teardown (see ClearCachedPipelines); it must not keep
     // the buffer pool, which is reset with the device, alive past it.
     this->context.bufferPool.reset();
-    Require(state.blends.size() == state.colors.size(), "blend states do not match decoded color state");
-    Require(state.colors.size() <= context.limits.maxColorAttachments, "color targets exceed device attachment limits");
+    // One blend state per color reference (State::blends): slots 0 up to the highest written one.
+    Require(state.blends.size() == (state.colors.empty() ? 0u : state.colors.back().slot + 1u) && state.colors.size() <= state.blends.size(), "blend states do not match decoded color state");
+    Require(state.blends.size() <= context.limits.maxColorAttachments, "color targets exceed device attachment limits");
     Require(state.hasColorTarget || (context.limits.framebufferNoAttachmentsSampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0, "device does not support single-sample rendering without attachments");
     Require(!state.negativeOneToOne || context.depthClipControl, "negative-one-to-one depth clipping requires VK_EXT_depth_clip_control with depthClipControl enabled");
     if (state.rectList) Require(context.tessellationShader && context.limits.maxTessellationPatchSize >= 4, "rect-list requires tessellation with four output control points");
@@ -88,7 +89,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;
         Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout graphics");
         std::vector<VkAttachmentDescription> colors;
-        std::vector<VkAttachmentReference> references;
+        // The reference at a slot no target is written through (a CB_TARGET_MASK gap) is unused.
+        std::vector<VkAttachmentReference> references(state.blends.size(), VkAttachmentReference{VK_ATTACHMENT_UNUSED, attachmentLayout});
         for (std::uint32_t index = 0; index < state.colors.size(); ++index) {
             VkAttachmentDescription color{};
             color.format = state.colors[index].format;
@@ -100,7 +102,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             color.initialLayout = attachmentLayout;
             color.finalLayout = attachmentLayout;
             colors.push_back(color);
-            references.push_back({index, attachmentLayout});
+            references.at(state.colors[index].slot) = {index, attachmentLayout};
         }
         VkSubpassDescription subpass{};
         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
@@ -341,6 +343,10 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
     for (const auto value : state.blendConstants) append(key, value);
     append(key, state.colors.size());
     for (const auto& color : state.colors) append(key, color.format);
+    // Which references the attachments fill, when a gap leaves some unused.
+    if (state.blends.size() != state.colors.size()) {
+        for (const auto& color : state.colors) append(key, color.slot);
+    }
     append(key, state.depth.has_value());
     if (state.depth) {
         append(key, state.depth->format);

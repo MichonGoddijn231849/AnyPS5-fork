@@ -21,6 +21,7 @@
 #include <limits>
 #include <list>
 #include <map>
+#include <tuple>
 #include <optional>
 #include <set>
 #include <string>
@@ -522,7 +523,7 @@ bool IsNullTextureDescriptor(std::span<const std::uint32_t> words) {
 // device's cached textures, ClearCachedTextures).
 struct NullTextures {
     std::mutex mutex;
-    std::map<std::pair<VkDevice, int>, std::shared_ptr<Texture>> textures;
+    std::map<std::tuple<VkDevice, int, std::uint32_t>, std::shared_ptr<Texture>> textures;
 };
 NullTextures& NullTextureCache() {
     static NullTextures cache;
@@ -534,10 +535,16 @@ NullTextures& NullTextureCache() {
 // zeros through such a T# (as through an unbound one). Demon's Souls' menus bind such descriptors in
 // dozens of dispatches per frame; the rejection's throw made exception unwinding about half of the
 // graphics queue's time.
-std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::DescriptorImageShape shape) {
+// The descriptor's DST_SEL (word 3, 3 bits per channel) still applies: a constant-one selector reads 1,
+// every other selector reads the zero texel.
+std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::DescriptorImageShape shape, std::span<const std::uint32_t> words) {
+    const auto swizzle = words.size() > 3 ? words[3] & 0xfffu : 0u;
+    const auto select = [&](std::uint32_t channel) { return ((swizzle >> (3u * channel)) & 7u) == 1u ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO; };
+    const VkComponentMapping mapping{select(0), select(1), select(2), select(3)};
+    const auto ones = static_cast<std::uint32_t>(mapping.r == VK_COMPONENT_SWIZZLE_ONE) | static_cast<std::uint32_t>(mapping.g == VK_COMPONENT_SWIZZLE_ONE) << 1u | static_cast<std::uint32_t>(mapping.b == VK_COMPONENT_SWIZZLE_ONE) << 2u | static_cast<std::uint32_t>(mapping.a == VK_COMPONENT_SWIZZLE_ONE) << 3u;
     auto& cache = NullTextureCache();
     std::lock_guard lock(cache.mutex);
-    auto& texture = cache.textures[{context.device, static_cast<int>(shape)}];
+    auto& texture = cache.textures[{context.device, static_cast<int>(shape), ones}];
     if (texture == nullptr) {
         GuestTextureResource resource{};
         resource.width = 1;
@@ -557,7 +564,7 @@ std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::D
         resource.dstSelZ = 6;
         resource.dstSelW = 7;
         const std::vector<std::byte> zeros(static_cast<std::size_t>(DescribeSurface(resource).guestBytes));
-        texture = std::make_shared<Texture>(context, *context.detiler, resource, VkComponentMapping{}, zeros);
+        texture = std::make_shared<Texture>(context, *context.detiler, resource, mapping, zeros);
     }
     return texture;
 }
@@ -641,7 +648,7 @@ void ClearCachedTextures(VkDevice device) {
         auto& zeros = NullTextureCache();
         std::lock_guard lock(zeros.mutex);
         for (auto it = zeros.textures.begin(); it != zeros.textures.end();) {
-            if (it->first.first == device) it = zeros.textures.erase(it);
+            if (std::get<0>(it->first) == device) it = zeros.textures.erase(it);
             else ++it;
         }
     }
@@ -1677,7 +1684,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
                         if (IsNullTextureDescriptor(words) && binding.imageShape.has_value()) {
-                            if (textureIndex >= textures.size() || nullTexture(context, *binding.imageShape) != textures[textureIndex]) return false;
+                            if (textureIndex >= textures.size() || nullTexture(context, *binding.imageShape, words) != textures[textureIndex]) return false;
                             ++textureIndex;
                             continue;
                         }
@@ -2510,7 +2517,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
             const auto* record = nextRecord();
             if (IsNullTextureDescriptor(words) && binding.imageShape.has_value()) {
-                textures.push_back(nullTexture(context, *binding.imageShape));
+                textures.push_back(nullTexture(context, *binding.imageShape, words));
                 textureFirstLayer.push_back(false);
                 describedRanges.push_back({"texture", 0, 0, 1, 1, 56, 0, 0});
                 item.imageAllocations.push_back(textures.size() - 1);
