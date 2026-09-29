@@ -184,6 +184,9 @@ public:
     std::size_t InFlightBatches() const { return inFlight.size(); }
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
     static std::uint64_t ReapsWithWork();
+    // Waits, without GuestMemory::GpuMutex, until the kept objects of finished batches handed to
+    // the release thread are destroyed, or `timeout` passed; whether they were.
+    static bool WaitForReleases(std::chrono::milliseconds timeout);
 
     // A store of `bytes` into a host import (a label, or a COPY_DATA/DMA_DATA/DUMP_CONST_RAM store
     // of up to 64 KiB; `address` is its guest address) recorded into the open batch: ordered

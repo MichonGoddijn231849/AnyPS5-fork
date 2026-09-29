@@ -6,6 +6,19 @@
 
 namespace AgcDriver::Graphics {
 
+// Live Vulkan memory the driver holds, by kind: counted at every allocation (bytes > 0) and free
+// (bytes < 0). APS5_TRACE_GPU_MEMORY=1 reports it every 10 s; allocation failures report it too.
+enum class GpuMemoryKind : std::uint8_t { HostBuffer, DeviceBuffer, HostImport, Texture, StorageImage, DepthSurface, RenderTarget, ShadowSlab, Count };
+void CountGpuMemory(GpuMemoryKind kind, std::int64_t bytes);
+std::uint64_t LiveGpuMemory();
+// vkAllocateMemory for a driver object of `kind`: out of memory first empties the buffer pool and
+// retries; a failure is reported (the first ones and every 100th: the request, its memory type and
+// heap, the live memory by kind) and counts in OutOfMemoryFailures. The result is the caller's.
+VkResult AllocateGpuMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory& memory, GpuMemoryKind kind, const char* what);
+// Out-of-memory allocation failures on this thread so far: a caller that sees the count move
+// across a failed operation may relieve memory (RelieveGpuMemory) and try once more.
+std::uint64_t OutOfMemoryFailures();
+
 class Buffer {
 public:
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -88,6 +101,7 @@ private:
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize allocationBytes = 0;
 };
 
 class CommandBatch {

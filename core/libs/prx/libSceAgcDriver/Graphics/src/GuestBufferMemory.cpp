@@ -1,7 +1,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -124,6 +126,16 @@ struct HostImports {
     std::uint64_t epoch = 1;
     VkDevice watchDevice = VK_NULL_HANDLE;
     bool unwatchImports = false;
+    // Lookup counter stamped into HostImport::lastUse; the floor of the build whose UploadFinish
+    // runs (imports stamped since are never evicted); the largest import (bounds findImport's walk).
+    std::uint64_t useCounter = 0;
+    std::uint64_t buildFloor = 0;
+    std::uint64_t maxBytes = 0;
+    std::uint64_t liveBytes = 0;
+    // Imports that ran out of memory are retried once the lookup counter passes this value.
+    std::map<std::uint64_t, std::uint64_t> retryAfter;
+    // The budget RelieveGpuMemory lowered, 0 while none was.
+    std::atomic<std::uint64_t> limit{0};
 };
 
 HostImports& Imports() {
@@ -137,6 +149,7 @@ void destroyImport(const Context& context, const HostImport& entry) {
 #ifdef _WIN32
     GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
+    CountGpuMemory(GpuMemoryKind::HostImport, -static_cast<std::int64_t>(entry.bytes));
 }
 
 // Frees a dropped import's Vulkan objects when it is released. Never copied: a copy would destroy the
@@ -163,6 +176,7 @@ void retireImport(const Context& context, HostImports& state, std::map<std::uint
     auto holder = std::make_shared<RetiredImport>(context, it->second);
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
     ++state.epoch;
+    state.liveBytes -= it->second.bytes;
     state.imports.erase(it);
 }
 
@@ -248,22 +262,74 @@ void decideImportWatch(const Context& context, HostImports& state) {
 #endif
 }
 
+// Imports looked up since the build in progress began may be pointed at by it.
+bool pointerHeld(const HostImports& state, const HostImport& entry) {
+    return entry.lastUse >= state.buildFloor;
+}
+
+// Eviction also spares the imports of the last few hundred lookups: the working set.
+bool evictable(const HostImports& state, const HostImport& entry) {
+    constexpr std::uint64_t protectedUses = 256;
+    return !pointerHeld(state, entry) && entry.lastUse + protectedUses < state.useCounter;
+}
+
+// Retires the least recently used evictable imports until `wanted` bytes went (a dropped import is
+// retired behind the recorded work that may still read it); returns the bytes retired.
+std::uint64_t retireLeastRecent(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, std::uint64_t wanted) {
+    std::uint64_t freed = 0;
+    while (freed < wanted) {
+        auto oldest = state.imports.end();
+        for (auto it = state.imports.begin(); it != state.imports.end(); ++it) {
+            if (evictable(state, it->second) && (oldest == state.imports.end() || it->second.lastUse < oldest->second.lastUse)) oldest = it;
+        }
+        if (oldest == state.imports.end()) break;
+        freed += oldest->second.bytes;
+        retireImport(context, state, oldest, lease);
+    }
+    return freed;
+}
+
+// Pinned imports and host-visible buffers share the system memory heap (Windows' shared GPU memory,
+// half the RAM); past it ordinary host allocations fail. Imports get that heap less 2 GiB for
+// buffers, staging and mirrors (6 GiB on a 16 GiB machine, 14 GiB on a 32 GiB one), or
+// APS5_HOST_IMPORT_MIB; RelieveGpuMemory may lower it.
+std::uint64_t configuredBudget(const Context& context) {
+    static const std::uint64_t budget = [&context] {
+        if (const char* value = std::getenv("APS5_HOST_IMPORT_MIB")) return std::strtoull(value, nullptr, 10) << 20u;
+        VkDeviceSize systemHeap = 0;
+        for (std::uint32_t index = 0; index < context.memory.memoryHeapCount; ++index) {
+            if ((context.memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) systemHeap = std::max(systemHeap, context.memory.memoryHeaps[index].size);
+        }
+        constexpr std::uint64_t reserve = 2048ull << 20u;
+        const std::uint64_t derived = systemHeap > reserve * 2 ? systemHeap - reserve : 6144ull << 20u;
+        std::fprintf(stderr, "[gpu] host import budget %llu MiB (system memory heap %llu MiB; APS5_HOST_IMPORT_MIB overrides)\n", static_cast<unsigned long long>(derived >> 20u), static_cast<unsigned long long>(systemHeap >> 20u));
+        return derived;
+    }();
+    return budget;
+}
+
+std::uint64_t importBudget(const Context& context, const HostImports& state) {
+    const auto limit = state.limit.load(std::memory_order_relaxed);
+    return limit != 0 ? std::min(configuredBudget(context), limit) : configuredBudget(context);
+}
+
+const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end, bool* unique = nullptr);
+
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t base, std::uint64_t bytes, const GuestAllocations::Lease& lease) {
+    if (const auto* covering = findImport(state, base, base + bytes)) return covering;
     if (const auto found = state.imports.find(base); found != state.imports.end()) {
-        if (found->second.bytes == bytes) return &found->second;
+        if (pointerHeld(state, found->second)) return nullptr;
         retireImport(context, state, found, lease);
     }
     const auto alignment = context.hostImportAlignment;
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
-    // Pinned imports count against the driver's system memory budget; past it ordinary host
-    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
-    // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
-    static const std::uint64_t budget = [] {
-        const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
-        return (value ? std::strtoull(value, nullptr, 10) : 6144ull) << 20u;
-    }();
-    std::uint64_t live = 0;
-    for (const auto& [address, existing] : state.imports) live += existing.bytes;
+    if (const auto retry = state.retryAfter.find(base); retry != state.retryAfter.end()) {
+        if (state.useCounter < retry->second) return nullptr;
+        state.retryAfter.erase(retry);
+    }
+    const auto budget = importBudget(context, state);
+    if (state.liveBytes + bytes > budget) retireLeastRecent(context, state, lease, state.liveBytes + bytes - budget);
+    const auto live = state.liveBytes;
     if (live + bytes > budget) {
         // A refused import turns every later use of the range into CPU copies, so say so.
         static std::uint64_t refused = 0, refusedBytes = 0;
@@ -277,6 +343,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         return nullptr;
     }
     HostImport entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+    bool imageMemory = false;
 #ifdef _WIN32
     // Drivers pin imported pages, so every page must be committed and accessible.
     bool writable = true;
@@ -294,6 +361,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         if (!pageReadOnly) readOnly = false;
         if (info.Type != MEM_MAPPED && !pageWritable && !pageReadOnly && refused.BaseAddress == nullptr) refused = info;
         if (!pageWritable) writable = false;
+        if (info.Type == MEM_IMAGE) imageMemory = true;
         cursor = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
     }
     if (!writable && readOnly) {
@@ -314,10 +382,37 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     entry.unwatched = state.unwatchImports;
     VkResult result = VK_SUCCESS;
     const char* step = nullptr;
-    GuestMemory::ImportWatched(base, bytes, [&] {
-        step = createImport(context, entry, result);
-        return step == nullptr;
-    });
+    const auto create = [&] {
+        GuestMemory::ImportWatched(base, bytes, [&] {
+            step = createImport(context, entry, result);
+            return step == nullptr;
+        });
+    };
+    create();
+    const bool outOfMemory = step != nullptr && std::strcmp(step, "vkAllocateMemory") == 0 && (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY);
+    // Executable image pages never import (the driver reports that as out of memory too): they fail
+    // for good, as any other failure.
+    if (outOfMemory && !imageMemory) {
+        // Out of pinnable memory is temporary: a large import makes room for one retry with the
+        // pool's idle buffers and least recently used imports; any failure is retried later. Small
+        // ones only wait: evicting for them thrashes large imports.
+        constexpr std::uint64_t evictForBytes = 16ull << 20u;
+        std::uint64_t freed = 0;
+        if (bytes >= evictForBytes) {
+            if (context.bufferPool != nullptr) freed += context.bufferPool->Trim();
+            freed += retireLeastRecent(context, state, lease, bytes);
+        }
+        if (freed != 0) create();
+        if (step != nullptr) {
+#ifdef _WIN32
+            GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
+#endif
+            state.retryAfter[base] = state.useCounter + 4096;
+            static std::uint64_t deferred = 0;
+            if (++deferred <= 20 || deferred % 100 == 0) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx out of memory (%d) after freeing %llu MiB; retried later (%llu deferred so far)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<int>(result), static_cast<unsigned long long>(freed >> 20u), static_cast<unsigned long long>(deferred));
+            return nullptr;
+        }
+    }
     if (step != nullptr) {
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
@@ -336,19 +431,21 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #endif
         return nullptr;
     }
+    CountGpuMemory(GpuMemoryKind::HostImport, static_cast<std::int64_t>(bytes));
+    // Imports this one covers pin the same pages twice: they go unless their pointers are held.
+    for (auto it = state.imports.lower_bound(base); it != state.imports.end() && it->first < base + bytes;) {
+        const auto next = std::next(it);
+        if (it->second.base + it->second.bytes <= base + bytes && !pointerHeld(state, it->second)) retireImport(context, state, it, lease);
+        it = next;
+    }
     static std::uint64_t importedBytes = 0;
     importedBytes += bytes;
+    state.liveBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
-    std::uint64_t liveBytes = bytes;
-    for (const auto& [address, existing] : state.imports) liveBytes += existing.bytes;
-    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, liveBytes / 1048576.0, importedBytes / 1048576.0);
+    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0);
+    entry.lastUse = ++state.useCounter;
+    state.maxBytes = std::max(state.maxBytes, bytes);
     return &state.imports.emplace(base, entry).first->second;
-}
-
-// The lease is in address order (it is built from the registry map), so a range is found by binary search.
-const GuestAllocations::Range* leasedRangeAt(const GuestAllocations::Lease& lease, std::uint64_t base) {
-    const auto found = std::lower_bound(lease.begin(), lease.end(), base, [](const auto& range, std::uint64_t value) { return range->address < value; });
-    return found != lease.end() && (*found)->address == base ? found->get() : nullptr;
 }
 
 // The readable registered range containing [begin, end), or null.
@@ -363,11 +460,17 @@ const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& le
 // guest addresses. Walks the imports only when the registry changed since the last walk.
 void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
     if (state.device != context.device) {
+        for (const auto& [address, entry] : state.imports) {
 #ifdef _WIN32
-        for (const auto& [address, entry] : state.imports) GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
+            GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
+            CountGpuMemory(GpuMemoryKind::HostImport, -static_cast<std::int64_t>(entry.bytes));
+        }
         state.imports.clear();
         state.failed.clear();
+        state.retryAfter.clear();
+        state.liveBytes = 0;
+        state.maxBytes = 0;
         state.device = context.device;
         state.refreshedGeneration = 0;
         ++state.epoch;
@@ -376,8 +479,8 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     if (generation == state.refreshedGeneration) return;
     state.refreshedGeneration = generation;
     for (auto it = state.imports.begin(); it != state.imports.end();) {
-        const auto* range = leasedRangeAt(lease, it->first);
-        if (range != nullptr && range->bytes == it->second.bytes) {
+        // A window or whole-allocation import stays while a registered range still contains it.
+        if (containingRange(lease, it->first, it->first + it->second.bytes) != nullptr) {
             if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
             ++it;
             continue;
@@ -386,15 +489,52 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         retireImport(context, state, it, lease);
         it = next;
     }
-    for (auto it = state.failed.begin(); it != state.failed.end();) it = leasedRangeAt(lease, *it) != nullptr ? std::next(it) : state.failed.erase(it);
+    for (auto it = state.failed.begin(); it != state.failed.end();) it = containingRange(lease, *it, *it + 1) != nullptr ? std::next(it) : state.failed.erase(it);
+    for (auto it = state.retryAfter.begin(); it != state.retryAfter.end();) it = containingRange(lease, it->first, it->first + 1) != nullptr ? std::next(it) : state.retryAfter.erase(it);
 }
 
-const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end) {
-    auto found = state.imports.upper_bound(begin);
-    if (found == state.imports.begin()) return nullptr;
-    --found;
-    const auto& entry = found->second;
-    return begin >= entry.base && end <= entry.base + entry.bytes ? &entry : nullptr;
+// Imports may overlap (windows of one allocation beside a whole-allocation import), so every import
+// starting at most the largest import's size below `begin` is a candidate; the nearest covering one
+// serves. `unique`, when given, says whether no other import covers the range as well.
+const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end, bool* unique) {
+    const HostImport* result = nullptr;
+    if (unique != nullptr) *unique = true;
+    for (auto found = state.imports.upper_bound(begin); found != state.imports.begin();) {
+        --found;
+        const auto& entry = found->second;
+        if (begin - entry.base > state.maxBytes) break;
+        if (end > entry.base + entry.bytes) continue;
+        if (result != nullptr) {
+            *unique = false;
+            break;
+        }
+        result = &entry;
+        entry.lastUse = ++state.useCounter;
+        if (unique == nullptr) break;
+    }
+    return result;
+}
+
+// The import serving [begin, end) inside registered `range`: an aligned window of
+// APS5_HOST_IMPORT_WINDOW_MIB (default 64) around it rather than the whole allocation, so pinned
+// memory follows what the GPU uses; 0 imports whole allocations. Address-based builds import whole
+// allocations (AcquireRegistered).
+const HostImport* importWindow(const Context& context, HostImports& state, const GuestAllocations::Range& range, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
+    static const std::uint64_t window = [] {
+        const char* value = std::getenv("APS5_HOST_IMPORT_WINDOW_MIB");
+        return (value ? std::strtoull(value, nullptr, 10) : 64ull) << 20u;
+    }();
+    if (const auto* covering = findImport(state, begin, end)) return covering;
+    const auto alignment = context.hostImportAlignment;
+    if (window == 0 || alignment == 0 || window % alignment != 0 || range.bytes <= window) return importAllocation(context, state, range.address, range.bytes, lease);
+    const auto rangeEnd = range.address + range.bytes;
+    const auto windowBegin = std::max(range.address, begin - (begin - range.address) % window);
+    auto windowEnd = std::min(rangeEnd, windowBegin + ((end - windowBegin + window - 1) / window) * window);
+    // Imports need aligned bases and sizes: an unaligned allocation end is rounded up within it, or
+    // the whole allocation is imported when that is not possible.
+    windowEnd = std::min(rangeEnd, windowEnd + (alignment - windowEnd % alignment) % alignment);
+    if (windowBegin % alignment != 0 || (windowEnd - windowBegin) % alignment != 0) return importAllocation(context, state, range.address, range.bytes, lease);
+    return importAllocation(context, state, windowBegin, windowEnd - windowBegin, lease);
 }
 
 // Whether the imports need reconciling before a lookup: the registry changed since the last walk.
@@ -1107,8 +1247,44 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    if (const auto* range = containingRange(lease, address, address + bytes)) return importAllocation(context, state, range->address, range->bytes, lease);
+    if (const auto* range = containingRange(lease, address, address + bytes)) return importWindow(context, state, *range, address, address + bytes, lease);
     return nullptr;
+}
+
+std::uint64_t HostImportLimit() {
+    return Imports().limit.load(std::memory_order_relaxed);
+}
+
+std::uint64_t RelieveGpuMemory(const Context& context) {
+    if (GuestMemory::GpuMutex().HeldByThisThread()) return 0;
+    const auto before = LiveGpuMemory();
+    {
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        auto* recorder = Recorder::Active();
+        if (recorder != nullptr) recorder->Sync();
+        // Cached builds pin their buffers and textures past the caches' budgets; they are rebuilt.
+        SharedResourceCache().Clear();
+        if (context.hostImportAlignment != 0) {
+            auto& state = Imports();
+            std::lock_guard lock(state.mutex);
+            if (state.device == context.device && !state.imports.empty()) {
+                const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+                refreshImports(context, state, lease);
+                // No build holds import pointers under the device lock now.
+                state.buildFloor = state.useCounter + 1;
+                retireLeastRecent(context, state, lease, std::max<std::uint64_t>(state.liveBytes / 4, 256ull << 20u));
+                // Imports grow back to what the heap held no longer: the budget follows (copies of
+                // what they no longer serve cost more than the imports, so not below half of it).
+                const auto limit = std::max(state.liveBytes, configuredBudget(context) / 2);
+                if (limit < importBudget(context, state)) state.limit.store(limit, std::memory_order_relaxed);
+            }
+        }
+        if (recorder != nullptr) recorder->Sync();
+        if (context.bufferPool != nullptr) context.bufferPool->Trim();
+    }
+    Recorder::WaitForReleases(std::chrono::milliseconds(2000));
+    const auto after = LiveGpuMemory();
+    return before > after ? before - after : 0;
 }
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
@@ -1195,6 +1371,13 @@ void GuestBufferMemory::AcquireRegistered() {
             else if (current->generation != generation) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
             else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
             else hit = true;
+            importFloor = state.useCounter + 1;
+            if (hit) {
+                const auto stamp = ++state.useCounter;
+                for (const auto& region : current->base) {
+                    if (region.direct != nullptr) region.direct->lastUse = stamp;
+                }
+            }
         }
         if (hit) {
             spaces.hits.fetch_add(1, std::memory_order_relaxed);
@@ -1224,6 +1407,8 @@ void GuestBufferMemory::AcquireRegistered() {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
             if (importable) refreshImports(context, state, lease);
+            if (importFloor == 0) importFloor = state.useCounter + 1;
+            state.buildFloor = importFloor;
             // Taken before the pass: the imports it takes are the registry's ones (just reconciled, so
             // none is retired by a make below), and a mirror's preparation may sync the recorder, whose
             // completions can retire an import already taken; that moves the epoch, and Upload then
@@ -1801,6 +1986,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
     if (context.hostImportAlignment != 0) {
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
+        if (importFloor == 0) importFloor = state.useCounter + 1;
         const bool stale = importsStale(context, state);
         for (auto& region : regions) {
             if (region.mirror != nullptr) continue;
@@ -1873,6 +2059,11 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     uploaded = true;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
+    if (context.hostImportAlignment != 0) {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        state.buildFloor = importFloor != 0 ? importFloor : state.useCounter + 1;
+    }
     // Registered ranges to import from. Address-based shaders hold their lease until write-back;
     // descriptor-only uploads acquire one only when the registry changed or an import must be made
     // (a lease copies every registered range's shared_ptr under the registry lock), so the guest can
@@ -1953,7 +2144,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             if (entry == nullptr) {
-                if (const auto* range = containingRange(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, range->address, range->bytes, importRanges());
+                if (const auto* range = containingRange(importRanges(), region.begin, region.end)) entry = importWindow(context, state, *range, region.begin, region.end, importRanges());
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
@@ -2549,11 +2740,11 @@ std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, st
     // An import whose registered range changed must not be reused: reconcile first, as an upload
     // does (the walk only runs when the registry changed since the last one).
     if (reconcile && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) static_cast<void>(refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix()));
-    auto found = state.imports.upper_bound(address);
-    if (found == state.imports.begin()) return 0;
-    --found;
-    auto& entry = found->second;
-    if (address < entry.base || address + bytes > entry.base + entry.bytes) return 0;
+    // A range two imports cover has no one identity: the build may have bound either.
+    bool unique = true;
+    const auto* found = findImport(state, address, address + bytes, &unique);
+    if (found == nullptr || !unique) return 0;
+    auto& entry = state.imports.at(found->base);
     // Serials are handed out on first use: a fresh import starts at 0, so one made after an earlier
     // import of the same range was dropped can never repeat that import's serial.
     static std::uint64_t serials = 0;

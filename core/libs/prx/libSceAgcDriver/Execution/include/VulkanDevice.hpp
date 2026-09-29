@@ -42,6 +42,9 @@ public:
     // resize, device replacement, CPU fill fallback and APS5_DRAIN_ALL; the packet-loop drains use the
     // three-step form below so the GPU wait happens without the mutex.
     void WaitIdle();
+    // Out of device memory: finishes recorded work and frees idle imports and pooled buffers
+    // (Graphics::RelieveGpuMemory); the caller does not hold GpuMutex. Returns the bytes freed.
+    std::uint64_t RelieveMemory();
     void PrepareForReplacement();
     // Sends recorded work to the GPU without waiting for it. With `reapFirst` it first retires batches
     // that already finished, so the in-flight list stays short (APS5_NO_OPPORTUNISTIC_REAP=1 skips
