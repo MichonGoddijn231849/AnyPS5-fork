@@ -8,6 +8,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -83,11 +84,16 @@ public:
             if (rangeStart < start) _used.emplace(rangeStart, start);
             if (rangeEnd > end) _used.emplace(end, rangeEnd);
         }
+        for (const auto& [holeStart, holeEnd] : _holes) {
+            if (holeStart < end && start < holeEnd) _used.emplace(holeStart, holeEnd);
+        }
     }
 
 private:
     Arena() {
 #ifdef _WIN32
+        _writeWatched = std::getenv("APS5_NO_WRITE_WATCH") == nullptr;
+        if (reserveAround(PreferredBase, PreferredBase + MaximumSize)) return;
         // Windows places other reservations randomly, so take the lowest base and largest size that fit.
         for (std::uintptr_t base = PreferredBase; base + MinimumSize <= MapAreaEnd; base += MinimumSize) {
             for (std::size_t size = MaximumSize; size >= MinimumSize; size /= 2) {
@@ -105,8 +111,49 @@ private:
 #endif
     }
 
+#ifdef _WIN32
+    bool reserveAround(std::uintptr_t base, std::uintptr_t end) {
+        SYSTEM_INFO system{};
+        GetSystemInfo(&system);
+        const std::uintptr_t granularity = system.dwAllocationGranularity;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> pieces;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> holes;
+        std::size_t reservedBytes = 0;
+        for (std::uintptr_t cursor = base; cursor < end;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) {
+                holes.emplace_back(cursor, end);
+                break;
+            }
+            const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize);
+            const auto first = alignUp(cursor, granularity);
+            const auto last = regionEnd & ~(granularity - 1);
+            if (info.State == MEM_FREE && first < last && WindowsMappings::Get().Reserve(reinterpret_cast<void*>(first), last - first) != nullptr) {
+                pieces.emplace_back(first, last);
+                reservedBytes += last - first;
+                if (cursor < first) holes.emplace_back(cursor, first);
+                if (last < regionEnd) holes.emplace_back(last, regionEnd);
+            } else {
+                holes.emplace_back(cursor, regionEnd);
+            }
+            cursor = regionEnd;
+        }
+        if (reservedBytes < MinimumSize) {
+            for (const auto& [pieceStart, pieceEnd] : pieces) VirtualFree(reinterpret_cast<void*>(pieceStart), 0, MEM_RELEASE);
+            return false;
+        }
+        if (base < SystemReservedEnd && SystemReservedStart < end) holes.emplace_back(std::max(base, SystemReservedStart), std::min(end, SystemReservedEnd));
+        _base = base;
+        _end = end;
+        _holes = std::move(holes);
+        for (const auto& [holeStart, holeEnd] : _holes) _used.emplace(holeStart, holeEnd);
+        return true;
+    }
+#endif
+
     std::mutex _lock;
     std::map<std::uintptr_t, std::uintptr_t> _used;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> _holes;
     std::uintptr_t _base = 0;
     std::uintptr_t _end = 0;
     bool _writeWatched = false;
