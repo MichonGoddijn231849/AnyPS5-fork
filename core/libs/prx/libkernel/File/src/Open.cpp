@@ -7,9 +7,12 @@
 #include "SceTypes.hpp"
 
 #include <cerrno>
+#include <cstddef>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -25,7 +28,13 @@ static int NativeRead(int fd, void* buf, std::size_t n) {
     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
         throw std::runtime_error("sceKernelRead: nbytes exceeds platform limit");
     }
-    return ::_read(fd, buf, static_cast<unsigned int>(n));
+    const auto start = ::_lseeki64(fd, 0, SEEK_CUR);
+    const int done = ::_read(fd, buf, static_cast<unsigned int>(n));
+    if (done >= 0 || errno != EINVAL || start < 0 || ::_lseeki64(fd, start, SEEK_SET) != start) return done;
+    std::vector<std::byte> staging(n);
+    const int staged = ::_read(fd, staging.data(), static_cast<unsigned int>(n));
+    if (staged > 0) std::memcpy(buf, staging.data(), static_cast<std::size_t>(staged));
+    return staged;
 }
 static int NativeWrite(int fd, const void* buf, std::size_t n) {
     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {

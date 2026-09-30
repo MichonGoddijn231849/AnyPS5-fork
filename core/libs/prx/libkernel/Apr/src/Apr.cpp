@@ -6,6 +6,7 @@
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -128,7 +129,17 @@ void _readFile(const Apr::ReadFileCommand& command) {
     std::ifstream stream(file.path, std::ios::binary);
     if (!stream) throw std::runtime_error("APR: cannot open " + file.path.string());
     stream.seekg(static_cast<std::streamoff>(command.offset));
-    stream.read(reinterpret_cast<char*>(command.destination), static_cast<std::streamsize>(command.size));
+    constexpr std::uint64_t STAGING_BYTES = 4ull << 20;
+    thread_local std::vector<char> staging;
+    auto* destination = reinterpret_cast<char*>(command.destination);
+    for (std::uint64_t done = 0; done < command.size && stream;) {
+        const auto chunk = std::min(command.size - done, STAGING_BYTES);
+        if (staging.size() < chunk) staging.resize(chunk);
+        stream.read(staging.data(), static_cast<std::streamsize>(chunk));
+        const auto got = static_cast<std::uint64_t>(stream.gcount());
+        std::memcpy(destination + done, staging.data(), got);
+        done += got;
+    }
     if (stream.bad()) throw std::runtime_error("APR: read failed for " + file.path.string());
 }
 
