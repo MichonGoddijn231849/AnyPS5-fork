@@ -294,7 +294,7 @@ std::uint64_t retireLeastRecent(const Context& context, HostImports& state, cons
 // buffers, staging and mirrors (6 GiB on a 16 GiB machine, 14 GiB on a 32 GiB one), or
 // APS5_HOST_IMPORT_MIB; RelieveGpuMemory may lower it.
 std::uint64_t configuredBudget(const Context& context) {
-    static const std::uint64_t budget = [&context] {
+    static const std::uint64_t budget = [&context]() -> std::uint64_t {
         if (const char* value = std::getenv("APS5_HOST_IMPORT_MIB")) return std::strtoull(value, nullptr, 10) << 20u;
         VkDeviceSize systemHeap = 0;
         for (std::uint32_t index = 0; index < context.memory.memoryHeapCount; ++index) {
