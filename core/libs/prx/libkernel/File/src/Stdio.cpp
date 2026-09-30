@@ -11,6 +11,7 @@
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include <cerrno>
 #include <cstring>
+#include <vector>
 #include <cstdarg>
 #include <filesystem>
 #include <stdexcept>
@@ -53,6 +54,7 @@ static int NativeFlock(int descriptor, int operation) {
     if (operation & 4) flags |= LOCKFILE_FAIL_IMMEDIATELY;
     return ::LockFileEx(handle, flags, 0, MAXDWORD, MAXDWORD, &overlapped) ? 0 : -1;
 }
+static thread_local DWORD g_lastPositionedError = 0;
 static std::int64_t NativePositioned(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write) {
     if (nbytes > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
         throw std::runtime_error("NativePositioned: nbytes exceeds platform limit");
@@ -69,7 +71,21 @@ static std::int64_t NativePositioned(int descriptor, void* buf, std::size_t nbyt
     const BOOL ok = write ? ::WriteFile(handle, buf, static_cast<DWORD>(nbytes), &done, &overlapped)
                           : ::ReadFile(handle, buf, static_cast<DWORD>(nbytes), &done, &overlapped);
     if (!ok) {
-        if (!write && ::GetLastError() == ERROR_HANDLE_EOF) return 0;
+        const auto error = ::GetLastError();
+        if (!write && error == ERROR_HANDLE_EOF) return 0;
+        if (!write && (error == ERROR_NOACCESS || error == ERROR_INVALID_USER_BUFFER)) {
+            std::vector<std::byte> staging(nbytes);
+            overlapped = OVERLAPPED{};
+            overlapped.Offset = static_cast<DWORD>(offset);
+            overlapped.OffsetHigh = static_cast<DWORD>(static_cast<std::uint64_t>(offset) >> 32u);
+            done = 0;
+            if (::ReadFile(handle, staging.data(), static_cast<DWORD>(nbytes), &done, &overlapped)) {
+                std::memcpy(buf, staging.data(), done);
+                return done;
+            }
+            if (::GetLastError() == ERROR_HANDLE_EOF) return 0;
+        }
+        g_lastPositionedError = error;
         errno = EIO;
         return -1;
     }
@@ -243,7 +259,11 @@ int64_t APS5_VABI pread_nid_postfix(int d, void* buf, size_t nbytes, int64_t off
     }
     auto n = NativePread(d, buf, nbytes, offset);
     if (n < 0) {
-        throw std::runtime_error(std::string(__func__) + ": pread failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
+        throw std::runtime_error(std::string(__func__) + ": pread failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno)
+#ifdef _WIN32
+            + ", Windows error " + std::to_string(g_lastPositionedError)
+#endif
+        );
     }
     return n;
 }
