@@ -105,7 +105,6 @@ int APS5_VABI sceNpEntitlementAccessDeleteRequest(void) {
  return 0;
 }
 
-// Consumable entitlements live on the PSN server, which is unreachable: no transaction ever starts.
 int APS5_VABI sceNpEntitlementAccessGenerateTransactionId(void* transaction_id) {
  if (!transaction_id) return SCE_NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
  return SCE_NP_ERROR_SIGNED_OUT;

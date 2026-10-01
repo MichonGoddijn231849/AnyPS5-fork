@@ -5,8 +5,6 @@
 
 extern "C" {
 
-// Neither Initialize nor Open is imported: no invitation dialog is ever opened, so status is
-// always "none" and there is nothing for Terminate to tear down.
 int APS5_VABI scePlayerInvitationDialogTerminate(void) {
  return 0;
 }

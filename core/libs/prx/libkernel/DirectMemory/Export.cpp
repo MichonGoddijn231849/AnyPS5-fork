@@ -281,7 +281,6 @@ int APS5_VABI sceKernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
  return 0;
 }
 
-// The memory type (cache policy) has no host equivalent: only the protection changes.
 int APS5_VABI sceKernelMtypeprotect(const void* addr, size_t len, int type, int prot) {
  (void)type;
  return DoMprotect(addr, len, prot);

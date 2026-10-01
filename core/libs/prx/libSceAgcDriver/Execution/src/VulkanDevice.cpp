@@ -808,7 +808,6 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     if (enabled.shaderImageGatherExtended) state->capabilities.push_back(spv::CapabilityImageGatherExtended);
     enabled.shaderResourceMinLod = available.shaderResourceMinLod;
     if (enabled.shaderResourceMinLod) state->capabilities.push_back(spv::CapabilityMinLod);
-    // Pixel shaders reading the packed ancillary VGPR use gl_SampleID and gl_Layer.
     enabled.sampleRateShading = available.sampleRateShading;
     enabled.geometryShader = available.geometryShader;
     if (enabled.geometryShader) state->capabilities.push_back(spv::CapabilityGeometry);

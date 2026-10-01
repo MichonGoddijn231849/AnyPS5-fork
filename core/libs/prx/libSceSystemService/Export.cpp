@@ -110,8 +110,6 @@ int APS5_VABI sceSystemServiceSetNoticeScreenSkipFlag(void) {
  return SYSTEM_SERVICE_OK;
 }
 
-// The player profile is a PSN page, so the dialog has nothing to show and closes at once.
-// The param layout is not known; it is left as the title filled it.
 int APS5_VABI sceSystemServiceInitializePlayerDialogParam(void* param) {
  if (param == nullptr) return SYSTEM_SERVICE_ERROR_PARAMETER;
  return SYSTEM_SERVICE_OK;

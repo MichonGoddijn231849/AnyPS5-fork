@@ -66,20 +66,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
-    // The failure memo's key (0: this draw's failure is not kept) and the out-of-memory count
-    // a failure must not have moved.
     std::uint64_t failureKey = 0;
     const auto memoryFailures = Graphics::OutOfMemoryFailures();
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
-    // A data-only hit's entry (see drawShapes): the newest entry of this draw's shape.
     std::shared_ptr<DrawEntry> dataEntry;
     std::uint64_t shapeKey = 0;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey);
-        // A kept failure of this key and these parameters whose memory is unchanged: rejected
-        // with its message (see DrawFailure).
         if (FailureMemo() && !drawParameters.indirect) {
             failureKey = drawFailureKey(drawKey, drawParameters);
             if (drawFailureCount.load(std::memory_order_relaxed) != 0) {
@@ -106,8 +101,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 else if (traceShapes.contains(shapeKey)) ++counters.absentUserWords;
                 else ++counters.absentNewRegisters;
             }
-            // The CPU path of an indirect draw patches user words after the decode: it takes
-            // the full path.
             if (drawDataHits() && !drawParameters.indirect) {
                 if (const auto shape = drawShapes.find(shapeKey); shape != drawShapes.end()) {
                     const auto kept = drawCache.find(shape->second);
@@ -231,18 +224,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<std::shared_ptr<DispatchVariant>> fresh(programs.size());
 
     std::vector<bool> recompiled(programs.size(), false);
-    // A data-only hit's stage candidates (see drawShapes): per stage whose user words equal
-    // the shape entry's, that entry's variants validated equal over their runs (one per push
-    // offset, rank order) with their regions; `reused` the stages one of them serves (their
-    // matched variant then, as a hit's).
     std::vector<std::vector<std::pair<std::shared_ptr<DispatchVariant>, std::vector<ShaderRecompiler::MemoryRegion>>>> dataCandidates(programs.size());
     std::vector<bool> reused(programs.size(), false);
     std::uint64_t dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
     bool drawHit = false;
     bool verifyHit = false;
-    // A throw from here on stashes what the draw read (the failure memo, see DrawFailure):
-    // this stage's partial capture, the finished captures, the matched variants' runs and the
-    // vertex decodes' reads. A draw that restarted leaves it to the restarted call.
     bool restarted = false;
     const UnwindAction stashFailure{[&] {
         if (failureKey == 0 || restarted) return;
@@ -267,8 +253,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (matched[i]->vertexInfo != nullptr) vertexInfos[i] = *matched[i]->vertexInfo;
                 continue;
             }
-            // A data-only hit's candidate stage: the candidates' info (their runs hold the
-            // decode's reads); decoded after all when no candidate serves the stage.
             if (!dataCandidates[i].empty() && !verifyDrawDataHits()) {
                 const auto& info = dataCandidates[i].front().first->vertexInfo;
                 if (info != nullptr) vertexInfos[i] = *info;

@@ -20,8 +20,6 @@ extern "C" {
 
 int SceMsgDialogNativeModuleLoaded_nid_no_patch = 1;
 
-// SceMsgDialogResult starts with mode/result/buttonId; matches the non-native libSceMsgDialog's
-// auto-answer (the affirmative button), so a title never blocks waiting on a message box.
 int APS5_VABI sceMsgDialogGetResult(MsgDialogResult* result) {
  const int status = g_status.load();
  if (status == 0) return COMMON_DIALOG_ERROR_NOT_INITIALIZED;
@@ -39,7 +37,6 @@ int APS5_VABI sceMsgDialogInitialize(void) {
     return 0;
 }
 
-// No message box is drawn: the dialog finishes at once with the affirmative button.
 int APS5_VABI sceMsgDialogOpen(const void* param) {
  const int status = g_status.load();
  if (status == 0) return COMMON_DIALOG_ERROR_NOT_INITIALIZED;

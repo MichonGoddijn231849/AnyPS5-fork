@@ -69,7 +69,6 @@ int APS5_VABI sceNpCommerceHidePsStoreIcon(void) {
  return 0;
 }
 
-// The PS Store icon is a system overlay; there is none to show.
 int APS5_VABI sceNpCommerceShowPsStoreIcon(int pos) {
  (void)pos;
  return 0;

@@ -5,7 +5,6 @@
 
 extern "C" {
 
-// Initialize/Open are not imported: no selection dialog is ever opened, nothing to tear down.
 int APS5_VABI scePlayerSelectionDialogTerminate(void) {
  return 0;
 }

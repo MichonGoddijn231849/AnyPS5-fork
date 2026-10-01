@@ -30,7 +30,6 @@ struct HostImport {
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
     bool unwatched = false;
-    // When it was last found or made (a counter under the import lock), for eviction.
     mutable std::uint64_t lastUse = 0;
 };
 
@@ -48,10 +47,6 @@ ImportProbe ProbeImportWriteProtection(const Context& context);
 ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);
 
-// Out-of-memory relief, called without GuestMemory::GpuMutex: finishes the recorded work, drops the
-// resource cache, retires least recently used imports and lowers the import budget to what is left
-// (not below half of it), empties the buffer pool and waits for the release thread; returns the
-// live bytes that went. HostImportLimit is the lowered budget (0: none).
 std::uint64_t RelieveGpuMemory(const Context& context);
 std::uint64_t HostImportLimit();
 
@@ -351,8 +346,6 @@ private:
     // Import registry epoch when `direct` pointers were taken at acquire time; they are reused while
     // no import was destroyed since.
     std::uint64_t importsEpoch = 0;
-    // The import lookup counter when this build first looked imports up: imports used since are
-    // never evicted while its UploadFinish holds their pointers.
     std::uint64_t importFloor = 0;
     std::vector<Region> regions;
     // Whether `regions` is in ascending address order (true right after AcquireRegistered, whose

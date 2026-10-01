@@ -451,7 +451,6 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
         add(state.rectList);
         add(state.topology);
         add(state.cullMode);
-        // The color reference count bounds the fragment output locations (ValidateShaders).
         add(state.blends.size());
         add(context.subgroup.subgroupSize);
         add(context.subgroup.supportedStages);
@@ -1196,8 +1195,6 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passKey *= 1099511628211ull;
     };
     for (const auto view : record.targetViews) mix(reinterpret_cast<std::uint64_t>(view));
-    // With a CB_TARGET_MASK gap the same views can fill other color references, whose render
-    // passes are not compatible.
     if (state.blends.size() != state.colors.size()) {
         mix(state.blends.size());
         for (const auto& color : state.colors) mix(color.slot);

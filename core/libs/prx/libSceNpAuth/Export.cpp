@@ -4,8 +4,6 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
-// PSN is not emulated: no authorization code is ever issued. A blocking call fails at once; an
-// async request is accepted and PollAsync reports signed-out, mirroring libSceNpManager.
 static constexpr int SCE_NP_ERROR_INVALID_ARGUMENT = static_cast<int>(0x80550003);
 static constexpr int SCE_NP_ERROR_SIGNED_OUT = static_cast<int>(0x80550006);
 static constexpr int NP_POLL_ASYNC_FINISHED = 0;

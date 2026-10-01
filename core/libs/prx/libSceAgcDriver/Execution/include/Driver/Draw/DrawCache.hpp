@@ -23,9 +23,6 @@ struct DrawProgram {
 
     std::shared_ptr<const ShaderSnapshot> snapshot;
     std::size_t codeOffset = 0;
-    // Where the user words came from, so a data-only hit (see drawShapes) reads them again as
-    // the prepare did: the bank's RSRC2 register, and for a merged program its eight hidden
-    // words and whether they start with the user pointer at `mergedPointer`.
     std::uint32_t resourceRegister = 0;
     bool merged = false;
     bool mergedPointerRequired = false;

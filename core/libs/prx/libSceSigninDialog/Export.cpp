@@ -37,7 +37,6 @@ int APS5_VABI sceSigninDialogGetStatus(void) {
  return 0;
 }
 
-// PSN is unreachable, so the sign-in prompt finishes at once as cancelled by the user.
 int APS5_VABI sceSigninDialogInitialize(void) {
  int expected = COMMON_DIALOG_STATUS_NONE;
  if (!g_status.compare_exchange_strong(expected, COMMON_DIALOG_STATUS_INITIALIZED)) return COMMON_DIALOG_ERROR_ALREADY_INITIALIZED;

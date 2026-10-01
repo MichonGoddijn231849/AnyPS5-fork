@@ -34,8 +34,6 @@ ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::u
     recompiled[i] = true;
     memory = shaderMemory.Regions();
 
-    // A data-only hit's reused stages ahead of this one are in the union likewise (a miss
-    // compiles every stage in order: none ahead of it is left unrecompiled).
     for (std::size_t j = 0; j < programs.size(); ++j) {
         if (matched[j] != nullptr && !recompiled[j] && (drawHit || j < i)) memory.insert(memory.end(), matchedRegions[j].begin(), matchedRegions[j].end());
     }
@@ -106,7 +104,6 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 std::memcpy(variant->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
             }
             if (traceDrawCache() && entry != nullptr && matched[i] == nullptr && i < entry->stages.size()) {
-                // The front variant compiled at this push offset, which the fresh one differs from.
                 const auto& variants = entry->stages[i];
                 const auto front = std::find_if(variants.begin(), variants.end(), [&](const std::shared_ptr<DispatchVariant>& kept) { return kept->pushOffset == variant->pushOffset; });
                 if (front != variants.end() && (*front)->runs == variant->runs && (*front)->words.size() == variant->words.size()) {

@@ -72,7 +72,6 @@ constexpr std::uint32_t ScreenOffsetMask = ~0x01ff01ffu;
 // Bits 26/27 (ZCLIP_NEAR/FAR_DISABLE) become depth clamping; bit 19 selects the [0, 1] clip space.
 constexpr std::uint32_t ClipControlMask = ~(0x80000u | 0x0c000000u);
 
-// 32-bit SPI_SHADER_Z_FORMATs carry Z in the first component; 32_ABGR carries the sample mask in the third.
 bool zFormatSupported(std::uint32_t format) {
     return format == 0u || format == 1u || format == 2u || format == 3u || format == 9u;
 }
@@ -487,8 +486,6 @@ State DecodeState(const QueueState& queue) {
     // matters where the shader exports.
     const auto targetMask = read(cx, 0x8e) & shaderMask;
     APS5_LOG_OUT_DEBUG("CB_TARGET_MASK=0x%x CB_SHADER_MASK=0x%x", targetMask, shaderMask);
-    // MRT slots 0..n-1 up to the highest written slot are the subpass's color references; a slot
-    // between written slots that is not written is a gap without an attachment (ColorTarget::slot).
     std::uint32_t slotCount = 0;
     for (std::uint32_t slot = 0; slot < 8; ++slot) {
         if (((targetMask >> (4u * slot)) & 0xfu) != 0) slotCount = slot + 1;
@@ -554,7 +551,6 @@ State DecodeState(const QueueState& queue) {
     intersect(result.scissor, cx, 0x90, false);
     if ((read(cx, 0x292) & 2u) != 0) intersect(result.scissor, cx, 0x94, false);
     APS5_LOG_OUT_DEBUG("Scissor offset=(%d,%d) extent=%ux%u", result.scissor.offset.x, result.scissor.offset.y, result.scissor.extent.width, result.scissor.extent.height);
-    // One blend state per color reference: a gap's is disabled with nothing written.
     result.blends.assign(slotCount, VkPipelineColorBlendAttachmentState{});
     for (const auto& color : result.colors) {
         const auto slot = color.slot;

@@ -512,15 +512,10 @@ std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextu
     return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
 }
 
-// Whether the descriptor has a zero base address, which DecodeTextureResource rejects (the 40-bit
-// base in words 0 and 1 bits 0..7, as it decodes it). Checked first where such descriptors are
-// expected, as the throw costs far more than the check.
 bool IsNullTextureDescriptor(std::span<const std::uint32_t> words) {
     return words.size() == 8 && words[0] == 0 && (words[1] & 0xffu) == 0;
 }
 
-// The zero textures of null sampled descriptors, one per device and image shape (dropped with the
-// device's cached textures, ClearCachedTextures).
 struct NullTextures {
     std::mutex mutex;
     std::map<std::tuple<VkDevice, int, std::uint32_t>, std::shared_ptr<Texture>> textures;
@@ -530,13 +525,6 @@ NullTextures& NullTextureCache() {
     return cache;
 }
 
-// A sampled texture whose descriptor has no memory is bound as a 1x1 zero texture of the shader's
-// image shape instead of skipping the draw or dispatch. Inferred, not documented: the hardware reads
-// zeros through such a T# (as through an unbound one). Demon's Souls' menus bind such descriptors in
-// dozens of dispatches per frame; the rejection's throw made exception unwinding about half of the
-// graphics queue's time.
-// The descriptor's DST_SEL (word 3, 3 bits per channel) still applies: a constant-one selector reads 1,
-// every other selector reads the zero texel.
 std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::DescriptorImageShape shape, std::span<const std::uint32_t> words) {
     const auto swizzle = words.size() > 3 ? words[3] & 0xfffu : 0u;
     const auto select = [&](std::uint32_t channel) { return ((swizzle >> (3u * channel)) & 7u) == 1u ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO; };
@@ -551,7 +539,7 @@ std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::D
         resource.height = 1;
         resource.mipCount = 1;
         resource.tileMode = TextureTileMode::kLinear;
-        resource.format = 56;  // 8_8_8_8 UNORM
+        resource.format = 56;
         switch (shape) {
             case ShaderRecompiler::DescriptorImageShape::Image1D: resource.dimension = TextureDimension::k1D; break;
             case ShaderRecompiler::DescriptorImageShape::Image2D: resource.dimension = TextureDimension::k2D; break;
@@ -2420,7 +2408,6 @@ bool ShaderResources::precollectImages() {
             ImageRecord record;
             record.sampled = binding.kind == ShaderRecompiler::DescriptorKind::SampledImage;
             if (IsNullTextureDescriptor(words)) {
-                // Nothing to collect: a sampled one binds the zero texture, a storage one is rejected in stage B.
                 record.decoded = false;
                 imageRecords.push_back(std::move(record));
                 continue;
@@ -2592,7 +2579,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
         for (const auto& range : describedRanges) {
             if (std::strcmp(range.kind, "texture") == 0 && textureIndex < textures.size()) {
                 const auto& texture = textures[textureIndex++];
-                if (range.bytes == 0) continue;  // the zero texture of a null descriptor
+                if (range.bytes == 0) continue;
                 if (texture->ViewsStorageImage()) consider(range.format, range.address, range.bytes, false);
                 else consider(range.format, range.address, range.bytes, true);
             }

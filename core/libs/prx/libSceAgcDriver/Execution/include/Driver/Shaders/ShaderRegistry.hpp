@@ -26,8 +26,6 @@ struct HandleMemos {
     std::atomic<std::uint32_t> poisoned{0};
 };
 
-// Runs `action` when the scope is left by an exception (the draw's failure memo stashes what the
-// draw had read while its locals still live); an exception of the action itself is dropped.
 template<typename Action>
 struct UnwindAction {
     Action action;

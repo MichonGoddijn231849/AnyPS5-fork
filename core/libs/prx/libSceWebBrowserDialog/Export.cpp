@@ -42,12 +42,10 @@ int APS5_VABI sceWebBrowserDialogGetResult(void* result) {
  if (status == COMMON_DIALOG_STATUS_NONE) return COMMON_DIALOG_ERROR_NOT_INITIALIZED;
  if (result == nullptr) return COMMON_DIALOG_ERROR_ARG_NULL;
  if (status != COMMON_DIALOG_STATUS_FINISHED) return COMMON_DIALOG_ERROR_NOT_FINISHED;
- // SceWebBrowserDialogResult starts with the int32 common-dialog result; the rest is reserved.
  *static_cast<std::int32_t*>(result) = COMMON_DIALOG_RESULT_USER_CANCELED;
  return 0;
 }
 
-// No browser exists: every open finishes at once as cancelled by the user.
 int APS5_VABI sceWebBrowserDialogOpen(const void* param) {
  const int status = g_status.load();
  if (status == COMMON_DIALOG_STATUS_NONE) return COMMON_DIALOG_ERROR_NOT_INITIALIZED;

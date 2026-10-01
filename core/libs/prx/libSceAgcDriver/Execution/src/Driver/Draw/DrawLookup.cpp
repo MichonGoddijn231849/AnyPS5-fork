@@ -173,9 +173,6 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 counters.validateUs += phaseMs[DrawRowKeyLookupValidate] * 1000;
             }
         } else if (dataEntry != nullptr && graphics.stages.path == Graphics::ShaderPath::Vertex && dataEntry->stages.size() == programs.size() && dataEntry->decode->programs.size() == programs.size()) {
-            // Only the vertex path: its two programs' requests carry nothing of each other's
-            // user words (a merged program's linked stages share its bank). The front stage
-            // runs at push offset 0.
             std::uint64_t imagesFlushed = 0, runsSynced = 0;
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
             std::optional<SampledReadScope> sampling;

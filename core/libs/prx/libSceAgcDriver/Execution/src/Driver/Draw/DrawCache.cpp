@@ -82,9 +82,6 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         if (found->second->decode != nullptr) replacement->decode = found->second->decode;
         replacement->recipes.store(found->second->recipes.load());
     }
-    // A new key of a shape that already has an entry (user words differ each frame) takes over
-    // that entry's variants and replaces it, so a shape keeps one entry instead of filling the
-    // cache with keys that never repeat.
     auto superseded = drawCache.end();
     if (found == drawCache.end() && shape != 0) {
         if (const auto previous = drawShapes.find(shape); previous != drawShapes.end() && previous->second != key) {
@@ -121,7 +118,6 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         drawCache.erase(superseded);
         ++counters.superseded;
     }
-    // The newest entry of its shape serves the shape's data-only hits (a decoded one only).
     if (replacement->decode != nullptr && shape != 0) drawShapes[shape] = key;
     if (found == drawCache.end()) {
         drawOrder.push_front(key);
