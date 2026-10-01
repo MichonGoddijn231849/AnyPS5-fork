@@ -218,6 +218,14 @@ void ShaderStageTests() {
         Require(pass.path == AgcDriver::Graphics::ShaderPath::Geometry && pass.mesh && pass.mesh->passthrough && pass.mesh->verticesPerGroup == 63 && pass.mesh->primitivesPerGroup == 21, "passthrough subgroup assembly changed");
         Require(pass.vertexWaveSize == ((routing & 0x00400000u) ? 32u : 64u), "passthrough wave size changed");
     }
+    for (const auto primitive : {5u, 7u, 17u}) {
+        queue.userConfig[0x242] = primitive;
+        queue.context[0x2d5] = 0x02002000u;
+        const auto state = AgcDriver::Graphics::DecodeState(queue);
+        Require(state.stages.path == AgcDriver::Graphics::ShaderPath::Vertex && !state.stages.mesh, "passthrough routing of a topology the mesh path does not assemble left the vertex path");
+        Require(state.rectList == (primitive != 5u), "passthrough rect list was not drawn as a rect list");
+    }
+    queue.userConfig[0x242] = 4;
     queue.context[0x2d5] = 0x2020;
     queue.context[0x2ce] = 3;
     queue.context[0x29b] = 2;

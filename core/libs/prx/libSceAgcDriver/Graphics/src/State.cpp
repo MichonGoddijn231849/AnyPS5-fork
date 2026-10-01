@@ -341,9 +341,10 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
     validate((value & 3u) != 3u && ((value >> 3u) & 3u) != 3u && ((value >> 6u) & 3u) != 3u, "reserved LS_EN, ES_EN or VS_EN encoding");
     const auto primitive = read(queue.userConfig, 0x242, RegisterBank::UserConfig);
     const bool tessellation = primitive == 9;
-    const bool passthrough = (value & 0x02000000u) != 0;
+    const bool passthroughRouting = (value & 0x02000000u) != 0;
+    validate(!passthroughRouting || (value & 0x2000u) != 0, "passthrough routing without PRIMGEN_EN is unsupported");
+    const bool passthrough = passthroughRouting && (primitive == 4 || primitive == 6);
     const bool geometry = (value & 0x20u) != 0 || passthrough;
-    validate(!passthrough || (value & 0x2000u) != 0, "passthrough routing without PRIMGEN_EN is unsupported");
     validate(tessellation == ((value & 4u) != 0), "Patch topology and HS_EN disagree");
     validate(!tessellation || !geometry, "combined tessellation and geometry is unsupported by the reference path");
     const auto path = tessellation ? ShaderPath::Tessellation : geometry ? ShaderPath::Geometry : ShaderPath::Vertex;
