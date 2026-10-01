@@ -3,33 +3,40 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
+// The bandwidth test needs PSN: without it the account is signed out, so no test starts and
+// no context exists to query, abort or shut down.
+static constexpr int SCE_NP_ERROR_INVALID_ARGUMENT = static_cast<int>(0x80550003);
+static constexpr int SCE_NP_ERROR_SIGNED_OUT = static_cast<int>(0x80550006);
+
 extern "C" {
 
 int SceNpUtilityModuleLoaded_nid_no_patch = 1;
 
-int APS5_VABI sceNpBandwidthTestAbort(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+int APS5_VABI sceNpBandwidthTestAbort(int context_id) {
+    (void)context_id;
+    return SCE_NP_ERROR_INVALID_ARGUMENT;
 }
 
-int APS5_VABI sceNpBandwidthTestGetStatus(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+int APS5_VABI sceNpBandwidthTestGetStatus(int context_id, int* status) {
+    (void)context_id;
+    if (status) *status = 0;
+    return SCE_NP_ERROR_INVALID_ARGUMENT;
 }
 
-int APS5_VABI sceNpBandwidthTestInitStartDownload(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+int APS5_VABI sceNpBandwidthTestInitStartDownload(const void* param) {
+    (void)param;
+    return SCE_NP_ERROR_SIGNED_OUT;
 }
 
-int APS5_VABI sceNpBandwidthTestInitStartUpload(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+int APS5_VABI sceNpBandwidthTestInitStartUpload(const void* param) {
+    (void)param;
+    return SCE_NP_ERROR_SIGNED_OUT;
 }
 
-int APS5_VABI sceNpBandwidthTestShutdown(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+int APS5_VABI sceNpBandwidthTestShutdown(int context_id, void* result) {
+    (void)context_id;
+    (void)result;
+    return SCE_NP_ERROR_INVALID_ARGUMENT;
 }
 
 }

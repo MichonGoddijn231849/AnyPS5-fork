@@ -1,20 +1,27 @@
 #include <cstdint>
 #include <cstddef>
+#include <atomic>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+
+// PSN is not emulated: no authorization code is ever issued. A blocking call fails at once; an
+// async request is accepted and PollAsync reports signed-out, mirroring libSceNpManager.
+static constexpr int SCE_NP_ERROR_INVALID_ARGUMENT = static_cast<int>(0x80550003);
+static constexpr int SCE_NP_ERROR_SIGNED_OUT = static_cast<int>(0x80550006);
+static constexpr int NP_POLL_ASYNC_FINISHED = 0;
+
+static std::atomic<int> g_nextRequest{1};
 
 extern "C" {
 
 int APS5_VABI sceNpAuthAbortRequest(int req_id) {
  (void)req_id;
- NotImplemented_nid_no_patch(__func__);
  return 0;
 }
 
 int APS5_VABI sceNpAuthCreateAsyncRequest(const void* param) {
  (void)param;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return g_nextRequest.fetch_add(1, std::memory_order_relaxed);
 }
 
 int APS5_VABI sceNpAuthCreateRequest(void) {
@@ -24,17 +31,14 @@ int APS5_VABI sceNpAuthCreateRequest(void) {
 
 int APS5_VABI sceNpAuthDeleteRequest(int req_id) {
  (void)req_id;
- NotImplemented_nid_no_patch(__func__);
  return 0;
 }
 
 int APS5_VABI sceNpAuthGetAuthorizationCodeV3(int req_id, const void* param, void* auth_code, int* issuer_id) {
  (void)req_id;
- (void)param;
- (void)auth_code;
  (void)issuer_id;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (!param || !auth_code) return SCE_NP_ERROR_INVALID_ARGUMENT;
+ return SCE_NP_ERROR_SIGNED_OUT;
 }
 
 int APS5_VABI sceNpAuthGetIdTokenV3(int req_id, const void* param, void* id_token) {
@@ -47,9 +51,8 @@ int APS5_VABI sceNpAuthGetIdTokenV3(int req_id, const void* param, void* id_toke
 
 int APS5_VABI sceNpAuthPollAsync(int req_id, int* result) {
  (void)req_id;
- (void)result;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (result) *result = SCE_NP_ERROR_SIGNED_OUT;
+ return NP_POLL_ASYNC_FINISHED;
 }
 
 int APS5_VABI sceNpAuthWaitAsync(int req_id, int* result) {

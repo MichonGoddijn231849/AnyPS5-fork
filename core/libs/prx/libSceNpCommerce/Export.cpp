@@ -66,12 +66,12 @@ int APS5_VABI sceNpCommerceDialogTerminate() {
 }
 
 int APS5_VABI sceNpCommerceHidePsStoreIcon(void) {
- NotImplemented_nid_no_patch(__func__);
  return 0;
 }
 
-int APS5_VABI sceNpCommerceShowPsStoreIcon(void) {
- NotImplemented_nid_no_patch(__func__);
+// The PS Store icon is a system overlay; there is none to show.
+int APS5_VABI sceNpCommerceShowPsStoreIcon(int pos) {
+ (void)pos;
  return 0;
 }
 

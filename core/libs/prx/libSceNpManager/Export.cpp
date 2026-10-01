@@ -35,8 +35,7 @@ int APS5_VABI sceNpCheckNpAvailability(int req_id, const char* user, void* resul
 int APS5_VABI sceNpCheckNpReachability(int req_id, int user_id) {
  (void)req_id;
  (void)user_id;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return SCE_NP_ERROR_SIGNED_OUT;
 }
 
 int APS5_VABI sceNpCheckPremium(int req_id, const NpCheckPremiumParameter* param, NpCheckPremiumResult* result) {
@@ -63,9 +62,8 @@ int APS5_VABI sceNpDeleteRequest(int req_id) {
 int APS5_VABI sceNpGetAccountAge(int req_id, int user_id, uint8_t* age) {
  (void)req_id;
  (void)user_id;
- (void)age;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (!age) return SCE_NP_ERROR_INVALID_ARGUMENT;
+ return SCE_NP_ERROR_SIGNED_OUT;
 }
 
 int APS5_VABI sceNpGetAccountCountryA(int user_id, void* country_code) {

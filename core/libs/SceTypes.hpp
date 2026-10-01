@@ -1142,6 +1142,13 @@ struct ImeDialogResult {
 
 using Result = ImeDialogResult;
 
+struct MsgDialogResult {
+    std::int32_t mode;
+    std::int32_t result;
+    std::int32_t button_id;
+    char reserved[32];
+};
+
 struct PositionAndForm {
     std::uint32_t type;
     float posx;

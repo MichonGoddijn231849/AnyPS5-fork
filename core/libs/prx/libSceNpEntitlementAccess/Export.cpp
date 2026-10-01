@@ -16,6 +16,7 @@
 
 static constexpr int SCE_NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER = static_cast<int>(0x80558003);
 static constexpr int SCE_NP_ENTITLEMENT_ACCESS_ERROR_NOT_FOUND = static_cast<int>(0x80558007);
+static constexpr int SCE_NP_ERROR_SIGNED_OUT = static_cast<int>(0x80550006);
 static constexpr uint32_t SKU_FLAG_FULL = 3;
 
 namespace {
@@ -97,28 +98,25 @@ int APS5_VABI sceNpEntitlementAccessInitialize(const NpEntitlementAccessInitPara
 }
 
 int APS5_VABI sceNpEntitlementAccessAbortRequest(void) {
- NotImplemented_nid_no_patch(__func__);
  return 0;
 }
 
 int APS5_VABI sceNpEntitlementAccessDeleteRequest(void) {
- NotImplemented_nid_no_patch(__func__);
  return 0;
 }
 
-int APS5_VABI sceNpEntitlementAccessGenerateTransactionId(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+// Consumable entitlements live on the PSN server, which is unreachable: no transaction ever starts.
+int APS5_VABI sceNpEntitlementAccessGenerateTransactionId(void* transaction_id) {
+ if (!transaction_id) return SCE_NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+ return SCE_NP_ERROR_SIGNED_OUT;
 }
 
 int APS5_VABI sceNpEntitlementAccessPollConsumeEntitlement(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return SCE_NP_ERROR_SIGNED_OUT;
 }
 
 int APS5_VABI sceNpEntitlementAccessRequestConsumeUnifiedEntitlement(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return SCE_NP_ERROR_SIGNED_OUT;
 }
 
 }
