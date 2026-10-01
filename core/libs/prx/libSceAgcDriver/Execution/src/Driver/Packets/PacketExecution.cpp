@@ -298,6 +298,7 @@ void Driver::execute(const Submission& submission) {
                     }
                 } catch (const std::exception& error) {
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
+                    keepPendingDrawFailure(error);
                     skipped(error.what());
                     countSkip(Graphics::DrawSkip::Thrown);
                     relieveMemory(failures, error, true);
