@@ -4,6 +4,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
@@ -77,6 +78,27 @@ void verifyRegisterSources() {
     secondVector.SetRegister({RegisterBank::Vector, 1});
     require(!EquivalentValue(plan, &firstVector, &secondVector), "different vector registers were merged");
     require(!EquivalentValue(plan, &samplerRegister, &firstVector), "different register types were merged");
+}
+
+void verifyEvaluatedValues() {
+    using namespace ShaderRecompiler;
+    std::vector<std::unique_ptr<IrValue>> values;
+    for (std::uint32_t id = 0; id < 1000u; id++) {
+        values.push_back(std::make_unique<IrValue>(IrOpcode::Void, IrType::U32, id));
+    }
+    Detail::EvaluatedValues table;
+    std::uint64_t found = 0;
+    require(!table.Find(values.front().get(), found), "evaluated values: an empty table found a value");
+    for (std::uint32_t id = 0; id < values.size(); id++) {
+        table.Insert(values[id].get(), std::uint64_t{id} * 3u);
+    }
+    for (std::uint32_t id = 0; id < values.size(); id++) {
+        require(table.Find(values[id].get(), found) && found == std::uint64_t{id} * 3u, "evaluated values: a value was lost when the table grew");
+    }
+    table.Insert(values[7].get(), 0u);
+    require(table.Find(values[7].get(), found) && found == 21u, "evaluated values: a second insert replaced the first value");
+    IrValue absent(IrOpcode::Void, IrType::U32, 1000u);
+    require(!table.Find(&absent, found), "evaluated values: a value that was never inserted was found");
 }
 
 // The pure flat slots of a hand-built plan (Detail::ComputePureFlatSlots): a slot is pure unless
@@ -603,6 +625,7 @@ int main() {
     try {
         using namespace ShaderRecompiler;
         verifyRegisterSources();
+        verifyEvaluatedValues();
         verifyPureFlatSlots();
         verifyBindlessTable();
         verifyProgramCounterRelativeData();
