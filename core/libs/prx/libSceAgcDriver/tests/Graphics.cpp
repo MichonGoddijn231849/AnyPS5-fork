@@ -1127,6 +1127,7 @@ struct ModuleShape {
     bool sampleId = false;
     bool layer = false;
     bool fragDepth = false;
+    std::uint32_t sampleMaskLength = 0;
 };
 
 void emit(std::vector<std::uint32_t>& out, spv::Op op, std::initializer_list<std::uint32_t> operands) {
@@ -1212,6 +1213,18 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
         emit(declarations, spv::OpTypePointer, {pointer, spv::StorageClassOutput, floatType});
         emit(declarations, spv::OpVariable, {pointer, variable, spv::StorageClassOutput});
         emit(annotations, spv::OpDecorate, {variable, spv::DecorationBuiltIn, spv::BuiltInFragDepth});
+        extraInterface.push_back(variable);
+    }
+    if (shape.sampleMaskLength != 0) {
+        const auto length = id();
+        const auto array = id();
+        const auto pointer = id();
+        const auto variable = id();
+        emit(declarations, spv::OpConstant, {uintType, length, shape.sampleMaskLength});
+        emit(declarations, spv::OpTypeArray, {array, uintType, length});
+        emit(declarations, spv::OpTypePointer, {pointer, spv::StorageClassOutput, array});
+        emit(declarations, spv::OpVariable, {pointer, variable, spv::StorageClassOutput});
+        emit(annotations, spv::OpDecorate, {variable, spv::DecorationBuiltIn, spv::BuiltInSampleMask});
         extraInterface.push_back(variable);
     }
     if (shape.perVertex) {
@@ -1474,8 +1487,10 @@ void validationTests() {
             AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, true);
             expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "fragmentShaderBarycentric");
         }
-        pixel.spirv = makeModule({.fragment = true, .sampleId = true, .layer = true, .fragDepth = true});
+        pixel.spirv = makeModule({.fragment = true, .sampleId = true, .layer = true, .fragDepth = true, .sampleMaskLength = 1});
         AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false);
+        pixel.spirv = makeModule({.fragment = true, .sampleMaskLength = 2});
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported fragment built-in");
         vertex.spirv = makeModule({.parameterOutput = true, .sampleId = true});
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported device capability 35");
         vertex.spirv = makeModule({.parameterOutput = true});
