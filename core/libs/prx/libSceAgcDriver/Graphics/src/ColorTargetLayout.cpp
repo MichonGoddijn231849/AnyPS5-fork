@@ -1,9 +1,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include <bit>
+#include <cstdio>
 #include <cstring>
-#include <limits>
 #include <mutex>
+#include <limits>
 #include <stdexcept>
 
 namespace AgcDriver::Graphics {
@@ -45,28 +46,34 @@ struct SwizzleTables {
     std::vector<std::uint32_t> y;
 };
 
-const SwizzleTables& renderTargetTables(std::uint32_t bytesPerElement, std::uint32_t blockWidth, std::uint32_t blockHeight) {
-    static std::once_flag once[5];
-    static SwizzleTables tables[5];
-    const auto index = static_cast<std::size_t>(std::countr_zero(bytesPerElement));
-    std::call_once(once[index], [&] {
-        const auto* equation = FindTextureSwizzleEquation(27u, bytesPerElement);
-        require(equation != nullptr, "AGC graphics: no SW_64KB_R_X equation for the color element size");
-        auto& table = tables[index];
+const SwizzleTables& swizzleTables(ColorTileMode mode, std::uint32_t bytesPerElement, std::uint32_t blockWidth, std::uint32_t blockHeight) {
+    static std::once_flag once[2][5];
+    static SwizzleTables tables[2][5];
+    const auto modeIndex = mode == ColorTileMode::RenderTarget ? 0u : 1u;
+    const auto sizeIndex = static_cast<std::uint32_t>(std::countr_zero(bytesPerElement));
+    std::call_once(once[modeIndex][sizeIndex], [&] {
+        auto& table = tables[modeIndex][sizeIndex];
         table.x.resize(blockWidth);
         table.y.resize(blockHeight);
-        for (std::uint32_t x = 0; x < blockWidth; ++x) {
-            std::uint32_t offset = 0;
-            for (std::uint32_t bit = 0; bit < 16u; ++bit) offset |= parity(x & equation->bits[bit] & 0xfffu) << bit;
-            table.x[x] = offset;
-        }
-        for (std::uint32_t y = 0; y < blockHeight; ++y) {
-            std::uint32_t offset = 0;
-            for (std::uint32_t bit = 0; bit < 16u; ++bit) offset |= parity((y << 12u) & equation->bits[bit] & 0xfff000u) << bit;
-            table.y[y] = offset;
+        if (mode == ColorTileMode::RenderTarget) {
+            const auto* equation = FindTextureSwizzleEquation(27u, bytesPerElement);
+            require(equation != nullptr, "AGC graphics: no SW_64KB_R_X equation for the color element size");
+            for (std::uint32_t x = 0; x < blockWidth; ++x) {
+                std::uint32_t offset = 0;
+                for (std::uint32_t bit = 0; bit < 16u; ++bit) offset |= parity(x & equation->bits[bit] & 0xfffu) << bit;
+                table.x[x] = offset;
+            }
+            for (std::uint32_t y = 0; y < blockHeight; ++y) {
+                std::uint32_t offset = 0;
+                for (std::uint32_t bit = 0; bit < 16u; ++bit) offset |= parity((y << 12u) & equation->bits[bit] & 0xfff000u) << bit;
+                table.y[y] = offset;
+            }
+        } else {
+            for (std::uint32_t x = 0; x < blockWidth; ++x) table.x[x] = standardOffset(x, 0, bytesPerElement);
+            for (std::uint32_t y = 0; y < blockHeight; ++y) table.y[y] = standardOffset(0, y, bytesPerElement);
         }
     });
-    return tables[index];
+    return tables[modeIndex][sizeIndex];
 }
 
 }
@@ -88,7 +95,7 @@ ColorTargetLayout::ColorTargetLayout(std::uint32_t width, std::uint32_t height, 
             blockHeight = 1u << (log2Elements / 2u);
             pitch = (width + blockWidth - 1u) / blockWidth * blockWidth;
             paddedHeight = (height + blockHeight - 1u) / blockHeight * blockHeight;
-            const auto& tables = renderTargetTables(bytesPerElement, blockWidth, blockHeight);
+            const auto& tables = swizzleTables(mode, bytesPerElement, blockWidth, blockHeight);
             xOffsets = tables.x.data();
             yOffsets = tables.y.data();
             break;
@@ -99,10 +106,9 @@ ColorTargetLayout::ColorTargetLayout(std::uint32_t width, std::uint32_t height, 
             blockHeight = 1u << (6u - log2Bytes / 2u);
             pitch = (width + blockWidth - 1u) / blockWidth * blockWidth;
             paddedHeight = (height + blockHeight - 1u) / blockHeight * blockHeight;
-            xOffsets.resize(blockWidth);
-            yOffsets.resize(blockHeight);
-            for (std::uint32_t x = 0; x < blockWidth; ++x) xOffsets[x] = standardOffset(x, 0, bytesPerElement);
-            for (std::uint32_t y = 0; y < blockHeight; ++y) yOffsets[y] = standardOffset(0, y, bytesPerElement);
+            const auto& tables = swizzleTables(mode, bytesPerElement, blockWidth, blockHeight);
+            xOffsets = tables.x.data();
+            yOffsets = tables.y.data();
             break;
         }
         default: throw std::runtime_error("AGC graphics: unsupported color tile mode");
