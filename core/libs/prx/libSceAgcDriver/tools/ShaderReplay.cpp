@@ -42,9 +42,10 @@ bool g_assembly = false;
 bool g_memory = false;
 bool g_spirv = false;
 bool g_graph = false;
+bool g_maintenance8 = false;
 
 bool Replay(const char* path) {
-    const auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
+    auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
     std::printf("%s: %zu code words, %zu user data, %zu memory regions, wave%u\n", path, request.request.shader.code.size(), request.request.context.userData.size(), request.request.context.memory.size(), request.request.context.waveSize);
     if (request.request.context.compute.has_value()) {
         const auto& compute = *request.request.context.compute;
@@ -100,6 +101,7 @@ bool Replay(const char* path) {
         return false;
     }
     try {
+        if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
         if (g_spirv) {
@@ -137,7 +139,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--maintenance8] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
     int failures = 0;
@@ -152,6 +154,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--cfg") {
             g_graph = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--maintenance8") {
+            g_maintenance8 = true;
             continue;
         }
         if (std::string(argv[i]) == "--mem") {

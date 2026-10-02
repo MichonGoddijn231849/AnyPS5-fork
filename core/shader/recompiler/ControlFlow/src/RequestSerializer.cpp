@@ -694,6 +694,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
             writer.WriteU32(value);
         }
     }
+    writer.WriteBool(request.target.nonConstantImageOffsets);
     return base64Encode(buffer);
 }
 
@@ -718,6 +719,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
             value = reader.ReadU32();
         }
     }
+    if (version >= 6u) result.request.target.nonConstantImageOffsets = reader.ReadBool();
     return result;
 }
 

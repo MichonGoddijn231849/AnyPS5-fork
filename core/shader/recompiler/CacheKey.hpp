@@ -200,6 +200,7 @@ private:
         append(key, value.maxWorkgroupSharedMemoryBytes);
         append(key, value.mesh);
         append(key, value.tessellation);
+        append(key, value.nonConstantImageOffsets);
     }
 };
 
