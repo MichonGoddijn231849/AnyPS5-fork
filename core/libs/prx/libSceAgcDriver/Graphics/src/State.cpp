@@ -682,7 +682,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto viewMip = (view >> 26u) & 0xfu;
     const auto attrib2 = read(cx, 0x3b0 + slot);
     const auto maxMip = attrib2 >> 28u;
-    Require(color.samples == 1 || maxMip == 0, "multisampled color mips are unsupported");
+    Require(color.samples == 1 || (maxMip == 0 && slice == 0), "multisampled color arrays or mips are unsupported");
     if (color.samples > 1 && (info & 0x4000u) != 0) {
         const auto cmaskHigh = find(cx, 0x398 + slot);
         color.cmaskAddress = ((cmaskHigh == cx.end() ? 0ull : static_cast<std::uint64_t>(cmaskHigh->second & 0xffu)) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x31f + stride)) << 8u);
