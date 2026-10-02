@@ -721,10 +721,53 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
 
 namespace {
 
+class PendingList {
+public:
+    using iterator = std::vector<StorageTexture*>::iterator;
+    iterator begin() { return textures.begin(); }
+    iterator end() { return textures.end(); }
+    void push_back(StorageTexture* texture) {
+        textures.push_back(texture);
+        ++version;
+    }
+    iterator erase(iterator it) {
+        ++version;
+        return textures.erase(it);
+    }
+    void remove(const StorageTexture* texture) {
+        if (std::erase(textures, texture) != 0) ++version;
+    }
+    bool MayOverlap(std::uint64_t address, std::size_t bytes) {
+        if (textures.empty() || bytes == 0) return false;
+        if (indexed != version) rebuild();
+        const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+        const auto it = std::upper_bound(ranges.begin(), ranges.end(), address, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& range) { return value < range.second; });
+        return it != ranges.end() && it->first < end;
+    }
+
+private:
+    void rebuild() {
+        ranges.clear();
+        for (const auto* texture : textures) ranges.emplace_back(texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes());
+        std::sort(ranges.begin(), ranges.end());
+        std::size_t merged = 0;
+        for (const auto& range : ranges) {
+            if (merged != 0 && range.first <= ranges[merged - 1].second) ranges[merged - 1].second = std::max(ranges[merged - 1].second, range.second);
+            else ranges[merged++] = range;
+        }
+        ranges.resize(merged);
+        indexed = version;
+    }
+    std::vector<StorageTexture*> textures;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::uint64_t version = 0;
+    std::uint64_t indexed = ~std::uint64_t{0};
+};
+
 // Storage images whose results have not reached guest memory yet.
 struct PendingWrites {
     std::mutex mutex;
-    std::vector<StorageTexture*> textures;
+    PendingList textures;
     // Images taken out of `textures` by a FlushPending still storing them (see adjacentPendingUnchanged).
     std::vector<StorageTexture*> flushing;
 };
@@ -1945,7 +1988,7 @@ void StorageTexture::reconcilePending() {
     if (any == dirty) return;
     dirty = any;
     if (any) pending.textures.push_back(this);
-    else std::erase(pending.textures, this);
+    else pending.textures.remove(this);
     BumpPendingSerial();
 }
 
@@ -1960,7 +2003,7 @@ void StorageTexture::Flush() {
         std::lock_guard lock(pending.mutex);
         if (!dirty) return;
         dirty = false;
-        std::erase(pending.textures, this);
+        pending.textures.remove(this);
         BumpPendingSerial();
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -1992,9 +2035,10 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
-        for (auto it = pending.textures.begin(); it != pending.textures.end();) {
+        const auto* exempt = refreshing;
+        for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
-            if (texture != except && texture != refreshing && texture->overlaps(address, bytes)) {
+            if (texture != except && texture != exempt && texture->overlaps(address, bytes)) {
                 if (!texture->pendingUnitInside(address, bytes)) {
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
                     ++it;
@@ -2083,6 +2127,7 @@ std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t addres
 bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const StorageTexture* except) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
+    if (!pending.textures.MayOverlap(address, bytes)) return false;
     for (const auto* texture : pending.textures) {
         // A free function (declared in ShaderResources.hpp): the overlap is computed from the public
         // surface description rather than the private helper.
@@ -2124,8 +2169,10 @@ std::vector<std::shared_ptr<StorageTexture>> StorageTexture::overlappingPending(
     std::vector<std::shared_ptr<StorageTexture>> overlapping;
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
+    if (!pending.textures.MayOverlap(address, bytes)) return overlapping;
+    const auto* exempt = refreshing;
     for (auto* texture : pending.textures) {
-        if (texture == refreshing || !texture->overlaps(address, bytes) || !texture->pendingUnitInside(address, bytes)) continue;
+        if (texture == exempt || !texture->overlaps(address, bytes) || !texture->pendingUnitInside(address, bytes)) continue;
         if (auto alive = texture->weak_from_this().lock()) overlapping.push_back(std::move(alive));
     }
     return overlapping;
@@ -2300,10 +2347,11 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
     std::lock_guard lock(pending.mutex);
     std::size_t discarded = 0;
     const auto end = address + bytes;
+    const auto* exempt = refreshing;
     for (auto it = pending.textures.begin(); it != pending.textures.end();) {
         auto* texture = *it;
         const auto begin = texture->descriptor.baseAddress;
-        if (texture != refreshing && begin >= address && begin + texture->guestBytes <= end) {
+        if (texture != exempt && begin >= address && begin + texture->guestBytes <= end) {
             // The content no longer matches guest memory anywhere: the next use re-uploads once the
             // fill stamped the range, never from a matching `original` (the fill may not have
             // touched the bytes a CPU-path upload copied).
@@ -2312,7 +2360,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             texture->originalValid = false;
             it = pending.textures.erase(it);
             ++discarded;
-        } else if (texture != refreshing && texture->blockUnits && texture->overlaps(address, bytes)) {
+        } else if (texture != exempt && texture->blockUnits && texture->overlaps(address, bytes)) {
             // Its units wholly inside the range are dead too (re-uploaded from the range's bytes at
             // the next use, never from a matching `original`: the dropped units hold results the
             // bytes never received); the others stay pending.
@@ -2498,7 +2546,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
         layerPending.assign(trackedLayers, false);
         if (dirty) {
             dirty = false;
-            std::erase(pending.textures, this);
+            pending.textures.remove(this);
             BumpPendingSerial();
         }
     }
@@ -3375,7 +3423,7 @@ StorageTexture::~StorageTexture() {
         std::lock_guard lock(pending.mutex);
         if (dirty) {
             dirty = false;
-            std::erase(pending.textures, this);
+            pending.textures.remove(this);
             BumpPendingSerial();
             static std::atomic<int> reports{0};
             if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx destroyed with GPU results pending\n", static_cast<unsigned long long>(descriptor.baseAddress));
