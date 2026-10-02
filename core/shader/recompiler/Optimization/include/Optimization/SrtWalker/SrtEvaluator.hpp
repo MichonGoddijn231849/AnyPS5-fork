@@ -6,10 +6,58 @@
 
 #include <cstdint>
 #include <span>
-#include <unordered_map>
 #include <vector>
 
 namespace ShaderRecompiler::Detail {
+
+class ValueCache {
+public:
+    const std::uint64_t* Find(const IrValue* key) const {
+        if (_slots.empty()) return nullptr;
+        for (auto index = slotOf(key);; index = (index + 1) & (_slots.size() - 1)) {
+            const auto& slot = _slots[index];
+            if (slot.key == key) return &slot.value;
+            if (slot.key == nullptr) return nullptr;
+        }
+    }
+    void Insert(const IrValue* key, std::uint64_t value) {
+        if ((_count + 1) * 4 > _slots.size() * 3) grow();
+        for (auto index = slotOf(key);; index = (index + 1) & (_slots.size() - 1)) {
+            auto& slot = _slots[index];
+            if (slot.key == key) {
+                slot.value = value;
+                return;
+            }
+            if (slot.key == nullptr) {
+                slot = {key, value};
+                ++_count;
+                return;
+            }
+        }
+    }
+
+private:
+    struct Slot {
+        const IrValue* key = nullptr;
+        std::uint64_t value = 0;
+    };
+    std::size_t slotOf(const IrValue* key) const {
+        auto bits = reinterpret_cast<std::uintptr_t>(key);
+        bits ^= bits >> 17u;
+        bits *= 0x9e3779b97f4a7c15ull;
+        return static_cast<std::size_t>(bits >> 32u) & (_slots.size() - 1);
+    }
+    void grow() {
+        auto old = std::move(_slots);
+        _slots.assign(old.empty() ? 64 : old.size() * 2, Slot{});
+        _count = 0;
+        for (const auto& slot : old) {
+            if (slot.key != nullptr) Insert(slot.key, slot.value);
+        }
+    }
+    std::vector<Slot> _slots;
+    std::size_t _count = 0;
+};
 
 class Evaluator {
 public:
@@ -33,7 +81,7 @@ private:
     std::span<const std::uint8_t> _cleanFlatSlots;
     Evaluator* _cleanEvaluator = nullptr;
     IrValue* _activeMask = nullptr;
-    std::unordered_map<IrValue*, std::uint64_t> _cache;
+    ValueCache _cache;
     std::vector<IrValue*> _visiting;
 };
 
