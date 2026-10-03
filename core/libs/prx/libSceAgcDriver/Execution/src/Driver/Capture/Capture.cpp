@@ -154,11 +154,11 @@ void Driver::RestoreDriverState(bool reset, std::span<const std::byte> gds) {
 bool Driver::captureStart() {
     auto& capture = Capture::FrameCapture::Get();
     if (!DrainFor(std::chrono::seconds(3))) {
-        std::fprintf(stderr, "[capture] the driver did not go idle within 3 s after flip %llu; retrying after the next flip\n", static_cast<unsigned long long>(capture.flips));
+        std::fprintf(stderr, "[frame-capture] the driver did not go idle within 3 s after flip %llu; retrying after the next flip\n", static_cast<unsigned long long>(capture.flips));
         return false;
     }
     Settle();
-    std::fprintf(stderr, "[capture] starting after flip %llu\n", static_cast<unsigned long long>(capture.flips));
+    std::fprintf(stderr, "[frame-capture] starting after flip %llu\n", static_cast<unsigned long long>(capture.flips));
     capture.Begin(capture.flips);
     std::vector<std::shared_ptr<const ShaderSnapshot>> registered;
     {
@@ -230,11 +230,11 @@ void Driver::captureFinish() {
     auto& capture = Capture::FrameCapture::Get();
     try {
         const auto flipsEnd = capture.flips;
-        if (!DrainFor(std::chrono::seconds(10))) std::fprintf(stderr, "[capture] the driver did not go idle within 10 s at the end; the final delta may miss late CPU writes\n");
+        if (!DrainFor(std::chrono::seconds(10))) std::fprintf(stderr, "[frame-capture] the driver did not go idle within 10 s at the end; the final delta may miss late CPU writes\n");
         capture.RecordDelta(captureProgress());
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         while (!capture.PresentsReached(flipsEnd) && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        if (!capture.PresentsReached(flipsEnd)) std::fprintf(stderr, "[capture] not every captured flip was presented within 10 s; their display buffers are missing\n");
+        if (!capture.PresentsReached(flipsEnd)) std::fprintf(stderr, "[frame-capture] not every captured flip was presented within 10 s; their display buffers are missing\n");
         capture.Finish({flipsEnd - capture.FlipsBefore(), capture.submissions});
     } catch (const ProcessShutdown&) {
         throw;

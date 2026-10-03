@@ -95,7 +95,7 @@ FrameCapture::FrameCapture() {
     limitBytes = (limit != nullptr ? std::strtoull(limit, nullptr, 10) : 20ull) << 30u;
     if (limitBytes == 0) throw std::invalid_argument("APS5_CAPTURE_MAX_GB must be positive");
     nextAttempt = firstFrame;
-    std::fprintf(stderr, "[capture] armed: frames %llu-%llu into %s (limit %.0f GiB)\n", static_cast<unsigned long long>(firstFrame), static_cast<unsigned long long>(lastFrame), directory.c_str(), Gib(limitBytes));
+    std::fprintf(stderr, "[frame-capture] armed: frames %llu-%llu into %s (limit %.0f GiB)\n", static_cast<unsigned long long>(firstFrame), static_cast<unsigned long long>(lastFrame), directory.c_str(), Gib(limitBytes));
     phase.store(Phase::Waiting, std::memory_order_release);
 }
 
@@ -143,7 +143,7 @@ void FrameCapture::Begin(std::uint64_t flipsBeforeStart) {
     }
     recordRanges(MemoryKind::Base, ranges, true);
     baseSeconds = Seconds(baseStart);
-    std::fprintf(stderr, "[capture] base: %llu pages (%.2f GiB, %llu zero), %u stored (%.2f GiB) in %.1f s\n", static_cast<unsigned long long>(base.pages), Gib(base.pages * PageBytes), static_cast<unsigned long long>(base.zeroPages), storedPages, Gib(static_cast<std::uint64_t>(storedPages) * PageBytes), baseSeconds);
+    std::fprintf(stderr, "[frame-capture] base: %llu pages (%.2f GiB, %llu zero), %u stored (%.2f GiB) in %.1f s\n", static_cast<unsigned long long>(base.pages), Gib(base.pages * PageBytes), static_cast<unsigned long long>(base.zeroPages), storedPages, Gib(static_cast<std::uint64_t>(storedPages) * PageBytes), baseSeconds);
     phase.store(Phase::Recording, std::memory_order_release);
 }
 
@@ -411,17 +411,17 @@ void FrameCapture::Finish(const EndEvent& end) {
     writeSummary("complete", "");
     closeFiles();
     phase.store(Phase::Done, std::memory_order_release);
-    std::fprintf(stderr, "[capture] complete: %llu flips, %llu submissions into %s\n", static_cast<unsigned long long>(end.flips), static_cast<unsigned long long>(end.submissions), directory.c_str());
+    std::fprintf(stderr, "[frame-capture] complete: %llu flips, %llu submissions into %s\n", static_cast<unsigned long long>(end.flips), static_cast<unsigned long long>(end.submissions), directory.c_str());
 }
 
 void FrameCapture::Fail(const std::string& reason) {
-    std::fprintf(stderr, "[capture] FAILED: %s\n", reason.c_str());
+    std::fprintf(stderr, "[frame-capture] FAILED: %s\n", reason.c_str());
     GuestMemory::SetCaptureDirtyPages(false);
     try {
         std::filesystem::create_directories(directory);
         writeSummary("FAILED", reason);
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "[capture] cannot write capture.txt: %s\n", error.what());
+        std::fprintf(stderr, "[frame-capture] cannot write capture.txt: %s\n", error.what());
     }
     closeFiles();
     phase.store(Phase::Done, std::memory_order_release);
