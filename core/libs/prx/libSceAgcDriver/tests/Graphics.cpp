@@ -1843,6 +1843,15 @@ int main() {
             draw.indexAddress = 0;
             draw.flags = 1;
             expectFailure([&] { AgcDriver::Graphics::Draw(context, state, draw, {}); }, "draw modifiers");
+            auto bounded = state;
+            bounded.depthBoundsTest = true;
+            bounded.minDepthBounds = 0.25f;
+            AgcDriver::Graphics::ValidateDepthBounds(context, bounded);
+            bounded.minDepthBounds = 1.5f;
+            expectFailure([&] { AgcDriver::Graphics::ValidateDepthBounds(context, bounded); }, "depth bounds outside [0, 1]");
+            auto unrestricted = context;
+            unrestricted.depthRangeUnrestricted = true;
+            AgcDriver::Graphics::ValidateDepthBounds(unrestricted, bounded);
         }
         stateTests();
         hardwareScreenOffsetTests();
