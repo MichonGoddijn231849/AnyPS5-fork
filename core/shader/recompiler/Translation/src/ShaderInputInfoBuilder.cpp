@@ -140,6 +140,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         pixelStorage.psExecuteOnNoop = pixel.executeOnNoop;
         pixelStorage.psConservativeZExport = pixel.conservativeZExport;
         pixelStorage.psOrderedPixelShader = pixel.orderedPixelShader;
+        pixelStorage.quadPixelMask = pixel.quadPixelMask;
         ShaderStageInputInfo result;
         result.pixel = &pixelStorage;
         return result;

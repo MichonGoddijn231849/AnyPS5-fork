@@ -130,6 +130,7 @@ struct ShaderPixelStageInfo {
     bool orderedPixelShader;
     std::array<std::uint8_t, 8> targetOutputMode;
     std::array<std::uint8_t, 8> targetExportMapping;
+    std::uint8_t quadPixelMask = 0xf;
 };
 
 struct ShaderVertexBufferResource {

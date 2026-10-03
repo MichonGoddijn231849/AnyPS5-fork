@@ -143,6 +143,7 @@ private:
         append(key, value.executeOnNoop);
         append(key, value.conservativeZExport);
         append(key, value.orderedPixelShader);
+        append(key, value.quadPixelMask);
         append(key, value.targetOutputMode);
         append(key, value.targetExportMapping);
     }
