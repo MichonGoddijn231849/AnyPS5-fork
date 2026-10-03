@@ -91,6 +91,16 @@ void Driver::RegisterShader(const Shader* shader) {
     std::memcpy(snapshot.code.data(), code, shader->shader_size);
     snapshot.header.resize(shader->header_size);
     std::memcpy(snapshot.header.data(), shader, shader->header_size);
+    auto& capture = Capture::FrameCapture::Get();
+    std::unique_lock captureLock(capture.SubmitMutex(), std::defer_lock);
+    if (capture.Active()) captureLock.lock();
+    if (captureLock.owns_lock() && capture.Recording()) {
+        try {
+            captureShader(snapshot);
+        } catch (const std::exception& error) {
+            captureFailed(error);
+        }
+    }
 
     static const char* traceRegs = std::getenv("APS5_TRACE_SHADER_REGS");
     if (traceRegs != nullptr && (std::string(traceRegs) == "all" || std::strtoull(traceRegs, nullptr, 16) == snapshot.codeAddress)) {

@@ -1,0 +1,305 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Capture/Replay.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include <cstring>
+#include <optional>
+
+namespace AgcDriver::DriverDetail {
+
+std::optional<std::uint64_t>& ExpectedCommands() {
+    static thread_local std::optional<std::uint64_t> expected;
+    return expected;
+}
+
+std::atomic<std::uint64_t> commandMismatches{0};
+
+void Driver::checkReplayCommands(std::span<const std::uint32_t> commands) {
+    auto& expected = ExpectedCommands();
+    if (!expected) return;
+    const auto hash = *expected;
+    expected.reset();
+    if (Capture::HashWords(commands) == hash) return;
+    if (commandMismatches.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[replay] submitted commands differ from the captured ones (%zu words): guest memory was not restored exactly\n", commands.size());
+}
+
+namespace {
+
+void PutRegisters(Capture::Writer& writer, const Registers& registers) {
+    std::vector<std::uint32_t> pairs;
+    pairs.reserve(registers.size() * 2);
+    for (const auto& [offset, value] : registers) {
+        pairs.push_back(offset);
+        pairs.push_back(value);
+    }
+    writer.PutSpan<std::uint32_t>(pairs);
+}
+
+Registers GetRegisters(Capture::Reader& reader) {
+    const auto pairs = reader.GetSpan<std::uint32_t>();
+    if (pairs.size() % 2 != 0) throw std::runtime_error("capture register list has an odd length");
+    Registers registers;
+    for (std::size_t i = 0; i < pairs.size(); i += 2) registers.insert_or_assign(pairs[i], pairs[i + 1]);
+    return registers;
+}
+
+}
+
+std::vector<std::byte> Driver::serializeQueueState(const QueueState& state) {
+    Capture::Writer writer;
+    PutRegisters(writer, state.shader);
+    PutRegisters(writer, state.context);
+    PutRegisters(writer, state.userConfig);
+    writer.Put<std::uint8_t>(state.savedContext.has_value());
+    if (state.savedContext) PutRegisters(writer, *state.savedContext);
+    writer.PutSpan<std::uint32_t>(state.constantRam);
+    writer.Put(state.indexBase);
+    writer.Put(state.drawIndirectBase);
+    writer.Put(state.dispatchIndirectBase);
+    writer.Put(state.indexBufferSize);
+    writer.Put(state.indexType);
+    writer.Put(state.instanceCount);
+    writer.Put<std::uint64_t>(state.markers.size());
+    for (const auto& marker : state.markers) writer.PutString(marker);
+    return std::move(writer.data);
+}
+
+QueueState Driver::deserializeQueueState(std::span<const std::byte> bytes) {
+    Capture::Reader reader(bytes);
+    QueueState state;
+    state.shader = GetRegisters(reader);
+    state.context = GetRegisters(reader);
+    state.userConfig = GetRegisters(reader);
+    if (reader.Get<std::uint8_t>() != 0) state.savedContext = GetRegisters(reader);
+    const auto ram = reader.GetSpan<std::uint32_t>();
+    require(ram.size() == state.constantRam.size(), "capture constant RAM size differs");
+    std::copy(ram.begin(), ram.end(), state.constantRam.begin());
+    state.indexBase = reader.Get<std::uint64_t>();
+    state.drawIndirectBase = reader.Get<std::uint64_t>();
+    state.dispatchIndirectBase = reader.Get<std::uint64_t>();
+    state.indexBufferSize = reader.Get<std::uint32_t>();
+    state.indexType = reader.Get<std::uint32_t>();
+    state.instanceCount = reader.Get<std::uint32_t>();
+    const auto markers = reader.Get<std::uint64_t>();
+    for (std::uint64_t i = 0; i < markers; ++i) state.markers.push_back(reader.GetString());
+    require(reader.Done(), "capture queue state has trailing bytes");
+    return state;
+}
+
+void Driver::captureFailed(const std::exception& error) {
+    Capture::FrameCapture::Get().Fail(error.what());
+}
+
+std::vector<std::uint64_t> Driver::captureProgress() const {
+    std::vector<std::uint64_t> progress(Capture::QueueCount);
+    for (std::size_t queue = 0; queue < progress.size(); ++queue) progress[queue] = packetsExecuted[queue].load(std::memory_order_acquire) - progressBase[queue];
+    return progress;
+}
+
+void Driver::captureShader(const ShaderSnapshot& snapshot) {
+    if (snapshot.codeAddress == NullPixelProgramAddress()) return;
+    require(snapshot.header.size() >= sizeof(Shader), "registered shader header is too small");
+    Shader shader;
+    std::memcpy(&shader, snapshot.header.data(), sizeof(Shader));
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> blocks;
+    const auto add = [&](const void* pointer, std::uint64_t bytes) {
+        if (pointer != nullptr && bytes != 0 && GuestMemory::Accessible(pointer, static_cast<std::size_t>(bytes))) blocks.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    };
+    add(reinterpret_cast<const void*>(snapshot.headerAddress), snapshot.header.size());
+    add(reinterpret_cast<const void*>(snapshot.codeAddress), snapshot.code.size() * sizeof(std::uint32_t));
+    add(shader.cx_registers, static_cast<std::uint64_t>(shader.num_cx_registers) * sizeof(ShaderRegister));
+    add(shader.sh_registers, static_cast<std::uint64_t>(shader.num_sh_registers) * sizeof(ShaderRegister));
+    add(shader.specials, sizeof(ShaderSpecialRegs));
+    add(shader.input_semantics, static_cast<std::uint64_t>(shader.num_input_semantics) * sizeof(ShaderSemantic));
+    add(shader.output_semantics, static_cast<std::uint64_t>(shader.num_output_semantics) * sizeof(ShaderSemantic));
+    if (shader.user_data != nullptr && GuestMemory::Accessible(shader.user_data, sizeof(ShaderUserData))) {
+        add(shader.user_data, sizeof(ShaderUserData));
+        add(shader.user_data->direct_resource_offset, static_cast<std::uint64_t>(shader.user_data->direct_resource_count) * sizeof(std::uint16_t));
+        for (std::size_t i = 0; i < 4; ++i) add(shader.user_data->sharp_resource_offset[i], static_cast<std::uint64_t>(shader.user_data->sharp_resource_count[i]) * sizeof(ShaderSharp));
+    }
+    Capture::FrameCapture::Get().RecordShader(snapshot.headerAddress, blocks);
+}
+
+bool Driver::DrainFor(std::chrono::milliseconds limit) {
+    std::unique_lock lock(mutex);
+    ++idleWaiters;
+    const bool idle = changed.wait_for(lock, limit, [&] { return failure != nullptr || stopping || completed >= accepted; });
+    --idleWaiters;
+    rethrowFailure();
+    checkStopping();
+    return idle;
+}
+
+void Driver::Settle() {
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    if (const auto localDevice = device.Load()) {
+        recordDeferredLabels(localDevice.get(), 0);
+        localDevice->WaitIdle();
+    }
+}
+
+std::uint64_t Driver::PacketsExecuted(std::uint32_t queue) const {
+    require(queue < Capture::QueueCount, "queue id out of range");
+    return packetsExecuted[queue].load(std::memory_order_acquire);
+}
+
+bool Driver::Stalled() {
+    std::lock_guard lock(mutex);
+    if (runningWorkers.load(std::memory_order_acquire) != 0) return false;
+    for (const auto& [queue, worker] : workers) {
+        if (!worker.pending.empty() && !queueBlocked[queue].load(std::memory_order_acquire)) return false;
+    }
+    return true;
+}
+
+void Driver::RestoreQueueState(std::uint32_t queue, std::span<const std::byte> state) {
+    auto restored = deserializeQueueState(state);
+    std::lock_guard lock(mutex);
+    require(completed >= accepted, "queue state restored while submissions are pending");
+    queues[queue] = std::move(restored);
+}
+
+void Driver::RestoreDriverState(bool reset, std::span<const std::byte> gds) {
+    require(gds.size() == Pm4::GdsBytes, "capture GDS size differs");
+    std::lock_guard lock(mutex);
+    require(completed >= accepted, "driver state restored while submissions are pending");
+    resetGraphics = reset;
+    std::memcpy(reinterpret_cast<void*>(Pm4::GdsAddress()), gds.data(), gds.size());
+}
+
+bool Driver::captureStart() {
+    auto& capture = Capture::FrameCapture::Get();
+    if (!DrainFor(std::chrono::seconds(3))) {
+        std::fprintf(stderr, "[capture] the driver did not go idle within 3 s after flip %llu; retrying after the next flip\n", static_cast<unsigned long long>(capture.flips));
+        return false;
+    }
+    Settle();
+    std::fprintf(stderr, "[capture] starting after flip %llu\n", static_cast<unsigned long long>(capture.flips));
+    capture.Begin(capture.flips);
+    std::vector<std::shared_ptr<const ShaderSnapshot>> registered;
+    {
+        std::lock_guard lock(mutex);
+        require(completed >= accepted, "submissions arrived while the capture started");
+        for (const auto& [queue, state] : queues) {
+            Capture::Writer writer;
+            writer.Put(queue);
+            const auto bytes = serializeQueueState(state);
+            writer.PutSpan<std::byte>(bytes);
+            capture.RecordEvent(Capture::EventType::QueueState, writer.data);
+        }
+        Capture::Writer driverState;
+        driverState.Put<std::uint8_t>(resetGraphics);
+        driverState.PutSpan<std::byte>(std::span(reinterpret_cast<const std::byte*>(Pm4::GdsAddress()), Pm4::GdsBytes));
+        capture.RecordEvent(Capture::EventType::DriverState, driverState.data);
+        for (const auto& [handle, output] : outputs) {
+            Capture::Writer writer;
+            writer.Put(Capture::VideoOutputEvent{handle, 1});
+            capture.RecordEvent(Capture::EventType::VideoOutput, writer.data);
+        }
+        if (shaders) {
+            for (const auto& [address, snapshot] : *shaders) registered.push_back(snapshot);
+        }
+        for (std::size_t queue = 0; queue < progressBase.size(); ++queue) progressBase[queue] = packetsExecuted[queue].load(std::memory_order_acquire);
+    }
+    for (const auto& snapshot : registered) captureShader(*snapshot);
+    return true;
+}
+
+void Driver::captureBeforeSubmit() {
+    auto& capture = Capture::FrameCapture::Get();
+    try {
+        if (!capture.Recording()) {
+            if (capture.flips < capture.nextAttempt) return;
+            if (!captureStart()) {
+                capture.nextAttempt = capture.flips + 1;
+                return;
+            }
+        }
+        capture.RecordDelta(captureProgress());
+    } catch (const ProcessShutdown&) {
+        throw;
+    } catch (const std::exception& error) {
+        captureFailed(error);
+    }
+}
+
+void Driver::captureSubmitted(const Submission& submission, const Packet& descriptor) {
+    auto& capture = Capture::FrameCapture::Get();
+    if (capture.Recording()) {
+        try {
+            const Capture::SubmitEvent event{submission.queue, static_cast<std::uint32_t>(submission.flips.size()), reinterpret_cast<std::uintptr_t>(descriptor.addr), descriptor.dw_num, static_cast<std::uint32_t>(submission.commands.size()), Capture::HashWords(submission.commands)};
+            capture.RecordSubmit(event, submission.commands);
+            ++capture.submissions;
+        } catch (const std::exception& error) {
+            captureFailed(error);
+        }
+    }
+    capture.flips += submission.flips.size();
+}
+
+void Driver::captureAfterSubmit() {
+    auto& capture = Capture::FrameCapture::Get();
+    if (capture.Recording() && capture.flips > capture.LastFrame()) captureFinish();
+}
+
+void Driver::captureFinish() {
+    auto& capture = Capture::FrameCapture::Get();
+    try {
+        const auto flipsEnd = capture.flips;
+        if (!DrainFor(std::chrono::seconds(10))) std::fprintf(stderr, "[capture] the driver did not go idle within 10 s at the end; the final delta may miss late CPU writes\n");
+        capture.RecordDelta(captureProgress());
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!capture.PresentsReached(flipsEnd) && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!capture.PresentsReached(flipsEnd)) std::fprintf(stderr, "[capture] not every captured flip was presented within 10 s; their display buffers are missing\n");
+        capture.Finish({flipsEnd - capture.FlipsBefore(), capture.submissions});
+    } catch (const ProcessShutdown&) {
+        throw;
+    } catch (const std::exception& error) {
+        captureFailed(error);
+    }
+}
+
+}
+
+namespace AgcDriver::Capture {
+
+std::uint64_t ReplayPacketsExecuted(std::uint32_t queue) {
+    return DriverDetail::Driver::Get().PacketsExecuted(queue);
+}
+
+bool ReplayStalled() {
+    return DriverDetail::Driver::Get().Stalled();
+}
+
+bool ReplayDrain(std::chrono::milliseconds limit) {
+    return DriverDetail::Driver::Get().DrainFor(limit);
+}
+
+void ReplaySettle() {
+    DriverDetail::Driver::Get().Settle();
+}
+
+void ReplayRestoreQueueState(std::uint32_t queue, std::span<const std::byte> state) {
+    DriverDetail::Driver::Get().RestoreQueueState(queue, state);
+}
+
+void ReplayRestoreDriverState(bool resetGraphics, std::span<const std::byte> gds) {
+    DriverDetail::Driver::Get().RestoreDriverState(resetGraphics, gds);
+}
+
+void ReplayDumpNextPresent(std::string path, std::uint32_t scale) {
+    VulkanDevice::DumpNextPresent(std::move(path), scale);
+}
+
+void ReplayExpectCommands(std::uint64_t hash) {
+    DriverDetail::ExpectedCommands() = hash;
+}
+
+std::uint64_t ReplayCommandMismatches() {
+    return DriverDetail::commandMismatches.load(std::memory_order_relaxed);
+}
+
+}

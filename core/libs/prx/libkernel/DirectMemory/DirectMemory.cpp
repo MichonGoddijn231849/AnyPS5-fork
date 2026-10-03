@@ -222,7 +222,7 @@ void Trace(const char* format, ...) {
 
 class PhysicalBacking {
 public:
-    explicit PhysicalBacking(std::size_t bytes, int memoryType) : memoryType(memoryType) {
+    PhysicalBacking(std::uint64_t start, std::size_t bytes, int memoryType) : start(start), bytes(bytes), memoryType(memoryType) {
 #ifdef _WIN32
         const auto size = static_cast<std::uint64_t>(bytes);
         section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
@@ -239,6 +239,8 @@ public:
     }
 
     int MemoryType() const { return memoryType; }
+    std::uint64_t Start() const { return start; }
+    std::size_t Bytes() const { return bytes; }
 
     ~PhysicalBacking() {
 #ifdef _WIN32
@@ -260,6 +262,8 @@ public:
     }
 
 private:
+    std::uint64_t start;
+    std::size_t bytes;
     int memoryType;
 #ifdef _WIN32
     HANDLE section = nullptr;
@@ -613,7 +617,7 @@ void CreateDirectMemoryBacking(int64_t start, size_t len, int memoryType) {
     for (std::size_t offset = 0; offset < len; offset += PS5_PAGE_SIZE) {
         if (g_physPages.contains(first + offset)) throw std::runtime_error("physical allocation overlaps live direct memory");
     }
-    const auto backing = std::make_shared<PhysicalBacking>(len, memoryType);
+    const auto backing = std::make_shared<PhysicalBacking>(first, len, memoryType);
     std::map<std::uint64_t, PhysicalPage> pages;
     for (std::size_t offset = 0; offset < len; offset += PS5_PAGE_SIZE) pages.emplace(first + offset, PhysicalPage{backing, offset});
     g_physPages.merge(pages);
@@ -649,4 +653,11 @@ bool QueryDirectMapping(std::uintptr_t address, std::uintptr_t* start, std::uint
     *offset = it->second.phys;
     *memoryType = it->second.memoryType;
     return true;
+}
+
+void DirectMemoryMappings_nid_postfix(std::vector<DirectMappingInfo>* mappings) {
+    std::lock_guard lock(g_directLock);
+    mappings->clear();
+    mappings->reserve(g_directMappings.size());
+    for (const auto& [address, mapping] : g_directMappings) mappings->push_back({address, mapping.end, mapping.phys, mapping.memoryType, mapping.backing.get(), mapping.phys - mapping.backing->Start(), mapping.backing->Bytes()});
 }

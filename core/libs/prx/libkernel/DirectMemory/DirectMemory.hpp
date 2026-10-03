@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 #include "prx/libkernel/KernelErrors.hpp"
 
@@ -22,5 +23,17 @@ int DoMprotect(const void* addr, size_t len, int prot);
 int DoMunmap(void* addr, size_t len);
 int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment);
 bool GuestProtection(uintptr_t addr, int* prot);
+
+struct DirectMappingInfo {
+    std::uintptr_t address;
+    std::uintptr_t end;
+    std::uint64_t phys;
+    int memoryType;
+    const void* backing;
+    std::uint64_t backingOffset;
+    std::uint64_t backingBytes;
+};
+
+void DirectMemoryMappings_nid_postfix(std::vector<DirectMappingInfo>* mappings);
 
 #endif

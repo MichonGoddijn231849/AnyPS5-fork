@@ -77,6 +77,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/DeviceAccess.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Capture/Capture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Capture/FrameCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Diagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DataHitVerification.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/Dispatch.cpp
@@ -180,6 +182,7 @@ target_include_directories(libSceAgcDriver PRIVATE
         ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
         ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Headers/include
 )
+target_include_directories(libSceAgcDriver SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/stb)
 
 file(GLOB_RECURSE agcShaderCacheGuardSources CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
@@ -574,6 +577,7 @@ if(AGC_BUILD_VISUAL_TEST)
             ${visualShaders}
     )
 
+    target_include_directories(agc_driver_visual_test SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/stb)
     target_include_directories(agc_driver_visual_test PRIVATE
             ${LIBS_INCLUDE_DIR}
             ${agcTextureDetileGeneratedRoot}
@@ -639,6 +643,15 @@ if(ANYPS5_ENABLE_SPIRV_TOOLS)
 endif()
 set_target_properties(agc_shader_replay PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_replay)
+
+if(WIN32)
+    add_executable(agc_frame_replay tools/FrameReplay.cpp)
+    target_include_directories(agc_frame_replay PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+    target_include_directories(agc_frame_replay SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/stb)
+    target_link_libraries(agc_frame_replay PRIVATE libSceAgcDriver libkernel libc SDL2-static)
+    set_target_properties(agc_frame_replay PROPERTIES CXX_EXTENSIONS OFF RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:libSceAgcDriver>")
+    configure_windows_unwind(agc_frame_replay)
+endif()
 
 if(BUILD_TESTING)
     add_test_executable(texture_format_lookup_tests ${LIBS_INCLUDE_DIR}/tests/TextureFormatLookup.cpp)

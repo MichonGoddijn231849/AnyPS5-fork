@@ -32,6 +32,9 @@
 #include <mutex>
 #include <SDL_loadso.h>
 #include <SDL_error.h>
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 #include <spirv/unified1/spirv.hpp>
 #include <array>
 #include <optional>
@@ -68,6 +71,7 @@ using ResourceCache = Graphics::ResourceCache;
 
 std::uint32_t DumpScale();
 void WriteFrameBmp(int index, std::uint32_t fullWidth, std::uint32_t fullHeight, std::span<const std::byte> full, std::uint32_t scale);
+void WriteFramePng(const std::string& path, std::uint32_t fullWidth, std::uint32_t fullHeight, std::span<const std::byte> full, std::uint32_t scale);
 
 class FrameDumpWriter {
 public:
@@ -80,13 +84,14 @@ public:
         if (worker.joinable()) worker.join();
     }
 
-    void Enqueue(int index, std::uint32_t width, std::uint32_t height, std::uint32_t scale, std::vector<std::byte> pixels) {
-        std::lock_guard lock(mutex);
+    void Enqueue(int index, std::string path, std::uint32_t width, std::uint32_t height, std::uint32_t scale, std::vector<std::byte> pixels) {
+        std::unique_lock lock(mutex);
         require(!stopping, "frame dump writer has stopped");
-        require(pixels.size() <= maxBytes - queuedBytes, "frame dump queue exceeded 64 MiB");
+        require(pixels.size() <= maxBytes, "frame dump exceeds the 256 MiB queue");
         if (!worker.joinable()) worker = std::thread([this] { run(); });
+        drained.wait(lock, [&] { return pixels.size() <= maxBytes - queuedBytes; });
         const auto bytes = pixels.size();
-        pending.push_back({index, width, height, scale, std::move(pixels)});
+        pending.push_back({index, std::move(path), width, height, scale, std::move(pixels)});
         queuedBytes += bytes;
         changed.notify_one();
     }
@@ -94,6 +99,7 @@ public:
 private:
     struct Frame {
         int index;
+        std::string path;
         std::uint32_t width;
         std::uint32_t height;
         std::uint32_t scale;
@@ -111,9 +117,11 @@ private:
                     batch.swap(pending);
                 }
                 for (const auto& frame : batch) {
-                    WriteFrameBmp(frame.index, frame.width, frame.height, frame.pixels, frame.scale);
+                    if (frame.path.empty()) WriteFrameBmp(frame.index, frame.width, frame.height, frame.pixels, frame.scale);
+                    else WriteFramePng(frame.path, frame.width, frame.height, frame.pixels, frame.scale);
                     std::lock_guard lock(mutex);
                     queuedBytes -= frame.pixels.size();
+                    drained.notify_all();
                 }
             }
         } catch (const std::exception& error) {
@@ -122,9 +130,10 @@ private:
         }
     }
 
-    static constexpr std::size_t maxBytes = 64 * 1024 * 1024;
+    static constexpr std::size_t maxBytes = 256 * 1024 * 1024;
     std::mutex mutex;
     std::condition_variable changed;
+    std::condition_variable drained;
     std::deque<Frame> pending;
     std::thread worker;
     std::size_t queuedBytes = 0;
@@ -264,6 +273,7 @@ struct VulkanDevice::State {
         std::uint32_t dumpScale = 1;
         bool dumpRecorded = false;
         int dumpIndex = 0;
+        std::string dumpPath;
         std::uint32_t imageIndex = 0;
         bool inFlight = false;
         // The blit reads the single scaler source, staging or upload objects (not a direct blit
@@ -294,6 +304,8 @@ struct VulkanDevice::State {
     bool queuePending = false;
     std::uint32_t queueIndex = 0;
     int nextDumpIndex = 0;
+    std::string nextDumpPath;
+    std::uint32_t nextDumpScale = 0;
     FrameDumpWriter dumpWriter;
 
     template<typename TFunction>
@@ -451,8 +463,8 @@ struct VulkanDevice::State {
         const auto width = slot.dumpWidth;
         const auto height = slot.dumpHeight;
         static const auto start = std::chrono::steady_clock::now();
-        std::fprintf(stderr, "[gpu] frame_%03d.bmp: %ux%u display read back on the GPU at %.1f s\n", index, width, height, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
-        dumpWriter.Enqueue(index, width, height, slot.dumpScale, std::move(full));
+        if (slot.dumpPath.empty()) std::fprintf(stderr, "[gpu] frame_%03d.bmp: %ux%u display read back on the GPU at %.1f s\n", index, width, height, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        dumpWriter.Enqueue(index, slot.dumpPath, width, height, slot.dumpScale, std::move(full));
     }
 
     // Blocks on the fence, or polls it every 50 us with APS5_PRESENT_POLL_FENCE=1 (the difference
@@ -1884,6 +1896,24 @@ void WriteFrameBmp(int index, std::uint32_t fullWidth, std::uint32_t fullHeight,
     }
 }
 
+void WriteFramePng(const std::string& path, std::uint32_t fullWidth, std::uint32_t fullHeight, std::span<const std::byte> full, std::uint32_t scale) {
+    require(scale != 0 && full.size() == static_cast<std::size_t>(fullWidth) * fullHeight * 4, "invalid frame dump pixels");
+    const std::uint32_t width = (fullWidth + scale - 1) / scale;
+    const std::uint32_t height = (fullHeight + scale - 1) / scale;
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * height * 4);
+    for (std::uint32_t y = 0; y < height; ++y) {
+        for (std::uint32_t x = 0; x < width; ++x) {
+            const auto* source = reinterpret_cast<const std::uint8_t*>(full.data()) + (static_cast<std::size_t>(y) * scale * fullWidth + x * scale) * 4;
+            auto* target = pixels.data() + (static_cast<std::size_t>(y) * width + x) * 4;
+            target[0] = source[2];
+            target[1] = source[1];
+            target[2] = source[0];
+            target[3] = 255;
+        }
+    }
+    if (stbi_write_png(path.c_str(), static_cast<int>(width), static_cast<int>(height), 4, pixels.data(), static_cast<int>(width * 4)) == 0) throw std::runtime_error("cannot write frame dump " + path);
+}
+
 ResidentPresent ResidentPresentable(const Graphics::Context& context, const Graphics::StorageTexture& image, const DisplayBuffer& buffer, VkFilter& filter) {
     const auto& descriptor = image.Descriptor();
     if (descriptor.width != buffer.width || descriptor.height != buffer.height || descriptor.mipCount != 1 || image.ImageLayers() != 1 || image.ImageDepth() != 1) return ResidentPresent::None;
@@ -1924,6 +1954,16 @@ struct FrameDumps {
     std::uint64_t presents = 0;
 };
 
+struct DumpRequest {
+    std::string path;
+    std::uint32_t scale = 0;
+};
+
+DumpRequest& PresentDumpRequest() {
+    static thread_local DumpRequest request;
+    return request;
+}
+
 FrameDumps& Dumps() {
     static FrameDumps dumps{[] {
         const char* value = std::getenv("APS5_DUMP_FRAMES");
@@ -1935,6 +1975,11 @@ FrameDumps& Dumps() {
     return dumps;
 }
 
+}
+
+void VulkanDevice::DumpNextPresent(std::string path, std::uint32_t scale) {
+    require(scale != 0 && scale <= 16384, "invalid frame dump scale");
+    PresentDumpRequest() = {std::move(path), scale};
 }
 
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
@@ -1976,7 +2021,15 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     }
     auto& dumps = Dumps();
     bool dumpFrame = false;
-    if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+    auto& request = PresentDumpRequest();
+    state->nextDumpPath.clear();
+    state->nextDumpScale = 0;
+    if (!request.path.empty()) {
+        state->nextDumpPath = std::move(request.path);
+        state->nextDumpScale = request.scale;
+        request = {};
+        dumpFrame = true;
+    } else if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
         if (dumps.cpu) {
             const auto full = ReadDisplayBuffer(buffer);
             WriteFrameBmp(dumps.dumped++, buffer.width, buffer.height, full, DumpScale());
@@ -1993,7 +2046,8 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     CaptureTrace::Log("present dump=%d address=%llx width=%u height=%u resident=%d generation=%llu", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height, resident != nullptr, static_cast<unsigned long long>(resident ? resident->Generation() : 0));
     if (!present(buffer.width, buffer.height, true, {}, &buffer, resident, filter, dumpFrame, convert)) {
         // A dropped frame (swapchain out of date) keeps the dump numbering contiguous.
-        if (dumpFrame) --dumps.dumped;
+        if (dumpFrame && state->nextDumpPath.empty()) --dumps.dumped;
+        if (!state->nextDumpPath.empty()) std::fprintf(stderr, "[gpu] %s: the frame was dropped (swapchain out of date), not written\n", state->nextDumpPath.c_str());
         return false;
     }
     return true;
@@ -2160,7 +2214,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         if (direct) PresentationScaler::RecordBlitFrom(graphicsContext(), commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, residentFilter, barrier.image, state->extent.width, state->extent.height);
         else state->scaler->RecordBlit(commands, barrier.image, state->extent.width, state->extent.height);
         if (dumpFrame && direct) {
-            const auto scale = DumpScale();
+            const auto scale = state->nextDumpScale != 0 ? state->nextDumpScale : DumpScale();
             slot.dumpWidth = (width + scale - 1) / scale;
             slot.dumpHeight = (height + scale - 1) / scale;
             slot.dumpScale = 1;
@@ -2180,7 +2234,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             if (!direct) {
                 slot.dumpWidth = state->scaler->SourceWidth();
                 slot.dumpHeight = state->scaler->SourceHeight();
-                slot.dumpScale = DumpScale();
+                slot.dumpScale = state->nextDumpScale != 0 ? state->nextDumpScale : DumpScale();
             }
             const auto dumpBytes = static_cast<std::size_t>(slot.dumpWidth) * slot.dumpHeight * 4;
             if (!slot.dumpBuffer || slot.dumpBuffer->Bytes().size() != dumpBytes) slot.dumpBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), dumpBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -2219,6 +2273,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         // Only a submitted readback is written after the fence (a failed submit tears the device down).
         slot.dumpRecorded = dumpFrame;
         slot.dumpIndex = state->nextDumpIndex;
+        slot.dumpPath = dumpFrame ? state->nextDumpPath : std::string{};
         slot.recorderSerial = batchesAtBlit;
         slot.previousSerial = state->lastPresentSerial;
         slot.submittedAt = submittedAt;

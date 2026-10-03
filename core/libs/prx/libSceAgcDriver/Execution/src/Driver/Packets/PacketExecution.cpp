@@ -316,6 +316,7 @@ void Driver::execute(const Submission& submission) {
             if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);
         }
         if (drawPacket || (sampleDump && wroteOnGpu)) Graphics::Recorder::CountRecordedWork();
+        packetsExecuted[submission.queue].fetch_add(1, std::memory_order_release);
         cursor += count;
     }
 

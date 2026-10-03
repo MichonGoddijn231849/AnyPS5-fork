@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace AgcDriver {
 
@@ -180,6 +181,7 @@ public:
     // submitted (0: today's render fence wait before the flip completes, 1 default, 2; larger
     // values are refused; 0 when APS5_SYNC_FLIP is set).
     static std::size_t FlipInFlight();
+    static void DumpNextPresent(std::string path, std::uint32_t scale);
     double RetirePresents(std::size_t keepInFlight);
     // Whether presenting `buffer` will use the single scaler source, staging or upload objects (a
     // GPU frame dump, the guest-memory path, a source-size change) while an in-flight blit still

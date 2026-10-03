@@ -897,8 +897,12 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
 }
 #endif
 
+std::atomic<bool> captureDirtyEnabled{false};
+std::vector<std::uint64_t> captureDirtyPages;
+
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind) {
     ++tracker.generation;
+    const bool captureDirty = kind != StampKind::Driver && captureDirtyEnabled.load(std::memory_order_relaxed);
 #ifdef _WIN32
     constexpr std::uint64_t page = 4096;
     // One resetting walk: the kernel reports and clears a page's dirty bit together, a write landing
@@ -917,6 +921,9 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
         }
         if (count != 0) dirty = true;
         for (ULONG_PTR i = 0; i < count; ++i) tracker.stamp(tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i])), tracker.generation, kind);
+        if (captureDirty) {
+            for (ULONG_PTR i = 0; i < count; ++i) captureDirtyPages.push_back(reinterpret_cast<std::uintptr_t>(tracker.pages[i]));
+        }
         if (count < tracker.pages.size()) break;
         cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + (granularity != 0 ? granularity : page);
     }
@@ -929,12 +936,16 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
             DWORD granularity = 4096;
             if (!GuestArena::GuestArenaCollectWrites_nid_postfix(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, true)) return false;
             for (ULONG_PTR i = 0; i < count; ++i) tracker.stamp(tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i])), tracker.generation, kind);
+            if (captureDirty) {
+                for (ULONG_PTR i = 0; i < count; ++i) captureDirtyPages.push_back(reinterpret_cast<std::uintptr_t>(tracker.pages[i]));
+            }
             if (count < tracker.pages.size()) break;
             cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + (granularity != 0 ? granularity : page);
         }
     }
     return true;
 #else
+    if (captureDirty) throw std::runtime_error("frame capture requires the Windows write tracker");
     const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
     StampRuns runs{tracker, kind};
     const bool complete = GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
@@ -1218,6 +1229,23 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
         if (k < cpu.size()) cpu[k] = generation == 0 || tracker.cpuStampOf(block) > generation ? 1 : 0;
     }
     return true;
+}
+
+void SetCaptureDirtyPages(bool enabled) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    require(!enabled || tracker.watched, "frame capture requires write-watched guest memory");
+    captureDirtyEnabled.store(enabled, std::memory_order_relaxed);
+    captureDirtyPages.clear();
+}
+
+std::vector<std::uint64_t> TakeCaptureDirtyPages() {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    std::vector<std::uint64_t> pages;
+    pages.swap(captureDirtyPages);
+    return pages;
 }
 
 namespace {

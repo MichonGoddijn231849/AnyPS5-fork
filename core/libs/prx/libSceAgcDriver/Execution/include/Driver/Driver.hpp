@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRIVER_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Capture/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
@@ -57,6 +58,12 @@ public:
     void Present(const PresentationWindow& window, const DisplayBuffer* buffer, bool opaque, void (*gpuReady)(void*), void* context);
     void ReleaseWindow(void* window);
     void RegisterShader(const Shader* shader);
+    std::uint64_t PacketsExecuted(std::uint32_t queue) const;
+    bool Stalled();
+    bool DrainFor(std::chrono::milliseconds limit);
+    void Settle();
+    void RestoreQueueState(std::uint32_t queue, std::span<const std::byte> state);
+    void RestoreDriverState(bool reset, std::span<const std::byte> gds);
 
 private:
     friend class SampledReadScope;
@@ -231,6 +238,18 @@ private:
     void retryOutOfMemory(TWork&& work);
     void execute(const Submission& submission);
     void markCompleted(std::uint64_t serial);
+    void captureBeforeSubmit();
+    void captureSubmitted(const Submission& submission, const Packet& descriptor);
+    void captureAfterSubmit();
+    bool captureStart();
+    void captureFinish();
+    static void captureFailed(const std::exception& error);
+    std::vector<std::uint64_t> captureProgress() const;
+    static void captureShader(const ShaderSnapshot& snapshot);
+    static void checkReplayCommands(std::span<const std::uint32_t> commands);
+    static void recordVideoOutput(std::uint32_t handle, bool registered);
+    static std::vector<std::byte> serializeQueueState(const QueueState& state);
+    static QueueState deserializeQueueState(std::span<const std::byte> bytes);
     static const std::atomic<std::uint64_t>*& workerQueued();
     void reapCompletionLabels();
     void run(std::uint32_t id) noexcept;
@@ -326,6 +345,10 @@ private:
 
     std::mutex validateMutex;
     ValidateCounters validateCounters;
+
+    std::array<std::atomic<std::uint64_t>, Capture::QueueCount> packetsExecuted{};
+    std::array<std::atomic<bool>, Capture::QueueCount> queueBlocked{};
+    std::array<std::uint64_t, Capture::QueueCount> progressBase{};
 
 };
 

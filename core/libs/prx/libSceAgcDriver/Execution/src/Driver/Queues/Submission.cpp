@@ -124,6 +124,12 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     GuestMemory::CheckRange(packet, sizeof(Packet), alignof(Packet));
     const auto descriptor = *packet;
     require(descriptor.flags == 0, "nonzero submission flags are not implemented");
+    auto& capture = Capture::FrameCapture::Get();
+    std::unique_lock captureLock(capture.SubmitMutex(), std::defer_lock);
+    if (capture.Active()) {
+        captureLock.lock();
+        captureBeforeSubmit();
+    }
     Submission submission{};
     submission.queue = queue;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -135,6 +141,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         copyCommands(submission, descriptor.addr, descriptor.dw_num);
     }
     const auto copied = profile ? std::chrono::steady_clock::now() : start;
+    checkReplayCommands(submission.commands);
     validate(submission.commands, queue, descriptor.addr);
     waitForFlipRoom(submission);
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
@@ -157,18 +164,30 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
             costs.validateNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(validated - copied).count());
             costs.copyNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>((copied - start) + (now - validated)).count());
         }
+        if (captureLock.owns_lock()) captureSubmitted(submission, descriptor);
         enqueue(std::move(submission));
         ++accepted;
     }
     changed.notify_all();
+    if (captureLock.owns_lock()) captureAfterSubmit();
 }
 
 void Driver::SuspendPoint() {
     require(!onWorkerThread(), "worker cannot suspend itself");
+    auto& capture = Capture::FrameCapture::Get();
+    std::unique_lock captureLock(capture.SubmitMutex(), std::defer_lock);
+    if (capture.Active()) captureLock.lock();
     std::unique_lock lock(mutex);
     rethrowFailure();
     checkStopping();
     require(accepted != std::numeric_limits<std::uint64_t>::max(), "submission serial overflow");
+    if (captureLock.owns_lock() && capture.Recording()) {
+        try {
+            capture.RecordEvent(Capture::EventType::Suspend, {});
+        } catch (const std::exception& error) {
+            captureFailed(error);
+        }
+    }
     Submission boundary{};
     boundary.serial = accepted + 1;
     boundary.suspend = true;
@@ -211,6 +230,7 @@ bool Driver::orderReleased(std::uint32_t queue, std::uint64_t received) const {
 }
 
 void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool blocked) {
+    queueBlocked[queue].store(blocked, std::memory_order_release);
     if (blocked) runningWorkers.fetch_sub(1, std::memory_order_acq_rel);
     else runningWorkers.fetch_add(1, std::memory_order_acq_rel);
     if (queue == 0) queue0Awaited.store(blocked ? awaited : 0, std::memory_order_release);
