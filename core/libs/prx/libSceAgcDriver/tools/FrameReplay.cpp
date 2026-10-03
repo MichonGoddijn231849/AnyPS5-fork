@@ -519,6 +519,7 @@ public:
             }
         }
         if (options.png) std::filesystem::create_directories(*options.png);
+        setImageRange();
         presenter = std::make_unique<Presenter>(width, height, options.hidden);
         presenter->dumpScale = options.pngScale;
         presenter->Enqueue({true, std::nullopt, {}, nullptr});
@@ -576,6 +577,26 @@ public:
     const std::vector<std::optional<PresentEvent>>& Presents() const { return presents; }
 
 private:
+    void setImageRange() {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+        for (std::size_t i = 0; i < prologueEnd; ++i) {
+            if (capture.events[i].type != EventType::AddressSpace) continue;
+            Reader reader(capture.events[i].payload);
+            static_cast<void>(reader.GetSpan<Backing>());
+            static_cast<void>(reader.GetSpan<Piece>());
+            for (const auto& piece : reader.GetSpan<Piece>()) {
+                if (piece.kind != PieceKind::External) continue;
+                if (!runs.empty() && piece.address >= runs.back().second && piece.address - runs.back().second < (16u << 20u)) runs.back().second = piece.address + piece.bytes;
+                else runs.emplace_back(piece.address, piece.address + piece.bytes);
+            }
+            break;
+        }
+        if (runs.empty()) return;
+        const auto largest = std::max_element(runs.begin(), runs.end(), [](const auto& a, const auto& b) { return a.second - a.first < b.second - b.first; });
+        AgcDriver::GuestMemory::SetImageRange(static_cast<std::uintptr_t>(largest->first), static_cast<std::size_t>(largest->second - largest->first));
+        std::fprintf(stderr, "[replay] guest image %s-%s (page-state cached as the game's main image)\n", Hex(largest->first).c_str(), Hex(largest->second).c_str());
+    }
+
     void rethrowFailure() {
         std::lock_guard lock(failureMutex);
         if (failure) std::rethrow_exception(failure);

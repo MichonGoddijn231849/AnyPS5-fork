@@ -414,6 +414,8 @@ struct PageStates {
     }
 };
 
+std::pair<std::uintptr_t, std::size_t> imageOverride{0, 0};
+
 PageStates& Pages() {
     static PageStates pages;
     return pages;
@@ -452,7 +454,11 @@ void PageStates::initialize() {
         // The image extent is the run of regions sharing the module's allocation base, as the registry
         // walks it when it registers the main image.
         static const bool noImageCache = std::getenv("APS5_NO_IMAGE_PAGE_CACHE") != nullptr;
-        if (const auto module = noImageCache ? nullptr : GetModuleHandleW(nullptr)) {
+        if (imageOverride.second != 0) {
+            image.base = imageOverride.first;
+            image.size = imageOverride.second;
+            imageCached = !noImageCache && image.allocate();
+        } else if (const auto module = noImageCache ? nullptr : GetModuleHandleW(nullptr)) {
             const auto start = reinterpret_cast<std::uintptr_t>(module);
             auto cursor = start;
             for (;;) {
@@ -1229,6 +1235,11 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
         if (k < cpu.size()) cpu[k] = generation == 0 || tracker.cpuStampOf(block) > generation ? 1 : 0;
     }
     return true;
+}
+
+void SetImageRange(std::uintptr_t base, std::size_t bytes) {
+    require(Pages().arena.pages == nullptr && Pages().image.pages == nullptr, "the image range must be set before guest memory is first checked");
+    imageOverride = {base, bytes};
 }
 
 void SetCaptureDirtyPages(bool enabled) {

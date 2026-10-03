@@ -114,6 +114,7 @@ constexpr std::uint8_t BlockUnchanged = 0;
 constexpr std::uint8_t BlockWritten = 1;
 constexpr std::uint8_t BlockMaybeWritten = 2;
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu = {});
+void SetImageRange(std::uintptr_t base, std::size_t bytes);
 void SetCaptureDirtyPages(bool enabled);
 std::vector<std::uint64_t> TakeCaptureDirtyPages();
 
