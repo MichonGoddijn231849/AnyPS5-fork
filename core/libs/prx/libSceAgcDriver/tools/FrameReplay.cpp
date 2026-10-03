@@ -176,7 +176,14 @@ public:
         }
         {
             GuestAllocations::Mutation mutation;
-            for (const auto& range : registryAdded) mutation.Add(reinterpret_cast<void*>(range.address), static_cast<std::size_t>(range.bytes), range.readable != 0, range.writable != 0, range.sceProtection);
+            std::uintptr_t arenaBase = 0;
+            std::size_t arenaBytes = 0;
+            GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+            for (const auto& range : registryAdded) {
+                const bool image = range.address < arenaBase || range.address + range.bytes > arenaBase + arenaBytes;
+                if (image) mutation.AddImage(reinterpret_cast<void*>(range.address), static_cast<std::size_t>(range.bytes), range.readable != 0, range.writable != 0);
+                else mutation.Add(reinterpret_cast<void*>(range.address), static_cast<std::size_t>(range.bytes), range.readable != 0, range.writable != 0, range.sceProtection);
+            }
         }
         for (const auto& piece : removed) erase(pieces, piece, PieceLess);
         for (const auto& piece : added) insert(pieces, piece, PieceLess);

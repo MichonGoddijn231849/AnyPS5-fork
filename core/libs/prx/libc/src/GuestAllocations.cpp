@@ -190,6 +190,9 @@ void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t 
     }
     ranges.emplace(address, std::make_shared<const Range>(Range{address, bytes, readable, writable, address, bytes}));
 }
+void GuestAllocationsAddImage_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable) {
+    GuestAllocationsAdd_nid_postfix(mutation, pointer, bytes, readable, writable);
+}
 
 [[noreturn]] void PinnedFailure(std::uintptr_t address, std::size_t bytes, const char* why) {
     char message[160];

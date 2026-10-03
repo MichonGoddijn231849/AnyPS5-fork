@@ -27,6 +27,8 @@ void* GuestAllocationsBegin_nid_postfix();
 void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation);
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept;
 void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable);
+// A range the replay maps outside the arena (the game's image span); added like any other here.
+void GuestAllocationsAddImage_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable);
 void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
 void GuestAllocationsRequireAvailable_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
 bool GuestAllocationsCovers_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
@@ -57,6 +59,7 @@ public:
     Mutation& operator=(const Mutation&) = delete;
     void RegisterMainImage() { GuestAllocationsRegisterMainImage_nid_postfix(handle); }
     void Add(void* pointer, std::size_t bytes, bool readable, bool writable) { GuestAllocationsAdd_nid_postfix(handle, pointer, bytes, readable, writable); }
+    void AddImage(void* pointer, std::size_t bytes, bool readable, bool writable) { GuestAllocationsAddImage_nid_postfix(handle, pointer, bytes, readable, writable); }
     void RequireUnpinned(const void* pointer, std::size_t bytes) const { GuestAllocationsRequireUnpinned_nid_postfix(handle, pointer, bytes); }
     void RequireAvailable(const void* pointer, std::size_t bytes) const { GuestAllocationsRequireAvailable_nid_postfix(handle, pointer, bytes); }
     bool Covers(const void* pointer, std::size_t bytes) const { return GuestAllocationsCovers_nid_postfix(handle, pointer, bytes); }
