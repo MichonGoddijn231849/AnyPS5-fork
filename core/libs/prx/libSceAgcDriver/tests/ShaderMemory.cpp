@@ -6,6 +6,7 @@
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
+#include "SpirvBackend/SpirvAnalysis.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
@@ -13,6 +14,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <initializer_list>
 #include <iostream>
 #include <map>
@@ -685,6 +687,94 @@ void verifyComputedTexelOffsets() {
     }
 }
 
+void verifyWaveUniformValues() {
+    using namespace ShaderRecompiler;
+    IrProgram program;
+    program.Resources().stage = IrShaderStage::Compute;
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarAddress;
+    MemoryInfo global;
+    global.kind = ResourceKind::Global;
+    program.Resources().memoryInfo = {scalar, global};
+    auto& block = program.CreateBlock();
+    program.SetEntryBlock(block);
+    program.BlockOrder().push_back(&block);
+    const auto emit = [&](IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments, std::uint64_t flags = 0) -> IrValue& {
+        auto& value = program.CreateValue(opcode, type, flags);
+        for (auto* argument : arguments) value.AddArgument(argument);
+        block.AppendInstruction(&value);
+        return value;
+    };
+    const auto memory = [](std::uint32_t index) {
+        MemoryFlags flags{index, 0u};
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &flags, sizeof(flags));
+        return bits;
+    };
+    auto& zero = program.CreateValue(IrOpcode::Void, IrType::U32);
+    zero.SetImmediateU32(0u);
+    auto& active = program.CreateValue(IrOpcode::Void, IrType::U1);
+    active.SetImmediateBool(true);
+    auto& userData = emit(IrOpcode::GetUserData, IrType::U32, {&zero});
+    auto& lane = emit(IrOpcode::LaneId, IrType::U32, {});
+    auto& uniformSum = emit(IrOpcode::IAdd32, IrType::U32, {&userData, &userData});
+    auto& laneSum = emit(IrOpcode::IAdd32, IrType::U32, {&userData, &lane});
+    auto& address = emit(IrOpcode::GetAddressResource, IrType::AddressResource, {&userData, &userData});
+    auto& scalarLoad = emit(IrOpcode::LoadAddressU32, IrType::U32, {&address, &uniformSum, &zero, &active}, memory(0u));
+    auto& laneOffsetLoad = emit(IrOpcode::LoadAddressU32, IrType::U32, {&address, &laneSum, &zero, &active}, memory(0u));
+    auto& globalLoad = emit(IrOpcode::LoadAddressU32, IrType::U32, {&address, &uniformSum, &zero, &active}, memory(1u));
+    auto& fromScalarLoad = emit(IrOpcode::IAdd32, IrType::U32, {&scalarLoad, &uniformSum});
+    auto& fromGlobalLoad = emit(IrOpcode::IAdd32, IrType::U32, {&globalLoad, &uniformSum});
+    auto& compare = emit(IrOpcode::ULessThan32, IrType::U1, {&laneSum, &userData});
+    auto& ballot = emit(IrOpcode::Ballot, IrType::U32x4, {&compare});
+    const auto uniform = WaveUniformValues(program);
+    for (const auto* value : {&userData, &uniformSum, &address, &scalarLoad, &fromScalarLoad, &ballot}) {
+        require(uniform.contains(value), "wave-uniform values: a value every lane of the wave computes alike was not found uniform");
+    }
+    for (const auto* value : {&lane, &laneSum, &laneOffsetLoad, &globalLoad, &fromGlobalLoad, &compare}) {
+        require(!uniform.contains(value), "wave-uniform values: a value that may differ between lanes was found uniform");
+    }
+}
+
+void verifyTwoLaneUniformValues() {
+    using namespace ShaderRecompiler;
+    static std::array<std::uint32_t, 64> output{};
+    const auto outputBase = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    static std::array<std::uint32_t, 8> srt{};
+    srt = {6u, 7u, 0u, 0u, static_cast<std::uint32_t>(outputBase), static_cast<std::uint32_t>((outputBase >> 32u) & 0xffffu), 64u, 0xfacu};
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    const std::array<std::uint32_t, 10> code{0xf4040080u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xbf8cc07fu, 0x93040302u, 0x4a020004u, 0xe0700000u, 0x80020100u, 0xbf810000u};
+    const auto multiplies = [&](std::uint32_t subgroupSize) {
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x40000u, code, 0, {}};
+        request.context.waveSize = 64;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = subgroupSize;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.layout.pushConstantSizeBytes = 128;
+        AgcDriver::ShaderMemory memory({});
+        const auto capture = memory.Capture(request);
+        request.context.memory = memory.Regions();
+        const auto words = Recompile(request, *capture)->spirv;
+        std::size_t count = 0;
+        for (std::size_t cursor = 5; cursor < words.size();) {
+            const auto length = words[cursor] >> 16u;
+            require(length != 0 && length <= words.size() - cursor, "two-lane uniform values: truncated SPIR-V instruction");
+            if ((words[cursor] & 0xffffu) == spv::OpIMul) ++count;
+            cursor += length;
+        }
+        return count;
+    };
+    const auto oneLane = multiplies(64u);
+    require(oneLane != 0u, "two-lane uniform values: the scalar multiply is missing from the module");
+    require(multiplies(32u) == oneLane, "two-lane uniform values: a two-lane invocation computes a scalar value once per lane");
+}
+
 int main() {
     try {
         using namespace ShaderRecompiler;
@@ -697,6 +787,8 @@ int main() {
         verifyPixelInputs();
         verifyPixelParameterSlots();
         verifyComputedTexelOffsets();
+        verifyWaveUniformValues();
+        verifyTwoLaneUniformValues();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
             0x07230203u, 0x00010000u, 0u, 5u, 0u,

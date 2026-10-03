@@ -447,6 +447,55 @@ bool TranslationContext::sBitreplicateB64B32(const RdnaInstruction& inst) {
     return true;
 }
 
+IrU32 TranslationContext::readRelativeScalar(std::uint32_t base, IrValue& offset) {
+    IrU32 result(ir.GetScalarReg(static_cast<ScalarReg>(base)));
+    for (std::uint32_t reg = base + 1u; reg < NumScalarRegs; ++reg) {
+        IrValue& hit = ir.IEqual(offset, ir.Constant(reg - base));
+        result = IrU32(ir.Select(hit, ir.GetScalarReg(static_cast<ScalarReg>(reg)), result.Value()));
+    }
+    return result;
+}
+
+void TranslationContext::writeRelativeScalar(std::uint32_t base, IrValue& offset, IrU32 value) {
+    for (std::uint32_t reg = base; reg < NumScalarRegs; ++reg) {
+        RdnaOperand target{};
+        target.kind = RdnaOperandKind::ScalarRegister;
+        target.reg = reg;
+        IrValue& hit = ir.IEqual(offset, ir.Constant(reg - base));
+        writeRawU32(target, IrU32(ir.Select(hit, value.Value(), ir.GetScalarReg(static_cast<ScalarReg>(reg)))));
+    }
+}
+
+bool TranslationContext::sMovrel(const RdnaInstruction& inst) {
+    const bool wide = inst.op == RdnaOpcode::SMovrelsB64 || inst.op == RdnaOpcode::SMovreldB64;
+    const bool relativeSource = inst.op != RdnaOpcode::SMovreldB32 && inst.op != RdnaOpcode::SMovreldB64;
+    const bool relativeDestination = inst.op != RdnaOpcode::SMovrelsB32 && inst.op != RdnaOpcode::SMovrelsB64;
+    const RdnaOperand& source = sourceAt(inst, 0u);
+    if ((relativeSource && source.kind != RdnaOperandKind::ScalarRegister) || (relativeDestination && inst.destination.kind != RdnaOperandKind::ScalarRegister)) {
+        throw std::runtime_error("s_movrel operand is not a scalar register");
+    }
+    IrValue& m0 = ir.GetM0();
+    const bool split = inst.op == RdnaOpcode::SMovrelsd2B32;
+    IrValue& sourceOffset = split ? ir.BitwiseAnd(m0, ir.Constant(0x3ffu)) : wide ? ir.BitwiseAnd(m0, ir.Constant(~1u)) : m0;
+    IrValue& destinationOffset = split ? ir.BitwiseAnd(ir.ShiftRightLogical(m0, ir.Constant(16u)), ir.Constant(0x3ffu)) : sourceOffset;
+    const std::uint32_t count = wide ? 2u : 1u;
+    std::array<IrU32, 2> values{IrU32(ir.Constant(0u)), IrU32(ir.Constant(0u))};
+    if (relativeSource) {
+        for (std::uint32_t index = 0u; index < count; ++index) values[index] = readRelativeScalar(source.reg + index, sourceOffset);
+    } else if (wide) {
+        values = readU32Pair(source);
+    } else {
+        values[0] = readU32(source);
+    }
+    if (!relativeDestination) {
+        if (wide) writeU32Pair(inst.destination, values);
+        else writeRawU32(inst.destination, values[0]);
+        return true;
+    }
+    for (std::uint32_t index = 0u; index < count; ++index) writeRelativeScalar(inst.destination.reg + index, destinationOffset, values[index]);
+    return true;
+}
+
 bool TranslationContext::sQuadmask(const RdnaInstruction& inst, bool wide) {
     const auto compact = [&](IrU32 value) {
         IrU32 bits(ir.BitwiseOr(value.Value(), ir.ShiftRightLogical(value.Value(), ir.Constant(1u))));

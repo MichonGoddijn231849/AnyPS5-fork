@@ -4,6 +4,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -24,6 +25,7 @@ struct SpirvRequirements {
 };
 
 [[nodiscard]] SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program);
+[[nodiscard]] std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program);
 
 }
 

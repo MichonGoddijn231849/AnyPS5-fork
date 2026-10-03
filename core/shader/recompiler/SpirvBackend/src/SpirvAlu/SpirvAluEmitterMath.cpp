@@ -13,6 +13,11 @@ struct Pair {
     std::uint32_t high = 0;
 };
 
+std::uint32_t Exact(SpirvEmitterState& state, std::uint32_t result) {
+    state.module.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+    return result;
+}
+
 Pair ExtractPair(SpirvEmitterState& state, std::uint32_t value) {
     Pair result{state.module.AllocateId(), state.module.AllocateId()};
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), result.low, value, 0u);
@@ -531,7 +536,9 @@ std::uint32_t EmitReadFirstLane(SpirvValueEmitContext& ctx, const IrValue& inst)
 }
 
 std::uint32_t EmitReadLane(SpirvValueEmitContext& ctx, const IrValue& inst) {
-    return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+    auto& state = ctx.state;
+    const auto lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, state.program.WaveSize() - 1u));
+    return ctx.Shuffle(inst, 0, lane);
 }
 
 std::uint32_t EmitWriteLane(SpirvValueEmitContext& ctx, const IrValue& inst) {
@@ -816,15 +823,15 @@ std::uint32_t EmitFPUnordGreaterThanEqual32(SpirvEmitterState& state, std::uint3
 }
 
 std::uint32_t EmitFPAdd32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
-    return EmitNative<spv::OpFAdd, IrType::F32>(state, arg0, arg1);
+    return Exact(state, EmitNative<spv::OpFAdd, IrType::F32>(state, arg0, arg1));
 }
 
 std::uint32_t EmitFPSub32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
-    return EmitNative<spv::OpFSub, IrType::F32>(state, arg0, arg1);
+    return Exact(state, EmitNative<spv::OpFSub, IrType::F32>(state, arg0, arg1));
 }
 
 std::uint32_t EmitFPMul32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
-    return EmitNative<spv::OpFMul, IrType::F32>(state, arg0, arg1);
+    return Exact(state, EmitNative<spv::OpFMul, IrType::F32>(state, arg0, arg1));
 }
 
 std::uint32_t EmitAddU32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
@@ -879,8 +886,44 @@ std::uint32_t EmitFAbsValue(SpirvEmitterState& state, std::uint32_t arg0) {
     return EmitGlsl<GLSLstd450FAbs, IrType::F32>(state, arg0);
 }
 
+std::uint32_t EmitF32ToF16BitsRte(SpirvEmitterState& state, std::uint32_t value) {
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t bits) { return ConstantU32(state, bits); };
+    const auto op = [&](spv::Op opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, u32, lhs, rhs); };
+    const auto test = [&](spv::Op opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, boolean, lhs, rhs); };
+    const auto pick = [&](std::uint32_t condition, std::uint32_t yes, std::uint32_t no) { return Select(state, u32, condition, yes, no); };
+    const auto roundEven = [&](std::uint32_t mantissa, std::uint32_t shift) {
+        const auto truncated = op(spv::OpShiftRightLogical, mantissa, shift);
+        const auto remainder = op(spv::OpBitwiseAnd, mantissa, op(spv::OpISub, op(spv::OpShiftLeftLogical, constant(1u), shift), constant(1u)));
+        const auto half = op(spv::OpShiftLeftLogical, constant(1u), op(spv::OpISub, shift, constant(1u)));
+        const auto above = test(spv::OpUGreaterThan, remainder, half);
+        const auto tie = Binary(state, spv::OpLogicalAnd, boolean, test(spv::OpIEqual, remainder, half), test(spv::OpINotEqual, op(spv::OpBitwiseAnd, truncated, constant(1u)), constant(0u)));
+        return op(spv::OpIAdd, truncated, pick(Binary(state, spv::OpLogicalOr, boolean, above, tie), constant(1u), constant(0u)));
+    };
+    const auto bits = Unary(state, spv::OpBitcast, u32, value);
+    const auto sign = op(spv::OpBitwiseAnd, op(spv::OpShiftRightLogical, bits, constant(16u)), constant(0x8000u));
+    const auto magnitude = op(spv::OpBitwiseAnd, bits, constant(0x7fffffffu));
+    const auto exponent = op(spv::OpShiftRightLogical, magnitude, constant(23u));
+    const auto normal = op(spv::OpISub, roundEven(magnitude, constant(13u)), constant(112u << 10u));
+    const auto mantissa = op(spv::OpBitwiseOr, op(spv::OpBitwiseAnd, magnitude, constant(0x7fffffu)), constant(0x800000u));
+    const auto shift = Select(state, u32, test(spv::OpULessThan, exponent, constant(102u)), constant(31u), op(spv::OpISub, constant(126u), exponent));
+    const auto subnormal = pick(test(spv::OpULessThan, exponent, constant(102u)), constant(0u), roundEven(mantissa, shift));
+    auto result = pick(test(spv::OpULessThan, magnitude, constant(0x38800000u)), subnormal, normal);
+    result = pick(test(spv::OpUGreaterThanEqual, magnitude, constant(0x477ff000u)), constant(0x7c00u), result);
+    const auto nan = op(spv::OpBitwiseOr, constant(0x7e00u), op(spv::OpShiftRightLogical, op(spv::OpBitwiseAnd, magnitude, constant(0x7fffffu)), constant(13u)));
+    result = pick(test(spv::OpUGreaterThan, magnitude, constant(0x7f800000u)), nan, result);
+    return op(spv::OpBitwiseOr, sign, result);
+}
+
 std::uint32_t EmitPackHalf2x16(SpirvEmitterState& state, std::uint32_t arg0) {
-    return EmitGlsl<GLSLstd450PackHalf2x16, IrType::U32>(state, arg0);
+    const auto component = [&](std::uint32_t index) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, arg0, index);
+        return EmitF32ToF16BitsRte(state, value);
+    };
+    const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), component(1u), ConstantU32(state, 16u));
+    return Binary(state, spv::OpBitwiseOr, TypeU32(state), component(0u), high);
 }
 
 std::uint32_t EmitPackSnorm2x16(SpirvEmitterState& state, std::uint32_t arg0) {
@@ -892,7 +935,11 @@ std::uint32_t EmitPackUnorm2x16(SpirvEmitterState& state, std::uint32_t arg0) {
 }
 
 std::uint32_t EmitFPFma32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
-    return EmitGlsl<GLSLstd450Fma, IrType::F32>(state, arg0, arg1, arg2);
+    return Exact(state, EmitGlsl<GLSLstd450Fma, IrType::F32>(state, arg0, arg1, arg2));
+}
+
+std::uint32_t EmitFPMad32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+    return EmitFPAdd32(state, EmitFPMul32(state, arg0, arg1), arg2);
 }
 
 std::uint32_t EmitFPRoundEven32(SpirvEmitterState& state, std::uint32_t arg0) {

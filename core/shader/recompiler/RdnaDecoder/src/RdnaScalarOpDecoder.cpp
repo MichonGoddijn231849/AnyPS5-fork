@@ -49,6 +49,10 @@ RdnaOpcode decodeSop1Opcode(std::uint32_t opcode) {
         case 0x2bu: return RdnaOpcode::SXnorSaveexecB64;
         case 0x2cu: return RdnaOpcode::SQuadmaskB32;
         case 0x2du: return RdnaOpcode::SQuadmaskB64;
+        case 0x2eu: return RdnaOpcode::SMovrelsB32;
+        case 0x2fu: return RdnaOpcode::SMovrelsB64;
+        case 0x30u: return RdnaOpcode::SMovreldB32;
+        case 0x31u: return RdnaOpcode::SMovreldB64;
         case 0x34u: return RdnaOpcode::SAbsI32;
         case 0x37u: return RdnaOpcode::SAndn1SaveexecB64;
         case 0x38u: return RdnaOpcode::SOrn1SaveexecB64;
@@ -67,6 +71,7 @@ RdnaOpcode decodeSop1Opcode(std::uint32_t opcode) {
         case 0x45u: return RdnaOpcode::SOrn1SaveexecB32;
         case 0x46u: return RdnaOpcode::SAndn1WrexecB32;
         case 0x47u: return RdnaOpcode::SAndn2WrexecB32;
+        case 0x49u: return RdnaOpcode::SMovrelsd2B32;
         default: throw std::invalid_argument("unsupported SOP1 opcode " + std::to_string(opcode));
     }
 }
@@ -251,6 +256,8 @@ std::uint32_t scalarDestinationDwordCount(RdnaOpcode opcode) {
         case RdnaOpcode::SAndn1WrexecB64:
         case RdnaOpcode::SAndn2WrexecB64:
         case RdnaOpcode::SQuadmaskB64:
+        case RdnaOpcode::SMovrelsB64:
+        case RdnaOpcode::SMovreldB64:
         case RdnaOpcode::SAndn1SaveexecB64:
         case RdnaOpcode::SBitreplicateB64B32:
         case RdnaOpcode::SCselectB64:

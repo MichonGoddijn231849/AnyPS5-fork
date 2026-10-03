@@ -338,6 +338,12 @@ bool TranslationContext::emitScalar(const RdnaInstruction& inst) {
         return sQuadmask(inst, false);
     case RdnaOpcode::SQuadmaskB64:
         return sQuadmask(inst, true);
+    case RdnaOpcode::SMovrelsB32:
+    case RdnaOpcode::SMovrelsB64:
+    case RdnaOpcode::SMovreldB32:
+    case RdnaOpcode::SMovreldB64:
+    case RdnaOpcode::SMovrelsd2B32:
+        return sMovrel(inst);
     case RdnaOpcode::SBfmB32:
         return bfmB32(inst);
     case RdnaOpcode::SBfmB64:

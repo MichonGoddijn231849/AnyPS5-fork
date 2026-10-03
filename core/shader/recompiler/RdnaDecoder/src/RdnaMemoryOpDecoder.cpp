@@ -101,6 +101,22 @@ constexpr MemoryOpcodeInfo flatOpcodes[] = {
 
 constexpr MemoryOpcodeInfo dsOpcodes[] = {
     {0x00u, RdnaOpcode::DsAddU32, 1, 32, false, false, false},
+    {0x02u, RdnaOpcode::DsRsubU32, 1, 32, false, false, false},
+    {0x03u, RdnaOpcode::DsIncU32, 1, 32, false, false, false},
+    {0x04u, RdnaOpcode::DsDecU32, 1, 32, false, false, false},
+    {0x0cu, RdnaOpcode::DsMskorB32, 1, 32, false, false, false},
+    {0x10u, RdnaOpcode::DsCmpstB32, 1, 32, false, false, false},
+    {0x11u, RdnaOpcode::DsCmpstF32, 1, 32, false, false, false},
+    {0x14u, RdnaOpcode::DsNop, 1, 32, false, false, false},
+    {0x15u, RdnaOpcode::DsAddF32, 1, 32, false, false, false},
+    {0x22u, RdnaOpcode::DsRsubRtnU32, 1, 32, false, false, false},
+    {0x2cu, RdnaOpcode::DsMskorRtnB32, 1, 32, false, false, false},
+    {0x30u, RdnaOpcode::DsCmpstRtnB32, 1, 32, false, false, false},
+    {0x31u, RdnaOpcode::DsCmpstRtnF32, 1, 32, false, false, false},
+    {0x32u, RdnaOpcode::DsMinRtnF32, 1, 32, false, false, false},
+    {0x33u, RdnaOpcode::DsMaxRtnF32, 1, 32, false, false, false},
+    {0x34u, RdnaOpcode::DsWrapRtnB32, 1, 32, false, false, false},
+    {0x55u, RdnaOpcode::DsAddRtnF32, 1, 32, false, false, false},
     {0x01u, RdnaOpcode::DsSubU32, 1, 32, false, false, false},
     {0x05u, RdnaOpcode::DsMinI32, 1, 32, false, false, false},
     {0x06u, RdnaOpcode::DsMaxI32, 1, 32, false, false, false},
@@ -300,7 +316,16 @@ bool isDsAtomicOpcode(RdnaOpcode opcode) {
         case RdnaOpcode::DsOrRtnB32:
         case RdnaOpcode::DsXorB32:
         case RdnaOpcode::DsXorRtnB32:
-        case RdnaOpcode::DsWrxchgRtnB32: return true;
+        case RdnaOpcode::DsWrxchgRtnB32:
+        case RdnaOpcode::DsRsubU32:
+        case RdnaOpcode::DsIncU32:
+        case RdnaOpcode::DsDecU32:
+        case RdnaOpcode::DsAddF32:
+        case RdnaOpcode::DsRsubRtnU32:
+        case RdnaOpcode::DsMinRtnF32:
+        case RdnaOpcode::DsMaxRtnF32:
+        case RdnaOpcode::DsAddRtnF32:
+            return true;
         default: return false;
     }
 }
@@ -311,8 +336,16 @@ std::uint32_t dsSourceCount(RdnaOpcode opcode) {
         case RdnaOpcode::DsWrite2st64B32:
         case RdnaOpcode::DsWrite2B64:
         case RdnaOpcode::DsWrite2st64B64:
+        case RdnaOpcode::DsMskorB32:
+        case RdnaOpcode::DsCmpstB32:
+        case RdnaOpcode::DsCmpstF32:
+        case RdnaOpcode::DsMskorRtnB32:
+        case RdnaOpcode::DsCmpstRtnB32:
+        case RdnaOpcode::DsCmpstRtnF32:
+        case RdnaOpcode::DsWrapRtnB32: return 3u;
         case RdnaOpcode::DsMinF32:
-        case RdnaOpcode::DsMaxF32: return 3u;
+        case RdnaOpcode::DsMaxF32: return 2u;
+        case RdnaOpcode::DsNop: return 0u;
         case RdnaOpcode::DsBpermuteB32: return 2u;
         case RdnaOpcode::DsReadAddtidB32:
         case RdnaOpcode::DsConsume:
@@ -397,8 +430,18 @@ RdnaInstruction DecodeRdnaSmem(std::uint32_t programCounter, std::span<const std
     const auto sdst = (word0 >> 6u) & 0x7Fu;
     const auto sbase = word0 & 0x3Fu;
     const auto soffsetCode = (word1 >> 25u) & 0x7Fu;
+    if (opcode == 0x2au) {
+        auto instruction = cacheControlInstruction(RdnaInstructionFamily::SMEM, RdnaOpcode::SGetWaveidInWorkgroup, opcode, programCounter, code, wordIndex);
+        instruction.destination = scalarDestination(sdst);
+        return instruction;
+    }
     if (const auto cacheOp = cacheControlOpcode(RdnaInstructionFamily::SMEM, opcode); cacheOp != RdnaOpcode::Invalid) {
         return cacheControlInstruction(RdnaInstructionFamily::SMEM, cacheOp, opcode, programCounter, code, wordIndex);
+    }
+    if (opcode == 0x24u || opcode == 0x25u) {
+        auto instruction = cacheControlInstruction(RdnaInstructionFamily::SMEM, opcode == 0x24u ? RdnaOpcode::SMemtime : RdnaOpcode::SMemrealtime, opcode, programCounter, code, wordIndex);
+        instruction.destination = scalarDestination(sdst);
+        return instruction;
     }
     const auto& info = lookupOpcode(smemOpcodes, opcode, "SMEM opcode is not supported");
 

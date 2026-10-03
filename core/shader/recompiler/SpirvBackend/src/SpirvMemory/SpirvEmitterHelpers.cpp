@@ -36,6 +36,7 @@ std::uint32_t BuiltInForInput(StageInputKind kind) {
     case StageInputKind::InstanceIndex: return spv::BuiltInInstanceIndex;
     case StageInputKind::FragCoord: return spv::BuiltInFragCoord;
     case StageInputKind::FrontFacing: return spv::BuiltInFrontFacing;
+    case StageInputKind::HelperInvocation: return spv::BuiltInHelperInvocation;
     case StageInputKind::Layer: return spv::BuiltInLayer;
     case StageInputKind::SampleId: return spv::BuiltInSampleId;
     case StageInputKind::BaryCoordSmooth: return spv::BuiltInBaryCoordKHR;
@@ -229,6 +230,7 @@ void DefineInputs(SpirvEmitterState& state) {
             type = TypeF32Vector(state, 3u);
             break;
         case StageInputKind::FrontFacing:
+        case StageInputKind::HelperInvocation:
             type = TypeBool(state);
             break;
         case StageInputKind::Parameter:

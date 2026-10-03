@@ -6,12 +6,13 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
 
-bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& drawPacket, bool& sampleDump) {
+bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     wroteOnGpu = false;
@@ -19,6 +20,42 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     bool orderedAlready = false;
 
     endOfPipeInterrupt = opcode == 0x49 && ((packet[2] >> 24u) & 7u) != 0;
+    interruptDeferred = false;
+    if (!drainAll && endOfPipeInterrupt) {
+        const auto label = Pm4::DecodeLabelWrite(packet);
+        const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
+        if (label.has_value() || storesNothing) {
+            bumpEpoch(&EpochBumps::drains);
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            const auto localDevice = device.Load();
+            recordDeferredLabels(localDevice.get(), submission.queue);
+            const bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
+            int reason = localDevice != nullptr ? 0 : 1;
+            if (label.has_value()) {
+                const auto bytes = label->Bytes();
+                const auto stamp = ++eventSerial;
+                reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, submission.queue) : 4;
+                if (reason == 1) GuestMemory::Write(label->address, bytes, 4);
+                if (reason == 0 || reason == 1 || reason == 5 || reason == 6) {
+                    noteLabelStore(label->address, bytes, stamp);
+                    Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+                }
+                countLabelOutcome(reason);
+                ++immediateLabels;
+            } else {
+                ++noOpLabels;
+            }
+            if (reason == 0 || reason == 5 || reason == 6) {
+                const auto queueId = submission.queue;
+                interruptDeferred = localDevice->AfterRecordedWork([queueId] { AgcDriverDeliverEopInterrupt(queueId); }, submission.queue == 0);
+                if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0);
+                wroteOnGpu = true;
+            } else if (reason == 1) {
+                wroteOnGpu = true;
+            }
+        }
+    }
     if (opcode == 0x50 && packet.size() >= 7) {
         const auto source = ((packet[1] >> 29u) & 3u) | ((packet[6] >> 24u) & 4u) | ((packet[6] >> 25u) & 8u);
         const auto destination = ((packet[1] >> 20u) & 3u) | ((packet[6] >> 25u) & 4u) | ((packet[6] >> 26u) & 8u);

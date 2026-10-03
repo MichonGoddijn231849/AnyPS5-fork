@@ -159,15 +159,37 @@ void testDecode() {
     expectFailure([&] { AgcDriver::DisplayBufferSize(buffer); });
 }
 
+void testOpenParam() {
+    using Words = std::array<std::uint32_t, 6>;
+    constexpr auto first = VIDEO_OUT_OPEN_PARAM_FIRST_WORD;
+    for (const Words& rejected : {
+             Words{24, 0, 0, 0, 0, 0},
+             Words{first, 2, 0, 0, 0, 0},
+             Words{first, 0, 0, 0x101, 0, 0},
+             Words{first, 1, 255, 0, 0, 0},
+             Words{first, 1, 768, 0, 0, 0},
+             Words{first, 0, 0, 1, 0, 0},
+             Words{first, 0, 0, 1, 0x2000, 0},
+             Words{first, 0, 0, 1, 0, 1},
+         }) {
+        expectFailure([&] { sceVideoOutOpen(255, 0, 0, rejected.data()); });
+    }
+    std::array<std::uint32_t, 4> zeroed{first, 0, 0, 0};
+    const auto zeroedHandle = sceVideoOutOpen(255, 0, 0, zeroed.data());
+    check(zeroedHandle >= 0, "open with a zeroed param failed");
+    sceVideoOutClose(zeroedHandle);
+    for (const Words& accepted : {Words{first, 1, 767, 0, 0, 0}, Words{first, 0, 0, 1, 1, 0}}) {
+        const auto handle = sceVideoOutOpen(255, 0, 0, accepted.data());
+        check(handle >= 0, "open with a valid service thread setting failed");
+        sceVideoOutClose(handle);
+    }
+}
+
 void testControls() {
-    std::array<std::uint32_t, 4> openParam{VIDEO_OUT_OPEN_PARAM_SIZE, 0, 0, 0};
+    testOpenParam();
+    const std::array<std::uint32_t, 22> openParam{VIDEO_OUT_OPEN_PARAM_FIRST_WORD, 1, 0x100, 1, 0x1FFF};
     const auto handle = sceVideoOutOpen(255, 0, 0, openParam.data());
-    check(handle >= 0, "open with a zeroed param failed");
-    openParam[0] = 24;
-    expectFailure([&] { sceVideoOutOpen(255, 0, 0, openParam.data()); });
-    openParam[0] = VIDEO_OUT_OPEN_PARAM_SIZE;
-    openParam[2] = 1;
-    expectFailure([&] { sceVideoOutOpen(255, 0, 0, openParam.data()); });
+    check(handle >= 0, "open with the highest priority on every CPU failed");
     const auto cfg = VideoOutDriver::Get().GetConfig(handle);
     for (int rate = 0; rate <= 2; ++rate) {
         check(sceVideoOutSetFlipRate(handle, rate) == 0 && cfg->flipRate == rate, "flip rate was not applied");
@@ -273,6 +295,31 @@ void testBackToBack() {
     LibcRunShutdown_nid_postfix();
 }
 
+void testReleaseVblank() {
+    const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
+    auto cfg = VideoOutDriver::Get().GetConfig(handle);
+    std::vector<std::byte> allocation(6 * 65536 + 65535);
+    const auto storage = alignedBuffer(allocation);
+    fillBuffer(storage, 259, 137);
+    VideoOutBuffers buffer{storage.data(), nullptr, {nullptr, nullptr}};
+    VideoOutBufferAttribute2 attribute{};
+    sceVideoOutSetBufferAttribute2(&attribute, 0x8000000000000000ull, 0, 259, 137, 0, 0, 0);
+    sceVideoOutRegisterBuffers2(handle, 0, 0, &buffer, 1, &attribute, 0, nullptr);
+    check(sceVideoOutSetFlipRate(handle, 2) == 0, "flip rate was not applied");
+    sceVideoOutSubmitFlip(handle, 0, 1, 1);
+    {
+        std::unique_lock lock(cfg->mutex);
+        const bool done = cfg->vblankCond.wait_for(lock, std::chrono::seconds(15), [&] { return cfg->failure || cfg->flipStatus.count == 1; });
+        if (cfg->failure) std::rethrow_exception(cfg->failure);
+        check(done, "the flip did not complete");
+        check(cfg->vblankStatus.count > 3, "the first presentation did not outlast the vblank it was released at");
+        check(cfg->lastFlipVblank == 3, "the next flip is not paced from the vblank this flip was released at");
+    }
+    sceVideoOutUnregisterBuffers(handle, 0);
+    sceVideoOutClose(handle);
+    LibcRunShutdown_nid_postfix();
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -281,6 +328,7 @@ int main(int argc, char** argv) {
         else if (argc == 2 && std::string(argv[1]) == "controls") testControls();
         else if (argc == 2 && std::string(argv[1]) == "present") testPresentation(false);
         else if (argc == 2 && std::string(argv[1]) == "backtoback") testBackToBack();
+        else if (argc == 2 && std::string(argv[1]) == "pacing") testReleaseVblank();
         else if (argc == 2 && std::string(argv[1]) == "unavailable") testPresentation(true);
         else testLifetime(argc == 2 && std::string(argv[1]) == "reopen");
         std::puts("VideoOut flip tests passed");

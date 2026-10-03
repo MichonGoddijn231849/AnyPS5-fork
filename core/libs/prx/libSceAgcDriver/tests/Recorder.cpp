@@ -14,6 +14,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "ResidentPresent.hpp"
 #include "SampleLod_spv.h"
 #include <SDL_loadso.h>
 #ifdef _WIN32
@@ -292,6 +293,50 @@ void completionCountTests(const Device& device, Recorder& recorder) {
     Require(ran == 1 && Recorder::PendingCompletionLabels() == 0 && Recorder::PendingWriteBackCompletions() == 0 && recorder.Idle(), "counts did not return to 0 at finish");
     const bool storeAlways = std::getenv("APS5_LABEL_STORE_ALWAYS") != nullptr;
     Require(memory[0] == 1 && memory[2] == (storeAlways ? 1u : 7u) && memory[16] == 1, "completion stores ran for the wrong labels (overlapped and not-imported ones store, the untouched GPU-stored one skips)");
+}
+
+void afterRecordedWorkTests(const Device& device, Recorder& recorder) {
+    alignas(64) static std::uint32_t memory[16];
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const std::array<std::byte, 4> value{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    recorder.Sync();
+    std::vector<int> ran;
+    std::uint32_t seen = 0;
+    Require(recorder.Idle() && !recorder.AfterRecordedWork([&] { ran.push_back(0); }) && ran.empty() && Recorder::PendingCompletionLabels() == 0, "an idle recorder kept an action for recorded work");
+    recorder.NotePendingWrite(0x52000, 0x100);
+    Require(!Recorder::PendingLabelSince().has_value(), "a write started the label flush deadline");
+    Require(recorder.AfterRecordedWork([&] { ran.push_back(1); }) && Recorder::PendingCompletionLabels() == 1 && Recorder::PendingLabelSince().has_value(), "an action behind the open batch is not pending under the label flush deadline");
+    recorder.AfterCompletions(base, value, 6, 0, false);
+    Require(recorder.AfterRecordedWork([&] { seen = memory[0]; ran.push_back(2); }) && Recorder::PendingCompletionLabels() == 3, "an action behind a completion label is not pending");
+    recorder.Submit();
+    Require(recorder.AfterRecordedWork([&] { ran.push_back(3); }) && Recorder::PendingCompletionLabels() == 4, "an action behind an in-flight batch is not pending");
+    device.WaitQueue();
+    Require(ran.empty(), "an action ran before its batch was reaped");
+    recorder.Sync();
+    Require(ran == std::vector<int>{1, 2, 3} && Recorder::PendingCompletionLabels() == 0 && recorder.Idle(), "actions behind recorded work did not run once each, in order");
+    Require(seen == 1, "an action ran before the completion label recorded ahead of it");
+}
+
+void batchStampTests(Recorder& recorder) {
+    Require(recorder.Idle(), "batch stamps: the recorder is busy");
+    double previousEnd = 0;
+    for (int round = 0; round < 3; ++round) {
+        recorder.NotePendingWrite(0x60000, 0x100);
+        const auto serial = recorder.Submissions() + 1;
+        recorder.Submit();
+        recorder.Sync();
+        std::size_t missing = 0;
+        const auto batches = recorder.CompletedBatches(serial - 1, serial, missing);
+        Require(missing == 0 && batches.size() == 1 && batches.front().serial == serial, "a finished batch has no completion record");
+        const auto& batch = batches.front();
+        if (Recorder::BatchStampsEnabled()) {
+            Require(batch.gpuStartNs > 0 && batch.gpuEndNs >= batch.gpuStartNs && batch.gpuStartNs >= previousEnd, "batch stamps are missing or out of order");
+            previousEnd = batch.gpuEndNs;
+        } else {
+            Require(batch.gpuStartNs == 0 && batch.gpuEndNs == 0, "batch stamps were written with profiling off");
+        }
+    }
+    std::cout << "batch stamps " << (Recorder::BatchStampsEnabled() ? "checked" : "off") << '\n';
 }
 
 void labelTests(Recorder& recorder) {
@@ -2278,6 +2323,8 @@ int main() {
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
+        afterRecordedWorkTests(device, recorder);
+        batchStampTests(recorder);
         labelTests(recorder);
         lateLabelTests(recorder);
         unchangedSinceTests();
@@ -2288,6 +2335,7 @@ int main() {
         drawSnapshotReuseTests(device, recorder);
         drawSnapshotEvictionTests(device);
         drawInputReuseTests(device, recorder);
+        RunResidentPresentTests(device.GetContext());
         storeRunTests(device, recorder);
         movedMetadataTests(device, recorder);
         keysFillTests(device, recorder);

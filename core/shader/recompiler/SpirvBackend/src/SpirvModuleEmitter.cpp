@@ -71,6 +71,13 @@ std::uint32_t EmitBuiltinU32(SpirvEmitterState& state, StageInputKind kind, std:
         state.module.AddFunction(spv::OpSelect, TypeU32(state), bits, value, ConstantU32(state, 0x3f800000u), ConstantU32(state, 0xbf800000u));
         return bits;
     }
+    if (kind == StageInputKind::HelperInvocation) {
+        const auto value = state.module.AllocateId();
+        const auto bits = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeBool(state), value, variable);
+        state.module.AddFunction(spv::OpSelect, TypeU32(state), bits, value, ConstantU32(state, 1u), ConstantU32(state, 0u));
+        return bits;
+    }
     if (kind == StageInputKind::VertexIndex || kind == StageInputKind::InstanceIndex || kind == StageInputKind::InvocationId || kind == StageInputKind::PrimitiveId || kind == StageInputKind::Layer || kind == StageInputKind::SampleId) {
         const auto value = state.module.AllocateId();
         const auto bits = state.module.AllocateId();
@@ -879,7 +886,7 @@ void EmitProgram(SpirvEmitterState& state) {
     DefineGetBdaPointer(state);
     for (const IrBlock* block : program.BlockOrder()) {
         const bool needsScratch = std::any_of(block->Instructions().begin(), block->Instructions().end(), [](const IrValue* inst) {
-            return inst->Opcode() == IrOpcode::SwizzleU32 || inst->Opcode() == IrOpcode::SharedAtomicFMin32 || inst->Opcode() == IrOpcode::SharedAtomicFMax32;
+            return inst->Opcode() == IrOpcode::SwizzleU32;
         });
         if (needsScratch) {
             ctx.scratchU32Variable = state.module.AllocateId();
@@ -1093,6 +1100,30 @@ void EmitSetAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {
 
 std::uint32_t EmitGetShaderBase(SpirvValueEmitContext& ctx) {
     return ConstantU64(ctx.state, 0u);
+}
+
+namespace {
+
+std::uint32_t EmitReadClock(SpirvValueEmitContext& ctx, const IrValue& inst, spv::Scope scope) {
+    auto& state = ctx.state;
+    const bool capability = std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityShaderClockKHR)) != state.supportedCapabilities.end();
+    const bool extension = std::find(state.supportedExtensions.begin(), state.supportedExtensions.end(), "SPV_KHR_shader_clock") != state.supportedExtensions.end();
+    if (!capability || !extension) ctx.Fail(inst, "reads the shader clock, which needs the device's VK_KHR_shader_clock");
+    state.module.EmitCapability(spv::CapabilityShaderClockKHR);
+    state.module.EmitExtension("SPV_KHR_shader_clock");
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpReadClockKHR, TypeU64(state), result, ConstantU32(state, static_cast<std::uint32_t>(scope)));
+    return result;
+}
+
+}
+
+std::uint32_t EmitShaderClock(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    return EmitReadClock(ctx, inst, spv::ScopeSubgroup);
+}
+
+std::uint32_t EmitRealtimeClock(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    return EmitReadClock(ctx, inst, spv::ScopeDevice);
 }
 
 void EmitTessellationBase(SpirvValueEmitContext& ctx, const IrValue& inst) {

@@ -194,6 +194,9 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
     }
 
     IrValue* initialExec = &entryIr.ConstantBool(true);
+    if (options.stage == ShaderStageKind::Pixel) {
+        initialExec = &entryIr.IEqual(builtin(StageInputKind::HelperInvocation), entryIr.Constant(0u));
+    }
     std::uint32_t totalThreads = 0;
     const auto* workgroup = shaderWorkgroupInput(options.stage, options.inputInfo);
     if (workgroup != nullptr) {

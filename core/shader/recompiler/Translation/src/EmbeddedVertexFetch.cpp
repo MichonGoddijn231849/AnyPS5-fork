@@ -290,6 +290,17 @@ EmbeddedFetchPlan EmbeddedVertexFetchAnalyzer::Analyze(const RdnaProgram& progra
                 }
             }
             break;
+        case RdnaOpcode::SMovreldB32:
+        case RdnaOpcode::SMovreldB64:
+        case RdnaOpcode::SMovrelsd2B32:
+            sgprs.fill(SgprValue{});
+            break;
+        case RdnaOpcode::SMovrelsB32:
+        case RdnaOpcode::SMovrelsB64:
+            if (isScalarOperand(inst.destination)) {
+                clearScalarRange(sgprs, inst.destination, decodedDstSize(inst));
+            }
+            break;
         case RdnaOpcode::SMovkI32:
             if (isScalarOperand(inst.destination)) {
                 auto& dst = sgprs[scalarSlot(inst.destination)];

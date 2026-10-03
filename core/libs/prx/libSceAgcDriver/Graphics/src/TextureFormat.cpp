@@ -123,6 +123,7 @@ std::optional<std::uint32_t> FindGuestColorTargetFormat(VkFormat format, std::ui
     switch (format) {
         case VK_FORMAT_B8G8R8A8_UNORM: format = VK_FORMAT_R8G8B8A8_UNORM; break;
         case VK_FORMAT_B8G8R8A8_SRGB: format = VK_FORMAT_R8G8B8A8_SRGB; break;
+        case VK_FORMAT_A2R10G10B10_UNORM_PACK32: format = VK_FORMAT_A2B10G10R10_UNORM_PACK32; break;
         default: break;
     }
     return FindGuestTextureFormat(format, elementBytes);

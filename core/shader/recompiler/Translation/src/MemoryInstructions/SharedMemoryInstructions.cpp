@@ -171,13 +171,14 @@ bool TranslationContext::dsWrite2(const RdnaInstruction& inst) {
     return true;
 }
 
-bool TranslationContext::dsMinmaxF32(const RdnaInstruction& inst, IrOpcode opcode) {
+bool TranslationContext::dsAtomic2(const RdnaInstruction& inst, IrOpcode opcode, bool returnsValue) {
     const MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
     const IrU32 address = readU32(inst.source0);
     const IrU32 data0 = readU32(inst.source1);
     const IrU32 data1 = readU32(inst.source2);
     IrValue& active = ir.GetExec();
-    (void)ir.Emit(opcode, IrType::Void, {&address.Value(), &data0.Value(), &data1.Value(), &active}, addMemoryInfo(memory, inst.programCounter));
+    IrValue& old = ir.Emit(opcode, IrOpcodeType(opcode), {&address.Value(), &data0.Value(), &data1.Value(), &active}, addMemoryInfo(memory, inst.programCounter));
+    if (returnsValue) writeOperand(inst.destination, &old);
     return true;
 }
 
