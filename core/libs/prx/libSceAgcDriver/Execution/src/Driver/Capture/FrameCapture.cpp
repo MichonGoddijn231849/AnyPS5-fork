@@ -130,7 +130,7 @@ void FrameCapture::Begin(std::uint64_t flipsBeforeStart) {
 
     const auto collectStart = std::chrono::steady_clock::now();
     for (const auto& piece : current.pieces) {
-        if (piece.kind != PieceKind::External && piece.gpu && piece.readable) GuestMemory::CollectWritesCommitted(piece.address, static_cast<std::size_t>(piece.bytes));
+        if (piece.kind != PieceKind::External && piece.gpu && piece.readable && piece.writable) GuestMemory::CollectWritesCommitted(piece.address, static_cast<std::size_t>(piece.bytes));
     }
     static_cast<void>(GuestMemory::TakeCaptureDirtyPages());
     collectSeconds += Seconds(collectStart);
@@ -240,7 +240,7 @@ void FrameCapture::RecordDelta(std::span<const std::uint64_t> progress) {
     RecordAddressSpaceChanges();
     const auto collectStart = std::chrono::steady_clock::now();
     for (const auto& piece : current.pieces) {
-        if (piece.kind != PieceKind::External && piece.gpu && piece.readable) GuestMemory::CollectWritesCommitted(piece.address, static_cast<std::size_t>(piece.bytes));
+        if (piece.kind != PieceKind::External && piece.gpu && piece.readable && piece.writable) GuestMemory::CollectWritesCommitted(piece.address, static_cast<std::size_t>(piece.bytes));
     }
     auto dirty = GuestMemory::TakeCaptureDirtyPages();
     collectSeconds += Seconds(collectStart);
@@ -452,7 +452,7 @@ void FrameCapture::writeSummary(const char* status, const std::string& detail) {
     std::fprintf(file, "frames: %llu-%llu (capture starts after flip %llu)\n", static_cast<unsigned long long>(firstFrame), static_cast<unsigned long long>(lastFrame), static_cast<unsigned long long>(flipsBefore));
     std::fprintf(file, "submissions:");
     for (const auto& [queue, count] : submitsPerQueue) std::fprintf(file, " queue 0x%x: %llu", queue, static_cast<unsigned long long>(count));
-    std::fprintf(file, "; command words %.2f MiB; shaders registered during capture %llu\n", Mib(submitWords * 4), static_cast<unsigned long long>(shaders));
+    std::fprintf(file, "; command words %.2f MiB; shaders recorded (registered before or during the capture) %llu\n", Mib(submitWords * 4), static_cast<unsigned long long>(shaders));
     std::fprintf(file, "address space: %zu pieces, %zu registry ranges, %llu changes (+%llu/-%llu pieces), %zu backings\n", current.pieces.size(), current.registry.size(), static_cast<unsigned long long>(addressSpaceChanges), static_cast<unsigned long long>(piecesAdded), static_cast<unsigned long long>(piecesRemoved), backingIds.size());
     std::fprintf(file, "size: base %.2f GiB of GPU-visible pages (%.2f GiB zero) -> %.2f GiB stored; pages.bin %.2f GiB; events.bin %.1f MiB; total %.2f GiB\n", Gib(base.pages * PageBytes), Gib(base.zeroPages * PageBytes), Gib(base.storedPages * PageBytes), Gib(pagesBytes), Mib(eventsTotal), Gib(pagesBytes + eventsTotal));
     std::fprintf(file, "mapped during capture: %.1f MiB (%.1f MiB stored); shader pages %.1f MiB\n", Mib(mapped.pages * PageBytes), Mib(mapped.storedPages * PageBytes), Mib(shader.pages * PageBytes));
