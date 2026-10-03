@@ -61,6 +61,7 @@ struct Options {
     bool pacing = true;
     bool settle = false;
     bool hidden = false;
+    std::optional<std::filesystem::path> shaderCache;
 };
 
 struct Event {
@@ -574,6 +575,14 @@ private:
     }
 
     void apply(const Event& event) {
+        try {
+            applyEvent(event);
+        } catch (const std::exception& error) {
+            Fail("event " + std::to_string(&event - capture.events.data()) + " (type " + std::to_string(static_cast<std::uint32_t>(event.type)) + ", " + std::to_string(event.payload.size()) + " bytes): " + error.what());
+        }
+    }
+
+    void applyEvent(const Event& event) {
         Reader reader(event.payload);
         switch (event.type) {
         case EventType::Begin:
@@ -591,7 +600,8 @@ private:
         }
         case EventType::Memory: {
             const auto kind = reader.Get<MemoryKind>();
-            writeRuns(reader.GetSpan<MemoryRun>(), reader.GetSpan<std::uint32_t>(), false);
+            const auto runs = reader.GetSpan<MemoryRun>();
+            writeRuns(runs, reader.GetSpan<std::uint32_t>(), false);
             if (kind == MemoryKind::Base || kind == MemoryKind::Mapped) space.ApplyProtections();
             break;
         }
@@ -715,7 +725,8 @@ private:
             Reader reader(event.payload);
             if (event.type == EventType::Memory) {
                 static_cast<void>(reader.Get<MemoryKind>());
-                writeRuns(reader.GetSpan<MemoryRun>(), reader.GetSpan<std::uint32_t>(), true);
+                const auto runs = reader.GetSpan<MemoryRun>();
+                writeRuns(runs, reader.GetSpan<std::uint32_t>(), true);
             } else if (event.type == EventType::QueueState || event.type == EventType::DriverState) {
                 apply(event);
             }
@@ -830,7 +841,7 @@ int Compare(const std::filesystem::path& replayed, const std::filesystem::path& 
 Options ParseOptions(int argc, char** argv) {
     Options options;
     const auto usage = [] {
-        Fail("usage: agc_frame_replay <capture dir> [--loop N] [--png DIR] [--png-scale N] [--png-all-loops] [--compare DIR] [--no-pacing] [--settle] [--hidden]");
+        Fail("usage: agc_frame_replay <capture dir> [--loop N] [--png DIR] [--png-scale N] [--png-all-loops] [--compare DIR] [--no-pacing] [--settle] [--hidden] [--shader-cache DIR]");
     };
     if (argc < 2) usage();
     for (int i = 1; i < argc; ++i) {
@@ -847,6 +858,7 @@ Options ParseOptions(int argc, char** argv) {
         else if (argument == "--no-pacing") options.pacing = false;
         else if (argument == "--settle") options.settle = true;
         else if (argument == "--hidden") options.hidden = true;
+        else if (argument == "--shader-cache") options.shaderCache = value();
         else if (!argument.starts_with("--") && options.capture.empty()) options.capture = argument;
         else usage();
     }
@@ -860,12 +872,15 @@ Options ParseOptions(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         const auto options = ParseOptions(argc, argv);
+        if (options.shaderCache && _wputenv_s(L"ANYPS5_SHADER_CACHE_DIR", options.shaderCache->wstring().c_str()) != 0) Fail("cannot set ANYPS5_SHADER_CACHE_DIR");
         CaptureFile capture(options.capture);
         Replayer replayer(options, capture);
         replayer.Run();
         int status = replayer.Stuck() || ReplayCommandMismatches() != 0 ? 2 : 0;
         if (options.png && options.compare) status = std::max(status, Compare(*options.png, *options.compare, replayer.Presents()));
+        std::fflush(stdout);
         std::fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(status));
         return status;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
