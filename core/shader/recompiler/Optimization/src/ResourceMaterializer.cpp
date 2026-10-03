@@ -277,6 +277,30 @@ struct TableResolution {
     bool direct = false;
 };
 
+struct TableShape {
+    IrTextureNumericClass numericClass;
+    RdnaImageDimension dimension;
+    bool cube;
+
+    auto operator<=>(const TableShape& other) const = default;
+};
+
+std::string describeShape(const TableShape& shape) {
+    const char* dimension = "?";
+    switch (shape.dimension) {
+        case RdnaImageDimension::Dim1D: dimension = "1D"; break;
+        case RdnaImageDimension::Dim2D: dimension = "2D"; break;
+        case RdnaImageDimension::Dim3D: dimension = "3D"; break;
+        case RdnaImageDimension::Dim1DArray: dimension = "1D array"; break;
+        case RdnaImageDimension::Dim2DArray: dimension = "2D array"; break;
+        case RdnaImageDimension::Dim2DMsaa: dimension = "2D MSAA"; break;
+        case RdnaImageDimension::Dim2DMsaaArray: dimension = "2D MSAA array"; break;
+        default: break;
+    }
+    const char* numeric = shape.numericClass == IrTextureNumericClass::Float ? "float" : shape.numericClass == IrTextureNumericClass::Uint ? "uint" : shape.numericClass == IrTextureNumericClass::Sint ? "sint" : "?";
+    return std::string(shape.cube ? "cube" : dimension) + " " + numeric;
+}
+
 struct TableMemoEntry {
     std::uint64_t shaderHash = 0;
     std::uint32_t imageIndex = 0;
@@ -286,6 +310,7 @@ struct TableMemoEntry {
     std::vector<DescriptorValue> candidates;
     TableResolution resolution;
     std::array<std::uint32_t, 3> padded{};
+    std::string groups;
 };
 
 struct TableMemo {
@@ -305,6 +330,10 @@ struct TableTrace {
     std::uint32_t entries = 0;
     std::uint32_t materialEntries = 0;
     std::uint32_t keys = 0;
+    std::uint32_t distinct = 0;
+    std::uint32_t surfaces = 0;
+    std::uint32_t padded = 0;
+    std::string groups;
 
     bool operator==(const TableTrace& other) const = default;
 };
@@ -316,7 +345,7 @@ void traceTable(const IrResourcePlan& plan, const ImageResource& image, const De
     auto& last = seen[{plan.shaderHash, image.firstUsePc}];
     if (last == trace) return;
     last = trace;
-    std::fprintf(stderr, "[bindless] table at pc 0x%x of shader %llx: heap V# base 0x%llx entries %u, material V# base 0x%llx entries %u stride 0x%x offset 0x%x, mode %c, %u keys\n", image.firstUsePc, static_cast<unsigned long long>(plan.shaderHash), static_cast<unsigned long long>(heapBase), trace.entries, static_cast<unsigned long long>(materialBase), trace.materialEntries, table.selectorStride, table.selectorOffset, trace.material ? 'M' : 'T', trace.keys);
+    std::fprintf(stderr, "[bindless] table at pc 0x%x of shader %llx: heap V# base 0x%llx entries %u, material V# base 0x%llx entries %u stride 0x%x offset 0x%x, mode %c, %u keys: %u distinct T#s over %u distinct surfaces, %u entries padded; access %s, shape groups (* bound): %s\n", image.firstUsePc, static_cast<unsigned long long>(plan.shaderHash), static_cast<unsigned long long>(heapBase), trace.entries, static_cast<unsigned long long>(materialBase), trace.materialEntries, table.selectorStride, table.selectorOffset, trace.material ? 'M' : 'T', trace.keys, trace.distinct, trace.surfaces, trace.padded, describeShape({IrTextureNumericClass::Unsupported, image.dimension, false}).c_str(), trace.groups.c_str());
 }
 
 // The slots of the table image `imageIndex` (see TableResolution). Mode M enumerates the keys the
@@ -419,7 +448,8 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         entry->keys = keys;
         entry->candidates = candidates;
         std::vector<std::uint8_t> valid(keys.size(), 0u);
-        std::optional<DecodedImage> shape;
+        std::vector<std::optional<TableShape>> shapes(keys.size());
+        std::map<TableShape, std::uint32_t> groups;
         auto& [paddedNull, paddedShape, paddedConversion] = entry->padded;
         for (std::size_t i = 0; i < keys.size(); i++) {
             const auto& candidate = candidates[i];
@@ -440,12 +470,22 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
                 paddedConversion++;
                 continue;
             }
-            if (shape.has_value() && (decoded.numericClass != shape->numericClass || decoded.dimension != shape->dimension || decoded.cube != shape->cube)) {
-                paddedShape++;
-                continue;
-            }
-            if (!shape.has_value()) shape = decoded;
-            valid[i] = 1u;
+            shapes[i] = TableShape{decoded.numericClass, decoded.dimension, decoded.cube};
+            groups[*shapes[i]]++;
+        }
+        std::optional<TableShape> shape;
+        for (const auto& [candidate, count] : groups) {
+            const auto rank = [&](const TableShape& group, std::uint32_t entries) { return std::make_pair(group.dimension == image.dimension ? 1 : 0, entries); };
+            if (!shape.has_value() || rank(candidate, count) > rank(*shape, groups[*shape])) shape = candidate;
+        }
+        for (std::size_t i = 0; i < keys.size(); i++) {
+            if (!shapes[i].has_value()) continue;
+            if (*shapes[i] == *shape) valid[i] = 1u;
+            else paddedShape++;
+        }
+        for (const auto& [group, count] : groups) {
+            if (!entry->groups.empty()) entry->groups += ", ";
+            entry->groups += describeShape(group) + " " + std::to_string(count) + (group == *shape ? "*" : "");
         }
         if (!shape.has_value()) {
             rejectTable(BindlessRejection::NoEntry, "bindless image table has no valid entry (" + std::to_string(keys.size()) + " candidates, first T# " + describeWords(candidates.front()) + ")");
@@ -476,7 +516,20 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     counters.paddedNull.fetch_add(memoized->padded[0], std::memory_order_relaxed);
     counters.paddedShape.fetch_add(memoized->padded[1], std::memory_order_relaxed);
     counters.paddedConversion.fetch_add(memoized->padded[2], std::memory_order_relaxed);
-    if (BindlessTraced()) traceTable(plan, image, table, heapBase, materialBase, {materialMode, entries, materialEntries, static_cast<std::uint32_t>(resolution.mapping.size())});
+    if (BindlessTraced()) {
+        std::vector<std::array<std::uint32_t, 8>> mapped;
+        std::vector<std::uint64_t> surfaces;
+        for (const auto& [key, slot] : resolution.mapping) {
+            const auto& words = resolution.slots[slot].dwords;
+            mapped.push_back(words);
+            surfaces.push_back(static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffu) << 32u));
+        }
+        std::sort(mapped.begin(), mapped.end());
+        std::sort(surfaces.begin(), surfaces.end());
+        const auto distinct = static_cast<std::uint32_t>(std::unique(mapped.begin(), mapped.end()) - mapped.begin());
+        const auto distinctSurfaces = static_cast<std::uint32_t>(std::unique(surfaces.begin(), surfaces.end()) - surfaces.begin());
+        traceTable(plan, image, table, heapBase, materialBase, {materialMode, entries, materialEntries, static_cast<std::uint32_t>(resolution.mapping.size()), distinct, distinctSurfaces, memoized->padded[0] + memoized->padded[1] + memoized->padded[2], memoized->groups});
+    }
 }
 
 void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, ResourceSnapshot& snapshot, std::vector<TableResolution>& tables) {

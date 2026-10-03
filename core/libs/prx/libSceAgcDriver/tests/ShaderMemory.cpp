@@ -403,15 +403,17 @@ void verifyBindlessTable() {
     // null entries are padded and left out of the mask.
     static std::array<std::array<std::uint32_t, 8>, 1000> large{};
     for (std::uint32_t entry = 0; entry < large.size(); entry++) large[entry] = entry % 2u == 0u ? heap[entry % 4u == 0u ? 0u : 1u] : std::array<std::uint32_t, 8>{};
+    large[0][3] = (large[0][3] & 0x0fffffffu) | (10u << 28u);
     fillSrt(static_cast<std::uint32_t>(large.size()), large.data());
     AgcDriver::ShaderMemory largeMemory({});
     const auto largeCapture = largeMemory.Capture(whole);
     const auto largeRoot = tableRoot(*largeCapture, wholeDirect, 1024u);
     const auto& largeImage = largeCapture->specialization.images[largeRoot];
     require(largeImage.indirectSearchIterations == 0u && largeImage.indirectMappingOffset + 32u == largeCapture->snapshot.flattenedSrt.size(), "bindless: the large table does not name a 32-word slot mask");
-    for (std::uint32_t word = 0; word < 32u; word++) require(largeCapture->snapshot.flattenedSrt[largeImage.indirectMappingOffset + word] == (word < 31u ? 0x55555555u : 0x00000055u), "bindless: the large table maps the wrong slots");
+    for (std::uint32_t word = 0; word < 32u; word++) require(largeCapture->snapshot.flattenedSrt[largeImage.indirectMappingOffset + word] == (word == 0u ? 0x55555554u : word < 31u ? 0x55555555u : 0x00000055u), "bindless: the large table maps the wrong slots");
+    require(largeImage.dimension == RdnaImageDimension::Dim2D && largeCapture->snapshot.images[largeRoot].dwords == large[2], "bindless: a 3D first entry decided the shape of a 2D access's table");
     for (const auto key : {2u, 4u, 998u}) require(largeCapture->snapshot.images[wholeDirect + key - 1u].dwords == large[key], "bindless: a large-table slot does not hold its key's entry");
-    require(largeCapture->snapshot.images[wholeDirect + 998u].dwords == heap[0] && largeCapture->snapshot.images[wholeDirect + 1022u].dwords == heap[0], "bindless: a null or past-the-table slot is not the pad");
+    require(largeCapture->snapshot.images[wholeDirect + 998u].dwords == large[2] && largeCapture->snapshot.images[wholeDirect + 1022u].dwords == large[2], "bindless: a null or past-the-table slot is not the pad");
     whole.context.memory = largeMemory.Regions();
     const auto largeCompiled = Recompile(whole, *largeCapture);
     std::size_t largeBindings = 0;
