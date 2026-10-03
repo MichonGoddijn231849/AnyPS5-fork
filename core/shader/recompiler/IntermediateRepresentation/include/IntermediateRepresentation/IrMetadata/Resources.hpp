@@ -55,7 +55,7 @@ struct ImageResource {
     std::uint32_t indirectRoot = NoIndirectImage;
     std::uint32_t indirectMappingOffset = 0;
     std::uint32_t indirectSearchIterations = 0;
-    std::vector<std::uint32_t> indirectResources;
+    std::uint32_t indirectSlots = 0;
 
     bool operator==(const ImageResource& other) const = default;
 };

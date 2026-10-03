@@ -406,7 +406,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(image.indirectRoot);
         out.Value(image.indirectMappingOffset);
         out.Value(image.indirectSearchIterations);
-        out.Values(std::span<const std::uint32_t>(image.indirectResources));
+        out.Value(image.indirectSlots);
     });
     writer.List(info.samplers, [](Writer& out, const SamplerResource& sampler) {
         out.Value(sampler.source);
@@ -493,7 +493,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.indirectRoot);
         in.Value(image.indirectMappingOffset);
         in.Value(image.indirectSearchIterations);
-        in.Values(image.indirectResources);
+        in.Value(image.indirectSlots);
     });
     reader.List(info.samplers, 10, [](Reader& in, SamplerResource& sampler) {
         in.Value(sampler.source);
@@ -798,6 +798,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, c
         out.Value(image.indirectRoot);
         out.Value(image.indirectMappingOffset);
         out.Value(image.indirectSearchIterations);
+        out.Value(image.indirectSlots);
         out.Value(image.cube);
         out.Value(image.fmask);
         out.Value(image.depthBits);

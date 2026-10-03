@@ -221,6 +221,20 @@ BindlessCounters& bindlessCounters() {
     return counters;
 }
 
+std::string hexWord(std::uint32_t value) {
+    std::array<char, 16> text{};
+    std::snprintf(text.data(), text.size(), "%x", value);
+    return text.data();
+}
+
+std::string describeWords(const DescriptorValue& value) {
+    std::string text;
+    for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); i++) {
+        text += (i == 0u ? "0x" : " 0x") + hexWord(value.dwords[i]);
+    }
+    return text;
+}
+
 [[noreturn]] void rejectTable(BindlessRejection reason, const std::string& message) {
     ResourceMaterializer::CountBindlessRejection(reason);
     throw std::runtime_error(message);
@@ -260,7 +274,31 @@ void reportBindless() {
 struct TableResolution {
     std::vector<DescriptorValue> slots;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> mapping;
+    bool direct = false;
 };
+
+struct TableMemoEntry {
+    std::uint64_t shaderHash = 0;
+    std::uint32_t imageIndex = 0;
+    std::uint32_t slotCount = 0;
+    bool direct = false;
+    std::vector<std::uint32_t> keys;
+    std::vector<DescriptorValue> candidates;
+    TableResolution resolution;
+    std::array<std::uint32_t, 3> padded{};
+};
+
+struct TableMemo {
+    std::mutex mutex;
+    std::vector<std::shared_ptr<const TableMemoEntry>> entries;
+};
+
+TableMemo& tableMemo() {
+    static TableMemo memo;
+    return memo;
+}
+
+constexpr std::size_t TableMemoCapacity = 16;
 
 struct TableTrace {
     bool material = false;
@@ -336,10 +374,13 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
             }
         }
     }
+    std::uint32_t slotCount = slots;
     if (!materialMode) {
-        if (entries > slots) {
-            rejectTable(table.hasMaterial ? BindlessRejection::MaterialScan : BindlessRejection::Capacity, "bindless image table has " + std::to_string(entries) + " entries (" + std::to_string(materialEntries) + " materials), limit " + std::to_string(slots));
+        const auto limit = ResourceMaterializer::BindlessTableLimit();
+        if (entries > limit) {
+            rejectTable(table.hasMaterial ? BindlessRejection::MaterialScan : BindlessRejection::Capacity, "bindless image table has " + std::to_string(entries) + " entries (" + std::to_string(materialEntries) + " materials), device limit " + std::to_string(limit) + " (heap V# " + describeWords(heapValue) + ", entry offset 0x" + hexWord(table.entryOffset) + ")");
         }
+        slotCount = std::max(slots, std::min(std::bit_ceil(entries), limit));
         keys.resize(entries);
         for (std::uint32_t key = 0; key < entries; key++) keys[key] = key;
     }
@@ -350,11 +391,6 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
 
     const std::uint64_t heapBase = heap.Base48();
     std::vector<DescriptorValue> candidates(keys.size());
-    std::vector<std::uint8_t> valid(keys.size(), 0u);
-    std::optional<DecodedImage> shape;
-    std::uint32_t paddedNull = 0;
-    std::uint32_t paddedShape = 0;
-    std::uint32_t paddedConversion = 0;
     for (std::size_t i = 0; i < keys.size(); i++) {
         auto& candidate = candidates[i];
         candidate.dwordCount = 8u;
@@ -362,51 +398,84 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         for (std::uint32_t dword = 0; dword < 8u; dword++) {
             readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword]);
         }
-        DecodedImage decoded;
-        bool usable = !nullImageDescriptor(candidate) && validImageDescriptor(candidate, image.r128);
-        if (usable) {
-            try {
-                decoded = decodeImageDescriptor(candidate, image);
-            } catch (const std::exception&) {
-                usable = false;
+    }
+    const bool direct = !materialMode;
+    const auto matches = [&](const TableMemoEntry& entry) {
+        return entry.shaderHash == plan.shaderHash && entry.imageIndex == imageIndex && entry.slotCount == slotCount && entry.direct == direct && entry.keys == keys && entry.candidates == candidates;
+    };
+    std::shared_ptr<const TableMemoEntry> memoized;
+    {
+        auto& memo = tableMemo();
+        std::lock_guard lock(memo.mutex);
+        const auto found = std::find_if(memo.entries.begin(), memo.entries.end(), [&](const auto& entry) { return matches(*entry); });
+        if (found != memo.entries.end()) memoized = *found;
+    }
+    if (memoized == nullptr) {
+        auto entry = std::make_shared<TableMemoEntry>();
+        entry->shaderHash = plan.shaderHash;
+        entry->imageIndex = imageIndex;
+        entry->slotCount = slotCount;
+        entry->direct = direct;
+        entry->keys = keys;
+        entry->candidates = candidates;
+        std::vector<std::uint8_t> valid(keys.size(), 0u);
+        std::optional<DecodedImage> shape;
+        auto& [paddedNull, paddedShape, paddedConversion] = entry->padded;
+        for (std::size_t i = 0; i < keys.size(); i++) {
+            const auto& candidate = candidates[i];
+            DecodedImage decoded;
+            bool usable = !nullImageDescriptor(candidate) && validImageDescriptor(candidate, image.r128);
+            if (usable) {
+                try {
+                    decoded = decodeImageDescriptor(candidate, image);
+                } catch (const std::exception&) {
+                    usable = false;
+                }
             }
+            if (!usable) {
+                paddedNull++;
+                continue;
+            }
+            if (decoded.conversionFormat != IrBufferFormat::Invalid || decoded.fmask) {
+                paddedConversion++;
+                continue;
+            }
+            if (shape.has_value() && (decoded.numericClass != shape->numericClass || decoded.dimension != shape->dimension || decoded.cube != shape->cube)) {
+                paddedShape++;
+                continue;
+            }
+            if (!shape.has_value()) shape = decoded;
+            valid[i] = 1u;
         }
-        if (!usable) {
-            paddedNull++;
-            continue;
+        if (!shape.has_value()) {
+            rejectTable(BindlessRejection::NoEntry, "bindless image table has no valid entry (" + std::to_string(keys.size()) + " candidates, first T# " + describeWords(candidates.front()) + ")");
         }
-        if (decoded.conversionFormat != IrBufferFormat::Invalid || decoded.fmask) {
-            paddedConversion++;
-            continue;
+        const auto pad = candidates[static_cast<std::size_t>(std::find(valid.begin(), valid.end(), std::uint8_t{1}) - valid.begin())];
+        auto& result = entry->resolution;
+        result.direct = direct;
+        result.slots = candidates;
+        for (std::size_t i = 0; i < keys.size(); i++) {
+            if (valid[i] == 0u) {
+                result.slots[i] = pad;
+                continue;
+            }
+            result.mapping.emplace_back(keys[i], static_cast<std::uint32_t>(i));
         }
-        if (shape.has_value() && (decoded.numericClass != shape->numericClass || decoded.dimension != shape->dimension || decoded.cube != shape->cube)) {
-            paddedShape++;
-            continue;
-        }
-        if (!shape.has_value()) shape = decoded;
-        valid[i] = 1u;
+        result.slots.resize(slotCount, pad);
+        auto& memo = tableMemo();
+        std::lock_guard lock(memo.mutex);
+        if (memo.entries.size() >= TableMemoCapacity) memo.entries.erase(memo.entries.begin());
+        memo.entries.push_back(entry);
+        memoized = std::move(entry);
     }
-    if (!shape.has_value()) {
-        rejectTable(BindlessRejection::NoEntry, "bindless image table has no valid entry");
-    }
-    const auto pad = candidates[static_cast<std::size_t>(std::find(valid.begin(), valid.end(), std::uint8_t{1}) - valid.begin())];
-    resolution.mapping.clear();
-    for (std::size_t i = 0; i < keys.size(); i++) {
-        if (valid[i] == 0u) {
-            candidates[i] = pad;
-            continue;
-        }
-        resolution.mapping.emplace_back(keys[i], static_cast<std::uint32_t>(i));
-    }
-    resolution.slots = std::move(candidates);
-    resolution.slots.resize(slots, pad);
+    resolution = memoized->resolution;
     resolved = resolution.slots[0];
 
     (materialMode ? counters.tablesMaterial : counters.tablesWhole).fetch_add(1, std::memory_order_relaxed);
     counters.keys.fetch_add(resolution.mapping.size(), std::memory_order_relaxed);
-    counters.paddedNull.fetch_add(paddedNull, std::memory_order_relaxed);
-    counters.paddedShape.fetch_add(paddedShape, std::memory_order_relaxed);
-    counters.paddedConversion.fetch_add(paddedConversion, std::memory_order_relaxed);
+    counters.paddedNull.fetch_add(memoized->padded[0], std::memory_order_relaxed);
+    counters.paddedShape.fetch_add(memoized->padded[1], std::memory_order_relaxed);
+    counters.paddedConversion.fetch_add(memoized->padded[2], std::memory_order_relaxed);
     if (BindlessTraced()) traceTable(plan, image, table, heapBase, materialBase, {materialMode, entries, materialEntries, static_cast<std::uint32_t>(resolution.mapping.size())});
 }
 
@@ -445,18 +514,10 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
 
     snapshot.images.resize(plan.info.images.size());
     tables.assign(plan.info.images.size(), {});
-    std::uint32_t activeTables = 0;
-    for (std::uint32_t i = 0; i < plan.info.images.size(); i++) {
-        const auto& image = plan.info.images[i];
+    for (const auto& image : plan.info.images) {
         if (image.source >= plan.descriptorSources.size()) {
             throw std::runtime_error("image resource references an unknown descriptor source");
         }
-        const bool active = image.source >= activeSources.size() || activeSources[image.source] != 0u;
-        if (plan.descriptorSources[image.source].indirectImage.has_value() && active) activeTables++;
-    }
-    const auto tableSlots = ResourceMaterializer::BindlessSlots();
-    if (activeTables != 0u && plan.info.images.size() + static_cast<std::size_t>(tableSlots - 1u) * activeTables > ShaderInfo::MaxImages) {
-        rejectTable(BindlessRejection::ImageSlots, "bindless image tables need " + std::to_string(plan.info.images.size() + static_cast<std::size_t>(tableSlots - 1u) * activeTables) + " image slots, limit " + std::to_string(ShaderInfo::MaxImages));
     }
     for (std::uint32_t i = 0; i < plan.info.images.size(); i++) {
         const auto& image = plan.info.images[i];
@@ -537,32 +598,34 @@ void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& s
         result.images.push_back(entry);
     }
 
-    // A table root is followed by its slots 1..C-1 as extra images of the root's shape; the
-    // (key, slot) mapping the SPIR-V selector searches is appended to the flattened SRT in a
-    // block of fixed size, so the offsets (part of the specialization) never depend on the keys.
+    // A table root binds its C slots as consecutive elements; slots 1..C-1 follow the plan's images
+    // in the snapshot. Mode M appends the (key, slot) mapping the SPIR-V selector searches to the
+    // flattened SRT in a block of fixed size, so the offsets (part of the specialization) never
+    // depend on the keys; mode T selects the slot of the key itself and appends a bitmask of the
+    // mapped slots.
     for (std::uint32_t i = 0; i < plan.info.images.size(); i++) {
         const auto& table = tables[i];
         if (table.slots.empty()) {
             continue;
         }
         const auto mappingOffset = static_cast<std::uint32_t>(snapshot.flattenedSrt.size());
-        snapshot.flattenedSrt.push_back(static_cast<std::uint32_t>(table.mapping.size()));
-        for (const auto& [key, slot] : table.mapping) {
-            snapshot.flattenedSrt.push_back(key);
-            snapshot.flattenedSrt.push_back(slot);
+        if (table.direct) {
+            snapshot.flattenedSrt.resize(mappingOffset + (table.slots.size() + 31u) / 32u, 0u);
+            for (const auto& [key, slot] : table.mapping) snapshot.flattenedSrt[mappingOffset + slot / 32u] |= 1u << (slot % 32u);
+        } else {
+            snapshot.flattenedSrt.push_back(static_cast<std::uint32_t>(table.mapping.size()));
+            for (const auto& [key, slot] : table.mapping) {
+                snapshot.flattenedSrt.push_back(key);
+                snapshot.flattenedSrt.push_back(slot);
+            }
+            snapshot.flattenedSrt.resize(mappingOffset + 1u + 2u * table.slots.size(), 0u);
         }
-        snapshot.flattenedSrt.resize(mappingOffset + 1u + 2u * table.slots.size(), 0u);
-        auto root = result.images[i];
+        auto& root = result.images[i];
         root.indirectRoot = i;
         root.indirectMappingOffset = mappingOffset;
-        root.indirectSearchIterations = static_cast<std::uint32_t>(std::bit_width(table.slots.size()));
-        result.images[i] = root;
-        root.indirectMappingOffset = 0u;
-        root.indirectSearchIterations = 0u;
-        for (std::uint32_t slot = 1; slot < table.slots.size(); slot++) {
-            result.images.push_back(root);
-            snapshot.images.push_back(table.slots[slot]);
-        }
+        root.indirectSearchIterations = table.direct ? 0u : static_cast<std::uint32_t>(std::bit_width(table.slots.size()));
+        root.indirectSlots = static_cast<std::uint32_t>(table.slots.size());
+        snapshot.images.insert(snapshot.images.end(), table.slots.begin() + 1, table.slots.end());
     }
 
     result.boundDescriptors.clear();
@@ -617,18 +680,12 @@ void ResourceMaterializer::Apply(IrProgram& program, const ResourceSpecializatio
         image.indirectRoot = source.indirectRoot;
         image.indirectMappingOffset = source.indirectMappingOffset;
         image.indirectSearchIterations = source.indirectSearchIterations;
+        image.indirectSlots = source.indirectSlots;
         image.cube = source.cube;
         image.depthBits = source.depthBits;
         image.depthUnorm16 = source.depthUnorm16;
-        image.indirectResources.clear();
-    }
-    for (std::uint32_t index = 0; index < images.size(); index++) {
-        const auto root = images[index].indirectRoot;
-        if (root != ImageResource::NoIndirectImage) {
-            if (root >= images.size()) {
-                throw std::runtime_error("ResourceMaterializer::Apply indirect image root is out of range");
-            }
-            images[root].indirectResources.push_back(index);
+        if ((image.indirectRoot != ImageResource::NoIndirectImage && image.indirectRoot != index) || (image.indirectRoot == index) != (image.indirectSlots != 0u)) {
+            throw std::runtime_error("ResourceMaterializer::Apply image " + std::to_string(index) + " has an inconsistent bindless table root " + std::to_string(image.indirectRoot) + " with " + std::to_string(image.indirectSlots) + " slots");
         }
     }
 
@@ -770,12 +827,6 @@ void ResourceMaterializer::Apply(IrProgram& program, const ResourceSpecializatio
                 throw std::runtime_error("ResourceMaterializer::Apply cannot remap an indirect image root");
             }
             image.indirectRoot = imageRemap[image.indirectRoot];
-        }
-        for (auto& resource : image.indirectResources) {
-            if (resource >= imageRemap.size() || imageRemap[resource] == NoRemap) {
-                throw std::runtime_error("ResourceMaterializer::Apply cannot remap an indirect image resource");
-            }
-            resource = imageRemap[resource];
         }
     }
     if (images.size() != imageRemap.size()) {
@@ -939,6 +990,18 @@ std::uint32_t ResourceMaterializer::BindlessSlots() {
     return slots;
 }
 
+namespace {
+std::atomic<std::uint32_t> bindlessTableLimit{16384u};
+}
+
+std::uint32_t ResourceMaterializer::BindlessTableLimit() {
+    return bindlessTableLimit.load(std::memory_order_relaxed);
+}
+
+void ResourceMaterializer::SetBindlessTableLimit(std::uint32_t limit) {
+    bindlessTableLimit.store(std::clamp(limit, BindlessSlots(), 16384u), std::memory_order_relaxed);
+}
+
 void ResourceMaterializer::CountBindlessRejection(BindlessRejection reason) {
     if (reason < BindlessRejection::Count) bindlessCounters().rejected[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 }
@@ -948,7 +1011,7 @@ bool ResourceSpecialization::Buffer::operator==(const Buffer& other) const {
 }
 
 bool ResourceSpecialization::Image::operator==(const Image& other) const {
-    return numericClass == other.numericClass && dimension == other.dimension && mipCount == other.mipCount && conversionFormat == other.conversionFormat && shaderSwizzle == other.shaderSwizzle && indirectRoot == other.indirectRoot && indirectMappingOffset == other.indirectMappingOffset && indirectSearchIterations == other.indirectSearchIterations && cube == other.cube && fmask == other.fmask && depthBits == other.depthBits && depthUnorm16 == other.depthUnorm16;
+    return numericClass == other.numericClass && dimension == other.dimension && mipCount == other.mipCount && conversionFormat == other.conversionFormat && shaderSwizzle == other.shaderSwizzle && indirectRoot == other.indirectRoot && indirectMappingOffset == other.indirectMappingOffset && indirectSearchIterations == other.indirectSearchIterations && indirectSlots == other.indirectSlots && cube == other.cube && fmask == other.fmask && depthBits == other.depthBits && depthUnorm16 == other.depthUnorm16;
 }
 
 bool ResourceSpecialization::operator==(const ResourceSpecialization& other) const {
