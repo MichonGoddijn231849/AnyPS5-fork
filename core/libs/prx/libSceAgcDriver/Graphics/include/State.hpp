@@ -50,6 +50,8 @@ struct ColorTarget {
     std::uint32_t slot = 0;
     std::uint32_t samples = 1;
     std::uint64_t cmaskAddress = 0;
+    std::uint32_t depth = 1;
+    std::uint32_t depthSlice = 0;
 };
 
 struct DepthTarget {
