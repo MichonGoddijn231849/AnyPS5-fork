@@ -61,7 +61,7 @@ public:
     void RecordEvent(EventType type, std::span<const std::byte> payload);
     void RecordAddressSpaceChanges();
     void RecordDelta(std::span<const std::uint64_t> progress);
-    void RecordShader(std::uint64_t header, std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks);
+    void RecordShader(std::uint64_t codeAddress, std::uint64_t headerAddress, std::uint8_t type, std::span<const std::uint32_t> code, std::span<const std::byte> header);
     void RecordSubmit(const SubmitEvent& submit, std::span<const std::uint32_t> words);
     void NotePresent(const DisplayBuffer* buffer, bool opaque, std::string& dumpPath);
     bool PresentsReached(std::uint64_t flipsEnd) const;
@@ -104,7 +104,7 @@ private:
     };
     Counts base;
     Counts mapped;
-    Counts shader;
+    std::uint64_t shaderBytes = 0;
     std::vector<Counts> deltaPerFrame;
     std::uint64_t addressSpaceChanges = 0;
     std::uint64_t piecesAdded = 0;

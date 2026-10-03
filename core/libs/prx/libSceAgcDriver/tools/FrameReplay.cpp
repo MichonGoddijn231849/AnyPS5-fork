@@ -622,9 +622,14 @@ private:
         case EventType::Suspend:
             AgcDriverSuspendPoint_nid_postfix();
             break;
-        case EventType::Shader:
-            AgcDriverRegisterShader_nid_postfix(reinterpret_cast<const Shader*>(static_cast<std::uintptr_t>(reader.Get<std::uint64_t>())));
+        case EventType::Shader: {
+            const auto codeAddress = reader.Get<std::uint64_t>();
+            const auto headerAddress = reader.Get<std::uint64_t>();
+            const auto type = reader.Get<std::uint8_t>();
+            const auto code = reader.GetSpan<std::uint32_t>();
+            ReplayRegisterShader(codeAddress, headerAddress, type, code, reader.GetSpan<std::byte>());
             break;
+        }
         case EventType::QueueState: {
             const auto queue = reader.Get<std::uint32_t>();
             ReplayRestoreQueueState(queue, reader.GetSpan<std::byte>());

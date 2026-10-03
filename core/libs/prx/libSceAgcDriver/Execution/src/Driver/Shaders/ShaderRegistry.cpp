@@ -112,8 +112,18 @@ void Driver::RegisterShader(const Shader* shader) {
     }
     std::lock_guard lock(mutex);
     rethrowFailure();
-    const auto address = snapshot.codeAddress;
+    insertShader(std::move(snapshot), shader);
+}
 
+void Driver::RegisterShaderSnapshot(ShaderSnapshot snapshot) {
+    require(snapshot.header.size() >= sizeof(Shader) && !snapshot.code.empty(), "invalid shader snapshot");
+    std::lock_guard lock(mutex);
+    rethrowFailure();
+    insertShader(std::move(snapshot), nullptr);
+}
+
+void Driver::insertShader(ShaderSnapshot snapshot, const Shader* prepare) {
+    const auto address = snapshot.codeAddress;
     if (shaders == nullptr) shaders = std::make_shared<ShaderRegistry>();
     else if (shaders.use_count() != 1) shaders = std::make_shared<ShaderRegistry>(*shaders);
     shaders->insert_or_assign(address, std::make_shared<const ShaderSnapshot>(std::move(snapshot)));

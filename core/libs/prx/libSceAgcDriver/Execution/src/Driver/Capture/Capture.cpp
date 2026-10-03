@@ -100,26 +100,7 @@ std::vector<std::uint64_t> Driver::captureProgress() const {
 
 void Driver::captureShader(const ShaderSnapshot& snapshot) {
     if (snapshot.codeAddress == NullPixelProgramAddress()) return;
-    require(snapshot.header.size() >= sizeof(Shader), "registered shader header is too small");
-    Shader shader;
-    std::memcpy(&shader, snapshot.header.data(), sizeof(Shader));
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> blocks;
-    const auto add = [&](const void* pointer, std::uint64_t bytes) {
-        if (pointer != nullptr && bytes != 0 && GuestMemory::Accessible(pointer, static_cast<std::size_t>(bytes))) blocks.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
-    };
-    add(reinterpret_cast<const void*>(snapshot.headerAddress), snapshot.header.size());
-    add(reinterpret_cast<const void*>(snapshot.codeAddress), snapshot.code.size() * sizeof(std::uint32_t));
-    add(shader.cx_registers, static_cast<std::uint64_t>(shader.num_cx_registers) * sizeof(ShaderRegister));
-    add(shader.sh_registers, static_cast<std::uint64_t>(shader.num_sh_registers) * sizeof(ShaderRegister));
-    add(shader.specials, sizeof(ShaderSpecialRegs));
-    add(shader.input_semantics, static_cast<std::uint64_t>(shader.num_input_semantics) * sizeof(ShaderSemantic));
-    add(shader.output_semantics, static_cast<std::uint64_t>(shader.num_output_semantics) * sizeof(ShaderSemantic));
-    if (shader.user_data != nullptr && GuestMemory::Accessible(shader.user_data, sizeof(ShaderUserData))) {
-        add(shader.user_data, sizeof(ShaderUserData));
-        add(shader.user_data->direct_resource_offset, static_cast<std::uint64_t>(shader.user_data->direct_resource_count) * sizeof(std::uint16_t));
-        for (std::size_t i = 0; i < 4; ++i) add(shader.user_data->sharp_resource_offset[i], static_cast<std::uint64_t>(shader.user_data->sharp_resource_count[i]) * sizeof(ShaderSharp));
-    }
-    Capture::FrameCapture::Get().RecordShader(snapshot.headerAddress, blocks);
+    Capture::FrameCapture::Get().RecordShader(snapshot.codeAddress, snapshot.headerAddress, snapshot.type, snapshot.code, snapshot.header);
 }
 
 bool Driver::DrainFor(std::chrono::milliseconds limit) {
@@ -288,6 +269,10 @@ void ReplayRestoreQueueState(std::uint32_t queue, std::span<const std::byte> sta
 
 void ReplayRestoreDriverState(bool resetGraphics, std::span<const std::byte> gds) {
     DriverDetail::Driver::Get().RestoreDriverState(resetGraphics, gds);
+}
+
+void ReplayRegisterShader(std::uint64_t codeAddress, std::uint64_t headerAddress, std::uint8_t type, std::span<const std::uint32_t> code, std::span<const std::byte> header) {
+    DriverDetail::Driver::Get().RegisterShaderSnapshot({codeAddress, headerAddress, type, {code.begin(), code.end()}, {header.begin(), header.end()}});
 }
 
 void ReplayDumpNextPresent(std::string path, std::uint32_t scale) {

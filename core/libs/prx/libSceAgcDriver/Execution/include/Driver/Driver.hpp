@@ -64,6 +64,7 @@ public:
     void Settle();
     void RestoreQueueState(std::uint32_t queue, std::span<const std::byte> state);
     void RestoreDriverState(bool reset, std::span<const std::byte> gds);
+    void RegisterShaderSnapshot(ShaderSnapshot snapshot);
 
 private:
     friend class SampledReadScope;
@@ -246,6 +247,7 @@ private:
     static void captureFailed(const std::exception& error);
     std::vector<std::uint64_t> captureProgress() const;
     static void captureShader(const ShaderSnapshot& snapshot);
+    void insertShader(ShaderSnapshot snapshot, const Shader* prepare);
     static void checkReplayCommands(std::span<const std::uint32_t> commands);
     static void recordVideoOutput(std::uint32_t handle, bool registered);
     static std::vector<std::byte> serializeQueueState(const QueueState& state);

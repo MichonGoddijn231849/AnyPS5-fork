@@ -264,19 +264,16 @@ void FrameCapture::RecordDelta(std::span<const std::uint64_t> progress) {
     if (!kept.empty()) recordPages(MemoryKind::Delta, kept);
 }
 
-void FrameCapture::RecordShader(std::uint64_t header, std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks) {
-    std::vector<std::uint64_t> pagesOfShader;
-    for (const auto& [address, bytes] : blocks) {
-        if (bytes == 0) continue;
-        for (auto page = address & ~static_cast<std::uint64_t>(PageBytes - 1); page < address + bytes; page += PageBytes) pagesOfShader.push_back(page);
-    }
-    std::sort(pagesOfShader.begin(), pagesOfShader.end());
-    pagesOfShader.erase(std::unique(pagesOfShader.begin(), pagesOfShader.end()), pagesOfShader.end());
-    recordPages(MemoryKind::Shader, pagesOfShader);
+void FrameCapture::RecordShader(std::uint64_t codeAddress, std::uint64_t headerAddress, std::uint8_t type, std::span<const std::uint32_t> code, std::span<const std::byte> header) {
     Writer shaderEvent;
-    shaderEvent.Put(header);
+    shaderEvent.Put(codeAddress);
+    shaderEvent.Put(headerAddress);
+    shaderEvent.Put(type);
+    shaderEvent.PutSpan(code);
+    shaderEvent.PutSpan(header);
     RecordEvent(EventType::Shader, shaderEvent.data);
     ++shaders;
+    shaderBytes += code.size_bytes() + header.size();
 }
 
 void FrameCapture::RecordSubmit(const SubmitEvent& submit, std::span<const std::uint32_t> words) {
@@ -386,8 +383,8 @@ void FrameCapture::recordPages(MemoryKind kind, std::span<const std::uint64_t> p
     std::vector<std::uint32_t> indices;
     std::array<std::byte, PageBytes> page{};
     const auto frame = static_cast<std::size_t>(flips - flipsBefore);
-    if (kind == MemoryKind::Delta && deltaPerFrame.size() <= frame) deltaPerFrame.resize(frame + 1);
-    auto& counts = kind == MemoryKind::Delta ? deltaPerFrame[frame] : shader;
+    if (deltaPerFrame.size() <= frame) deltaPerFrame.resize(frame + 1);
+    auto& counts = deltaPerFrame[frame];
     const auto before = storedPages;
     for (const auto address : pageList) {
         if (GuestMemory::CopyMapped(address, page) != GuestMemory::Compare::Equal) continue;
@@ -455,7 +452,7 @@ void FrameCapture::writeSummary(const char* status, const std::string& detail) {
     std::fprintf(file, "; command words %.2f MiB; shaders recorded (registered before or during the capture) %llu\n", Mib(submitWords * 4), static_cast<unsigned long long>(shaders));
     std::fprintf(file, "address space: %zu pieces, %zu registry ranges, %llu changes (+%llu/-%llu pieces), %zu backings\n", current.pieces.size(), current.registry.size(), static_cast<unsigned long long>(addressSpaceChanges), static_cast<unsigned long long>(piecesAdded), static_cast<unsigned long long>(piecesRemoved), backingIds.size());
     std::fprintf(file, "size: base %.2f GiB of GPU-visible pages (%.2f GiB zero) -> %.2f GiB stored; pages.bin %.2f GiB; events.bin %.1f MiB; total %.2f GiB\n", Gib(base.pages * PageBytes), Gib(base.zeroPages * PageBytes), Gib(base.storedPages * PageBytes), Gib(pagesBytes), Mib(eventsTotal), Gib(pagesBytes + eventsTotal));
-    std::fprintf(file, "mapped during capture: %.1f MiB (%.1f MiB stored); shader pages %.1f MiB\n", Mib(mapped.pages * PageBytes), Mib(mapped.storedPages * PageBytes), Mib(shader.pages * PageBytes));
+    std::fprintf(file, "mapped during capture: %.1f MiB (%.1f MiB stored); shader code and headers %.1f MiB\n", Mib(mapped.pages * PageBytes), Mib(mapped.storedPages * PageBytes), Mib(shaderBytes));
     std::fprintf(file, "deltas per frame (%llu delta points):", static_cast<unsigned long long>(deltaPoints));
     for (std::size_t frame = 0; frame < deltaPerFrame.size(); ++frame) std::fprintf(file, " [%zu] %.1f MiB written, %.1f MiB new;", frame, Mib(deltaPerFrame[frame].pages * PageBytes), Mib(deltaPerFrame[frame].storedPages * PageBytes));
     std::fprintf(file, "\n");

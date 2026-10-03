@@ -15,6 +15,7 @@ bool ReplayDrain(std::chrono::milliseconds limit);
 void ReplaySettle();
 void ReplayRestoreQueueState(std::uint32_t queue, std::span<const std::byte> state);
 void ReplayRestoreDriverState(bool resetGraphics, std::span<const std::byte> gds);
+void ReplayRegisterShader(std::uint64_t codeAddress, std::uint64_t headerAddress, std::uint8_t type, std::span<const std::uint32_t> code, std::span<const std::byte> header);
 void ReplayDumpNextPresent(std::string path, std::uint32_t scale);
 void ReplayExpectCommands(std::uint64_t hash);
 std::uint64_t ReplayCommandMismatches();

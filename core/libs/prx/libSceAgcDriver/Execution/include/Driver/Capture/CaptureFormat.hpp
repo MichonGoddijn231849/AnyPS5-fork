@@ -13,7 +13,7 @@
 namespace AgcDriver::Capture {
 
 inline constexpr std::array<char, 8> Magic{'A', 'P', 'S', '5', 'C', 'A', 'P', '1'};
-inline constexpr std::uint32_t Version = 1;
+inline constexpr std::uint32_t Version = 2;
 inline constexpr std::size_t PageBytes = 4096;
 inline constexpr std::uint32_t ZeroPage = 0xffffffffu;
 inline constexpr std::uint32_t QueueCount = 0x58;
@@ -78,7 +78,7 @@ struct MemoryRun {
     std::uint32_t reserved;
 };
 
-enum class MemoryKind : std::uint32_t { Base = 0, Delta = 1, Mapped = 2, Shader = 3 };
+enum class MemoryKind : std::uint32_t { Base = 0, Delta = 1, Mapped = 2 };
 
 struct BeginEvent {
     std::uint64_t firstFrame;
