@@ -131,6 +131,7 @@ struct Context {
     bool descriptorIndexing = false;
     bool geometryShader = false;
     bool sampleRateShading = false;
+    bool demoteToHelperInvocation = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
 
