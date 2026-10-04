@@ -5,7 +5,6 @@
 #include <array>
 #include <bit>
 #include <cstdint>
-#include <initializer_list>
 #include <utility>
 #include <vector>
 
@@ -202,52 +201,42 @@ bool lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancil
     }
     std::vector<IrUse> uses;
     collectUses(ancillary, uses);
-    if (uses.empty()) {
-        return false;
-    }
-    IrBlock& block = *ancillary.Parent();
-    const auto emit = [&](IrOpcode opcode, std::initializer_list<IrValue*> arguments) -> IrValue& {
-        IrValue& created = program.CreateValue(opcode, IrType::U32);
-        for (IrValue* argument : arguments) {
-            created.AddArgument(argument);
-        }
-        block.InsertInstructionBefore(&ancillary, &created);
-        return created;
-    };
     std::array<IrValue*, 2> fields {};
     const auto field = [&](std::size_t index) -> IrValue& {
         if (fields[index] == nullptr) {
             const auto builtin = index == 0u ? StageInputKind::SampleId : StageInputKind::Layer;
-            fields[index] = &emit(IrOpcode::GetBuiltin, {&builder.Constant(static_cast<std::uint32_t>(builtin)), &builder.Constant(0u)});
+            IrValue& created = program.CreateValue(IrOpcode::GetBuiltin, IrType::U32);
+            created.AddArgument(&builder.Constant(static_cast<std::uint32_t>(builtin)));
+            created.AddArgument(&builder.Constant(0u));
+            ancillary.Parent()->InsertInstructionBefore(&ancillary, &created);
+            fields[index] = &created;
         }
         return *fields[index];
     };
     constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 2> ranges {{{8u, 4u}, {16u, 13u}}};
-    IrValue* packed = nullptr;
+    bool lowered = false;
     for (const IrUse& use : uses) {
         IrValue& user = *use.user;
-        if ((user.Opcode() == IrOpcode::BitFieldUExtract || user.Opcode() == IrOpcode::BitFieldSExtract) && use.operand == 0u) {
-            auto& offset = resolveArg(user, 1);
-            auto& count = resolveArg(user, 2);
-            if (isImmediate(offset, IrType::U32) && isImmediate(count, IrType::U32) && count.ImmediateU32() != 0u) {
-                const auto range = std::ranges::find_if(ranges, [&](const auto& candidate) {
-                    return offset.ImmediateU32() >= candidate.first && count.ImmediateU32() <= candidate.first + candidate.second - offset.ImmediateU32();
-                });
-                if (range != ranges.end()) {
-                    user.ReplaceArgument(0, &field(static_cast<std::size_t>(range - ranges.begin())));
-                    user.ReplaceArgument(1, &builder.Constant(offset.ImmediateU32() - range->first));
-                    continue;
-                }
-            }
+        if ((user.Opcode() != IrOpcode::BitFieldUExtract && user.Opcode() != IrOpcode::BitFieldSExtract) || use.operand != 0u) {
+            continue;
         }
-        if (packed == nullptr) {
-            IrValue& sample = emit(IrOpcode::ShiftLeftLogical32, {&field(0u), &builder.Constant(ranges[0].first)});
-            IrValue& layer = emit(IrOpcode::ShiftLeftLogical32, {&field(1u), &builder.Constant(ranges[1].first)});
-            packed = &emit(IrOpcode::BitwiseOr32, {&sample, &layer});
+        auto& offset = resolveArg(user, 1);
+        auto& count = resolveArg(user, 2);
+        if (!isImmediate(offset, IrType::U32) || !isImmediate(count, IrType::U32) || count.ImmediateU32() == 0u) {
+            continue;
         }
-        user.ReplaceArgument(use.operand, packed);
+        const auto range = std::ranges::find_if(ranges, [&](const auto& candidate) {
+            return offset.ImmediateU32() >= candidate.first && count.ImmediateU32() <= candidate.second &&
+                   offset.ImmediateU32() - candidate.first <= candidate.second - count.ImmediateU32();
+        });
+        if (range == ranges.end()) {
+            continue;
+        }
+        user.ReplaceArgument(0, &field(static_cast<std::size_t>(range - ranges.begin())));
+        user.ReplaceArgument(1, &builder.Constant(offset.ImmediateU32() - range->first));
+        lowered = true;
     }
-    return true;
+    return lowered;
 }
 
 } // namespace
