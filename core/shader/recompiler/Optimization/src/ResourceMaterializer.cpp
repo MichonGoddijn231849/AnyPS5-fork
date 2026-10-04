@@ -1052,7 +1052,7 @@ std::uint32_t ResourceMaterializer::BindlessTableLimit() {
 }
 
 void ResourceMaterializer::SetBindlessTableLimit(std::uint32_t limit) {
-    bindlessTableLimit.store(std::clamp(limit, BindlessSlots(), 16384u), std::memory_order_relaxed);
+    bindlessTableLimit.store(std::clamp(limit, BindlessSlots(), 65536u), std::memory_order_relaxed);
 }
 
 void ResourceMaterializer::CountBindlessRejection(BindlessRejection reason) {
