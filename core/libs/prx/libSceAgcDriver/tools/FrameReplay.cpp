@@ -61,6 +61,7 @@ struct Options {
     std::optional<std::filesystem::path> png;
     std::uint32_t pngScale = 1;
     bool pngAllLoops = false;
+    bool deltaMerge = true;
     std::optional<std::filesystem::path> compare;
     bool pacing = true;
     bool settle = false;
@@ -843,7 +844,7 @@ private:
             const auto memoryStarted = Clock::now();
             {
                 std::unique_lock replayWrites(ReplayMemoryWriteMutex());
-                writeRuns(runs, reader.GetSpan<std::uint32_t>(), false, kind == MemoryKind::Delta);
+                writeRuns(runs, reader.GetSpan<std::uint32_t>(), false, options.deltaMerge && kind == MemoryKind::Delta);
             }
             memoryMs += std::chrono::duration<double, std::milli>(Clock::now() - memoryStarted).count();
             for (const auto& run : runs) memoryBytes += static_cast<std::uint64_t>(run.pages) * PageBytes;
@@ -1195,6 +1196,7 @@ Options ParseOptions(int argc, char** argv) {
         else if (argument == "--compare") options.compare = value();
         else if (argument == "--no-pacing") options.pacing = false;
         else if (argument == "--no-restore-collect") options.restoreCollect = false;
+        else if (argument == "--no-delta-merge") options.deltaMerge = false;
         else if (argument == "--settle") options.settle = true;
         else if (argument == "--hidden") options.hidden = true;
         else if (argument == "--shader-cache") options.shaderCache = value();

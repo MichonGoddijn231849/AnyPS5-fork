@@ -37,6 +37,7 @@ Output:
 | `--cold[=classes]` | Between loops clear the driver's in-memory caches so every loop misses them like new frames do in the game. Classes: `dispatch` (dispatch cache and its recipes), `draw` (draw cache and recipes), `resources` (resource cache), `textures` (sampled/storage textures, flushed first), `tables` (bindless sampled tables, BDA tables), `space` (address-space cache); presets `live` (everything but textures, the default of `--cold`) and `all`. The shader disk cache, compiled shaders and pipelines stay warm. |
 | `--for-seconds S` | Loop until S seconds have passed after loop 0 (instead of `--loop`). |
 | `--no-restore-collect` | Leave the restore's write-watch walk to the first frame (by default the replay collects the pages it rewrote before the loop starts). |
+| `--no-delta-merge` | Copy each delta page whole instead of only the words the capture changed since the page's previous captured version (by default the words the replay's GPU wrote ahead of the capture are kept). |
 
 Each loop also prints `frame ms` (every frame's time: from the loop start, or the previous frame's GPU completion, to its own) and the time spent writing the capture's memory deltas. Deltas of 256 pages or more are written by four threads, as the title's own threads write them in the game. `APS5_TRACE_PACING=ms` lists the pacing waits longer than that with every queue's progress.
 
