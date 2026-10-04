@@ -166,8 +166,8 @@ void verifyRequest(const char* path) {
 
 std::size_t recompile(const std::string& name, std::span<const std::uint32_t> code, std::uint32_t subgroupSize) {
     const std::array<std::uint32_t, 4> userData{0x10000000u, 0x00100000u, 0x40u, 0x00027facu};
-    const std::array<std::uint32_t, 2> capabilities{1u, 61u};
-    const std::array<std::string_view, 1> extensions{"SPV_KHR_storage_buffer_storage_class"};
+    const std::array<std::uint32_t, 5> capabilities{1u, 61u, 11u, 5347u, 4448u};
+    const std::array<std::string_view, 3> extensions{"SPV_KHR_storage_buffer_storage_class", "SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
     RecompileRequest request{};
     request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
     request.context.waveSize = 64;
@@ -616,6 +616,18 @@ early_exit:
   s_endpgm)",
          {0x7e020280u, 0xbf06c002u, 0xbf850003u, 0x4a020081u, 0xbf068003u, 0xbf850006u, 0x7d880088u, 0xbf870001u, 0x4a020282u, 0xe0700000u,
           0x80000100u, 0xbf810000u, 0xbefe0480u, 0xbf810000u},
+         Split::None},
+        {"format load through a V# read from a table at a lane's index", R"(
+  v_readfirstlane_b32 s4, v0
+  s_lshl_b32 s4, s4, 4
+  s_buffer_load_dwordx4 s[8:11], s[0:3], s4
+  s_waitcnt lgkmcnt(0)
+  buffer_load_format_x v1, v0, s[8:11], 0 idxen
+  s_waitcnt vmcnt(0)
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         {0x7e080500u, 0x8f048404u, 0xf4280200u, 0x08000000u, 0xbf8cc07fu, 0xe0002000u, 0x80020100u, 0xbf8c3f70u, 0xe0700000u, 0x80000100u,
+          0xbf810000u},
          Split::None},
     };
     int failures = 0;
