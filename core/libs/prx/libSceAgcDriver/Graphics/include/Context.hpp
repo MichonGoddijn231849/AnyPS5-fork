@@ -5,6 +5,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -29,7 +30,24 @@ inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
 }
 
+// Debug aid: APS5_GPU_CHECKPOINTS=1 records a VK_NV_device_diagnostic_checkpoints marker (the
+// program address) before each guest dispatch; a device loss reports the last ones the GPU reached.
+inline PFN_vkCmdSetCheckpointNV& CheckpointMarker() {
+    static PFN_vkCmdSetCheckpointNV marker = nullptr;
+    return marker;
+}
+
+// Reports why the device was lost (VK_EXT_device_fault), set once the device supports it.
+inline void (*&DeviceLostHook())() {
+    static void (*hook)() = nullptr;
+    return hook;
+}
+
 inline void Check(VkResult result, const char* operation) {
+    if (result == VK_ERROR_DEVICE_LOST && DeviceLostHook() != nullptr) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) DeviceLostHook()();
+    }
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
 

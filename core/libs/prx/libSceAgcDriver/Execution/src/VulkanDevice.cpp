@@ -987,9 +987,75 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     } else {
         std::fprintf(stderr, "[gpu] timeline semaphores unavailable or disabled; drains wait under the GPU mutex\n");
     }
+    // VK_EXT_device_fault: after a device loss the driver names the faulting addresses (see
+    // ReportDeviceFault, called from Check on VK_ERROR_DEVICE_LOST).
+    VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (hasExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &faultFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        if (faultFeatures.deviceFault == VK_TRUE) {
+            faultFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+            faultFeatures.deviceFault = VK_TRUE;
+            deviceExtensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+            deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+            deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+            faultFeatures.pNext = byteFeatures.pNext;
+            byteFeatures.pNext = &faultFeatures;
+        }
+    }
+    const bool checkpoints = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr && hasExtension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    if (checkpoints) {
+        deviceExtensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+    }
     bdaFeatures.pNext = &byteFeatures;
     deviceInfo.pNext = &bdaFeatures;
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
+    static VkQueue checkpointQueue = VK_NULL_HANDLE;
+    static PFN_vkGetQueueCheckpointDataNV checkpointData = nullptr;
+    if (checkpoints) {
+        Graphics::CheckpointMarker() = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
+        checkpointData = state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV");
+        state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &checkpointQueue);
+    }
+    if (faultFeatures.deviceFault == VK_TRUE || checkpoints) {
+        static VkDevice faultDevice = VK_NULL_HANDLE;
+        static PFN_vkGetDeviceFaultInfoEXT faultInfo = nullptr;
+        faultDevice = state->device;
+        if (faultFeatures.deviceFault == VK_TRUE) faultInfo = state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT");
+        Graphics::DeviceLostHook() = [] {
+            if (checkpointData != nullptr && checkpointQueue != VK_NULL_HANDLE) {
+                std::uint32_t count = 0;
+                checkpointData(checkpointQueue, &count, nullptr);
+                std::vector<VkCheckpointDataNV> data(count, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+                checkpointData(checkpointQueue, &count, data.data());
+                for (const auto& point : data) std::fprintf(stderr, "[device-fault] checkpoint: program 0x%llx at stage 0x%x\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(point.pCheckpointMarker)), static_cast<unsigned>(point.stage));
+            }
+            if (faultInfo == nullptr) return;
+            VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+            if (faultInfo(faultDevice, &counts, nullptr) != VK_SUCCESS && counts.addressInfoCount == 0) {
+                std::fprintf(stderr, "[device-fault] vkGetDeviceFaultInfoEXT reported nothing\n");
+                return;
+            }
+            std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+            std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+            counts.vendorBinarySize = 0;
+            VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+            info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+            info.pVendorInfos = vendor.empty() ? nullptr : vendor.data();
+            const auto result = faultInfo(faultDevice, &counts, &info);
+            std::fprintf(stderr, "[device-fault] result %d: %s\n", static_cast<int>(result), info.description);
+            static constexpr const char* kinds[] = {"none", "read invalid", "write invalid", "execute invalid", "instruction pointer unknown", "instruction pointer invalid", "instruction pointer fault"};
+            for (const auto& address : addresses) {
+                const auto kind = static_cast<std::size_t>(address.addressType);
+                std::fprintf(stderr, "[device-fault] %s at 0x%llx (precision 0x%llx)\n", kind < std::size(kinds) ? kinds[kind] : "?", static_cast<unsigned long long>(address.reportedAddress), static_cast<unsigned long long>(address.addressPrecision));
+            }
+            for (const auto& entry : vendor) {
+                std::fprintf(stderr, "[device-fault] vendor: %s (code 0x%llx, data 0x%llx)\n", entry.description, static_cast<unsigned long long>(entry.vendorFaultCode), static_cast<unsigned long long>(entry.vendorFaultData));
+            }
+        };
+    }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -3130,6 +3196,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::PipelinePushConstantBytes, record.pushBytes->data());
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
+    if (Graphics::CheckpointMarker() != nullptr) Graphics::CheckpointMarker()(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));
     if (argumentImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
     else context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, record.x, record.y, record.z);
     recorder.EndGpuTiming(gpuTiming);
