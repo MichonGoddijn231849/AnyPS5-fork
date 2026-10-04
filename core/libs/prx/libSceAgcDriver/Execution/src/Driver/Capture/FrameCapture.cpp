@@ -3,6 +3,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
+#include <limits>
 #include <algorithm>
 #include <bit>
 #include <cinttypes>
@@ -95,8 +96,24 @@ FrameCapture::FrameCapture() {
     limitBytes = (limit != nullptr ? std::strtoull(limit, nullptr, 10) : 20ull) << 30u;
     if (limitBytes == 0) throw std::invalid_argument("APS5_CAPTURE_MAX_GB must be positive");
     nextAttempt = firstFrame;
+    if (const char* trigger = std::getenv("APS5_CAPTURE_TRIGGER"); trigger != nullptr && *trigger != '    nextAttempt = firstFrame;') {
+        triggerPath = trigger;
+        nextAttempt = std::numeric_limits<std::uint64_t>::max();
+    }
     std::fprintf(stderr, "[frame-capture] armed: frames %llu-%llu into %s (limit %.0f GiB)\n", static_cast<unsigned long long>(firstFrame), static_cast<unsigned long long>(lastFrame), directory.c_str(), Gib(limitBytes));
     phase.store(Phase::Waiting, std::memory_order_release);
+}
+
+void FrameCapture::PollTrigger() {
+    if (triggerPath.empty() || nextAttempt != std::numeric_limits<std::uint64_t>::max()) return;
+    std::error_code error;
+    if (!std::filesystem::exists(triggerPath, error)) return;
+    std::filesystem::remove(triggerPath, error);
+    const auto span = lastFrame - firstFrame;
+    firstFrame = flips + 1;
+    lastFrame = firstFrame + span;
+    nextAttempt = firstFrame;
+    std::fprintf(stderr, "[frame-capture] triggered: frames %llu-%llu\n", static_cast<unsigned long long>(firstFrame), static_cast<unsigned long long>(lastFrame));
 }
 
 void FrameCapture::Begin(std::uint64_t flipsBeforeStart) {

@@ -217,6 +217,7 @@ void Driver::captureBeforeSubmit() {
     auto& capture = Capture::FrameCapture::Get();
     try {
         if (!capture.Recording()) {
+            capture.PollTrigger();
             if (capture.flips < capture.nextAttempt) return;
             if (!captureStart()) {
                 capture.nextAttempt = capture.flips + 1;

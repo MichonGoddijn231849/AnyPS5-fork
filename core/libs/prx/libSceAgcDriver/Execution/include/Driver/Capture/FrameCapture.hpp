@@ -52,6 +52,9 @@ public:
     std::mutex& SubmitMutex() { return submitMutex; }
     std::uint64_t FirstFrame() const { return firstFrame; }
     std::uint64_t LastFrame() const { return lastFrame; }
+    // APS5_CAPTURE_TRIGGER=<file>: once the file exists the window (its length from APS5_CAPTURE_FRAMES)
+    // moves to start at the next flip, and the file is removed. Called before each submission.
+    void PollTrigger();
 
     std::uint64_t flips = 0;
     std::uint64_t nextAttempt = 0;
@@ -95,6 +98,7 @@ private:
     AddressSpace current;
     std::uint64_t registryGeneration = 0;
     std::uint64_t flipsBefore = 0;
+    std::string triggerPath;
     std::atomic<std::uint64_t> presentsSeen{0};
 
     struct Counts {
