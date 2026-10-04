@@ -130,7 +130,7 @@ void FrameCapture::Begin(std::uint64_t flipsBeforeStart) {
 
     const auto collectStart = std::chrono::steady_clock::now();
     for (const auto& piece : current.pieces) {
-        if (piece.kind != PieceKind::External && piece.gpu && piece.readable && piece.writable) GuestMemory::CollectWritesCommitted(piece.address, static_cast<std::size_t>(piece.bytes));
+        if (piece.kind != PieceKind::External && piece.gpu && piece.readable && piece.writable) GuestMemory::CollectWritesUncached(piece.address, static_cast<std::size_t>(piece.bytes));
     }
     static_cast<void>(GuestMemory::TakeCaptureDirtyPages());
     collectSeconds += Seconds(collectStart);
@@ -167,8 +167,9 @@ AddressSpace FrameCapture::snapshotAddressSpace(std::vector<Backing>& added) {
         return it->second;
     };
     for (const auto& range : ranges) {
-        const bool gpu = range.GpuAccessible();
-        space.registry.push_back({range.address, range.bytes, range.readable, range.writable, gpu, 0, range.sceProtection});
+        // This branch keeps no SCE protection per range: every range counts as GPU-visible.
+        const bool gpu = range.readable || range.writable;
+        space.registry.push_back({range.address, range.bytes, range.readable, range.writable, gpu, 0, -1});
         const auto end = range.address + range.bytes;
         auto mapping = std::upper_bound(direct.begin(), direct.end(), range.address, [](std::uint64_t address, const DirectMappingInfo& info) { return address < info.address; });
         if (mapping != direct.begin() && std::prev(mapping)->end > range.address) --mapping;
@@ -240,7 +241,7 @@ void FrameCapture::RecordDelta(std::span<const std::uint64_t> progress) {
     RecordAddressSpaceChanges();
     const auto collectStart = std::chrono::steady_clock::now();
     for (const auto& piece : current.pieces) {
-        if (piece.kind != PieceKind::External && piece.gpu && piece.readable && piece.writable) GuestMemory::CollectWritesCommitted(piece.address, static_cast<std::size_t>(piece.bytes));
+        if (piece.kind != PieceKind::External && piece.gpu && piece.readable && piece.writable) GuestMemory::CollectWritesUncached(piece.address, static_cast<std::size_t>(piece.bytes));
     }
     auto dirty = GuestMemory::TakeCaptureDirtyPages();
     collectSeconds += Seconds(collectStart);

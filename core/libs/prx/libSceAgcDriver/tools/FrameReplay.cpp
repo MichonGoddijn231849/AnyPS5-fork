@@ -184,7 +184,7 @@ public:
             for (const auto& range : registryAdded) {
                 const bool image = range.address < arenaBase || range.address + range.bytes > arenaBase + arenaBytes;
                 if (image) mutation.AddImage(reinterpret_cast<void*>(range.address), static_cast<std::size_t>(range.bytes), range.readable != 0, range.writable != 0);
-                else mutation.Add(reinterpret_cast<void*>(range.address), static_cast<std::size_t>(range.bytes), range.readable != 0, range.writable != 0, range.sceProtection);
+                else mutation.Add(reinterpret_cast<void*>(range.address), static_cast<std::size_t>(range.bytes), range.readable != 0, range.writable != 0);
             }
         }
         for (const auto& piece : removed) erase(pieces, piece, PieceLess);

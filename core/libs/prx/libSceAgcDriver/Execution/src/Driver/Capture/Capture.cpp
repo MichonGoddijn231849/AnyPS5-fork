@@ -99,7 +99,6 @@ std::vector<std::uint64_t> Driver::captureProgress() const {
 }
 
 void Driver::captureShader(const ShaderSnapshot& snapshot) {
-    if (snapshot.codeAddress == NullPixelProgramAddress()) return;
     Capture::FrameCapture::Get().RecordShader(snapshot.codeAddress, snapshot.headerAddress, snapshot.type, snapshot.code, snapshot.header);
 }
 
@@ -144,11 +143,10 @@ void Driver::RestoreQueueState(std::uint32_t queue, std::span<const std::byte> s
 }
 
 void Driver::RestoreDriverState(bool reset, std::span<const std::byte> gds) {
-    require(gds.size() == Pm4::GdsBytes, "capture GDS size differs");
+    // This branch does not emulate GDS; a capture carries none.
     std::lock_guard lock(mutex);
     require(completed >= accepted, "driver state restored while submissions are pending");
     resetGraphics = reset;
-    std::memcpy(reinterpret_cast<void*>(Pm4::GdsAddress()), gds.data(), gds.size());
 }
 
 void Driver::ClearCaches(std::uint32_t classes) {
@@ -168,8 +166,6 @@ void Driver::ClearCaches(std::uint32_t classes) {
         std::lock_guard lock(drawCacheMutex);
         drawCache.clear();
         drawShapes.clear();
-        drawFailures.clear();
-        drawFailureCount.store(0, std::memory_order_relaxed);
         drawOrder.clear();
         drawCacheVariants = 0;
         drawCacheVariantBytes = 0;
@@ -201,7 +197,7 @@ bool Driver::captureStart() {
         }
         Capture::Writer driverState;
         driverState.Put<std::uint8_t>(resetGraphics);
-        driverState.PutSpan<std::byte>(std::span(reinterpret_cast<const std::byte*>(Pm4::GdsAddress()), Pm4::GdsBytes));
+        driverState.PutSpan<std::byte>(std::span<const std::byte>{});
         capture.RecordEvent(Capture::EventType::DriverState, driverState.data);
         for (const auto& [handle, output] : outputs) {
             Capture::Writer writer;
