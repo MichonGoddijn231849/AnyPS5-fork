@@ -4,7 +4,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <cstdlib>
+#include <vector>
 #include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
@@ -14,6 +16,21 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     auto it = submission.shaders->upper_bound(address);
     require(it != submission.shaders->begin(), "compute program does not belong to a registered shader");
     --it;
+    // Debug aid: APS5_SKIP_PROGRAMS=<hex,...> drops the dispatches of those compute programs, to tell
+    // whether a GPU fault or hang comes from them.
+    static const std::vector<std::uint64_t> skipped = [] {
+        std::vector<std::uint64_t> parsed;
+        const char* text = std::getenv("APS5_SKIP_PROGRAMS");
+        while (text != nullptr && *text != 0) {
+            char* end = nullptr;
+            const auto value = std::strtoull(text, &end, 16);
+            if (end == text) break;
+            parsed.push_back(value);
+            text = *end == ',' ? end + 1 : end;
+        }
+        return parsed;
+    }();
+    if (!skipped.empty() && std::find(skipped.begin(), skipped.end(), address) != skipped.end()) return;
     const auto& snapshot = *it->second;
     require(address - snapshot.codeAddress < snapshot.code.size() * sizeof(std::uint32_t), "compute program is outside registered shader code");
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
