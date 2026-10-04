@@ -6,9 +6,11 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <span>
@@ -21,15 +23,18 @@ namespace AgcDriver::DriverDetail {
 namespace {
 
 // Debug aid (APS5_CHECK_BVH=1): before each dispatch of the BVH refit program (GTA V's RT, found by its first
-// code words), the PSR_BVHL blob behind user data 4-5 is checked the way the refit walks it: every leaf child
-// must start a list inside the list array that ends at an entry with its end bit (second dword negative) or
-// type 7. When a blob has more bad leaves than at its last check, the bad nodes and the dispatches since are
-// printed, to find what first corrupts it.
+// code words), and before every later dispatch that gets a blob the refit used in user data 4-5, that
+// PSR_BVHL blob is checked the way the refit walks it: every leaf child must start a list inside the list
+// array that ends at an entry with its end bit (second dword negative) or type 7. When a blob has more bad
+// leaves than at its last check, the bad nodes and the dispatches since that check are printed, to find
+// what first corrupts it.
 struct BvhCheck {
     std::mutex mutex;
     std::map<std::uint64_t, std::size_t> badLeaves;
-    std::vector<std::string> recent;
-    std::size_t next = 0;
+    std::map<std::uint64_t, std::uint64_t> checkedAt;
+    std::map<std::uint64_t, std::vector<std::byte>> lastBytes;
+    std::deque<std::pair<std::uint64_t, std::string>> recent;
+    std::uint64_t sequence = 0;
 };
 
 BvhCheck& Bvh() {
@@ -48,8 +53,16 @@ void NoteDispatchForBvh(std::uint64_t program, std::span<const std::uint32_t> us
     }
     auto& check = Bvh();
     std::lock_guard lock(check.mutex);
-    if (check.recent.size() < 64) check.recent.push_back(std::move(text));
-    else check.recent[check.next++ % 64] = std::move(text);
+    check.recent.emplace_back(++check.sequence, std::move(text));
+    if (check.recent.size() > 4096) check.recent.pop_front();
+}
+
+std::atomic<std::uint64_t> checkAfterRefit{0};
+
+bool KnownBvh(std::uint64_t pointer) {
+    auto& check = Bvh();
+    std::lock_guard lock(check.mutex);
+    return check.badLeaves.contains(pointer);
 }
 
 void CheckBvh(std::uint64_t pointer) {
@@ -91,11 +104,51 @@ void CheckBvh(std::uint64_t pointer) {
     }
     auto& check = Bvh();
     std::lock_guard lock(check.mutex);
+    // APS5_CHECK_BVH_TRIGGER=<file>: the first check creates that file (APS5_CAPTURE_TRIGGER's), so a frame
+    // capture starts with the first frames a refit runs in.
+    if (check.badLeaves.empty()) {
+        if (const char* trigger = std::getenv("APS5_CHECK_BVH_TRIGGER"); trigger != nullptr && *trigger != '\0') {
+            if (FILE* file = std::fopen(trigger, "wb")) std::fclose(file);
+            std::fprintf(stderr, "[bvh] first check: created %s\n", trigger);
+        }
+    }
     auto& known = check.badLeaves[pointer];
-    if (bad <= known) return;
-    std::fprintf(stderr, "[bvh] %.1f ms blob 0x%llx: %zu bad leaves (was %zu):%s dispatches since the last check, oldest first:\n", TraceMs(), static_cast<unsigned long long>(pointer), bad, known, first.c_str());
-    for (std::size_t i = 0; i < check.recent.size(); ++i) std::fprintf(stderr, "[bvh]   %s\n", check.recent[(check.next + i) % check.recent.size()].c_str());
+    auto& checkedAt = check.checkedAt[pointer];
+    const auto since = checkedAt;
+    // The dispatch being checked was noted already: the next check covers it.
+    checkedAt = check.sequence - 1;
+    if (bad <= known) {
+        check.lastBytes[pointer].assign(blob, blob + bytes);
+        return;
+    }
+    std::fprintf(stderr, "[bvh] %.1f ms blob 0x%llx: %zu bad leaves (was %zu):%s dispatches since its last check (the last one is the next to run), oldest first:\n", TraceMs(), static_cast<unsigned long long>(pointer), bad, known, first.c_str());
+    const auto newer = static_cast<std::size_t>(std::count_if(check.recent.begin(), check.recent.end(), [&](const auto& entry) { return entry.first > since; }));
+    std::size_t skipped = newer > 600 ? newer - 600 : 0;
+    if (skipped != 0) std::fprintf(stderr, "[bvh]   (%zu older ones left out)\n", skipped);
+    for (const auto& [sequence, text] : check.recent) {
+        if (sequence <= since || (skipped != 0 && skipped-- != 0)) continue;
+        std::fprintf(stderr, "[bvh]   %s\n", text.c_str());
+    }
     known = bad;
+    // The blob as at its last check and now, for the first few reports (bvh_<blob>_<n>_{before,after}.bin).
+    static int dumps = 0;
+    if (dumps < 4) {
+        char name[96];
+        std::snprintf(name, sizeof(name), "bvh_%llx_%d_before.bin", static_cast<unsigned long long>(pointer), dumps);
+        if (FILE* file = std::fopen(name, "wb")) {
+            const auto& before = check.lastBytes[pointer];
+            std::fwrite(before.data(), 1, before.size(), file);
+            std::fclose(file);
+        }
+        std::snprintf(name, sizeof(name), "bvh_%llx_%d_after.bin", static_cast<unsigned long long>(pointer), dumps);
+        if (FILE* file = std::fopen(name, "wb")) {
+            std::fwrite(blob, 1, static_cast<std::size_t>(bytes), file);
+            std::fclose(file);
+        }
+        std::fprintf(stderr, "[bvh]   blob written to %s and the matching _before.bin\n", name);
+        ++dumps;
+    }
+    check.lastBytes[pointer].assign(blob, blob + bytes);
 }
 
 }
@@ -172,12 +225,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     static const bool checkBvh = std::getenv("APS5_CHECK_BVH") != nullptr;
     if (checkBvh) {
+        // The blob a refit just used is checked again at the next dispatch, after the refit ran.
+        if (const auto refitted = checkAfterRefit.exchange(0, std::memory_order_acq_rel); refitted != 0) CheckBvh(refitted);
         NoteDispatchForBvh(address, userData);
         static constexpr std::array<std::uint32_t, 6> RefitStart{0xbfa00003u, 0xd7460001u, 0x04010c06u, 0xf4041a82u, 0xfa000040u, 0xbf8cc07fu};
         const auto word = (address - snapshot.codeAddress) / sizeof(std::uint32_t);
-        if (userData.size() >= 6 && word + RefitStart.size() <= snapshot.code.size() && std::equal(RefitStart.begin(), RefitStart.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(word))) {
-            CheckBvh((userData[4] | (static_cast<std::uint64_t>(userData[5]) << 32u)) & 0xffffffffffffull);
-        }
+        const auto pointer = userData.size() >= 6 ? (userData[4] | (static_cast<std::uint64_t>(userData[5]) << 32u)) & 0xffffffffffffull : 0;
+        const bool refit = word + RefitStart.size() <= snapshot.code.size() && std::equal(RefitStart.begin(), RefitStart.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(word));
+        if (pointer != 0 && (refit || KnownBvh(pointer))) CheckBvh(pointer);
+        if (refit && pointer != 0) checkAfterRefit.store(pointer, std::memory_order_release);
     }
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
