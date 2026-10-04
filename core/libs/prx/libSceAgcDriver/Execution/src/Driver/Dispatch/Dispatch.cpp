@@ -5,32 +5,138 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <span>
+#include <string>
 #include <vector>
 #include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// Debug aid (APS5_CHECK_BVH=1): before each dispatch of the BVH refit program (GTA V's RT, found by its first
+// code words), the PSR_BVHL blob behind user data 4-5 is checked the way the refit walks it: every leaf child
+// must start a list inside the list array that ends at an entry with its end bit (second dword negative) or
+// type 7. When a blob has more bad leaves than at its last check, the bad nodes and the dispatches since are
+// printed, to find what first corrupts it.
+struct BvhCheck {
+    std::mutex mutex;
+    std::map<std::uint64_t, std::size_t> badLeaves;
+    std::vector<std::string> recent;
+    std::size_t next = 0;
+};
+
+BvhCheck& Bvh() {
+    static BvhCheck check;
+    return check;
+}
+
+void NoteDispatchForBvh(std::uint64_t program, std::span<const std::uint32_t> userData) {
+    std::string text = std::to_string(TraceMs()) + " ms program 0x";
+    char item[24];
+    std::snprintf(item, sizeof(item), "%llx", static_cast<unsigned long long>(program));
+    text += item;
+    for (const auto word : userData) {
+        std::snprintf(item, sizeof(item), " %08x", word);
+        text += item;
+    }
+    auto& check = Bvh();
+    std::lock_guard lock(check.mutex);
+    if (check.recent.size() < 64) check.recent.push_back(std::move(text));
+    else check.recent[check.next++ % 64] = std::move(text);
+}
+
+void CheckBvh(std::uint64_t pointer) {
+    const auto* blob = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(pointer));
+    const auto dword = [&](std::uint64_t offset) {
+        std::uint32_t value;
+        std::memcpy(&value, blob + offset, sizeof(value));
+        return value;
+    };
+    GuestMemory::FlushGpuWrites(pointer, 0x80);
+    if (std::memcmp(blob, "PSR_BVHL", 8) != 0) return;
+    const auto bytes = dword(0x10) | (static_cast<std::uint64_t>(dword(0x14)) << 32u);
+    GuestMemory::FlushGpuWrites(pointer, static_cast<std::size_t>(bytes));
+    const auto aOffset = dword(0x40) | (static_cast<std::uint64_t>(dword(0x44)) << 32u);
+    const auto nodes = dword(0x50);
+    const auto entries = dword(0x58);
+    const auto threads = dword(0x60);
+    if (aOffset + 4ull * ((threads + 3) / 4) > bytes || 64ull * nodes > bytes || 8ull * entries > bytes) return;
+    std::size_t bad = 0;
+    std::string first;
+    for (std::uint32_t t = 0; t < threads; ++t) {
+        const auto node = dword(aOffset + 4ull * (t >> 2u));
+        if (node >= nodes) continue;
+        const auto child = dword(64ull * node + 4ull * (t & 3u));
+        if (child == 30u || child == 0xffffffffu || (child & 7u) != 0) continue;
+        bool ended = false;
+        for (auto index = child >> 3u; index < entries && index - (child >> 3u) < 64u; ++index) {
+            if ((dword(8ull * index) & 7u) == 7u || (dword(8ull * index + 4) >> 31u) != 0) {
+                ended = true;
+                break;
+            }
+        }
+        if (ended) continue;
+        if (bad++ < 4) {
+            char item[96];
+            std::snprintf(item, sizeof(item), " node %u child 0x%08x;", node, child);
+            first += item;
+        }
+    }
+    auto& check = Bvh();
+    std::lock_guard lock(check.mutex);
+    auto& known = check.badLeaves[pointer];
+    if (bad <= known) return;
+    std::fprintf(stderr, "[bvh] %.1f ms blob 0x%llx: %zu bad leaves (was %zu):%s dispatches since the last check, oldest first:\n", TraceMs(), static_cast<unsigned long long>(pointer), bad, known, first.c_str());
+    for (std::size_t i = 0; i < check.recent.size(); ++i) std::fprintf(stderr, "[bvh]   %s\n", check.recent[(check.next + i) % check.recent.size()].c_str());
+    known = bad;
+}
+
+}
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     auto it = submission.shaders->upper_bound(address);
     require(it != submission.shaders->begin(), "compute program does not belong to a registered shader");
     --it;
-    // Debug aid: APS5_SKIP_PROGRAMS=<hex,...> drops the dispatches of those compute programs, to tell
-    // whether a GPU fault or hang comes from them.
-    static const std::vector<std::uint64_t> skipped = [] {
-        std::vector<std::uint64_t> parsed;
+    // Debug aid: APS5_SKIP_PROGRAMS=<hex[:n],...> drops the dispatches of those compute programs (with :n
+    // only the program's n-th dispatch, counted from 0 over the process), to tell whether a GPU fault or
+    // hang comes from them.
+    struct Skip {
+        std::uint64_t program;
+        std::uint64_t nth;
+    };
+    static constexpr std::uint64_t EveryDispatch = ~std::uint64_t{0};
+    static const std::vector<Skip> skipped = [] {
+        std::vector<Skip> parsed;
         const char* text = std::getenv("APS5_SKIP_PROGRAMS");
         while (text != nullptr && *text != 0) {
             char* end = nullptr;
             const auto value = std::strtoull(text, &end, 16);
             if (end == text) break;
-            parsed.push_back(value);
+            auto nth = EveryDispatch;
+            if (*end == ':') nth = std::strtoull(end + 1, &end, 10);
+            parsed.push_back({value, nth});
             text = *end == ',' ? end + 1 : end;
         }
         return parsed;
     }();
-    if (!skipped.empty() && std::find(skipped.begin(), skipped.end(), address) != skipped.end()) return;
+    if (!skipped.empty()) {
+        static std::mutex countsMutex;
+        static std::map<std::uint64_t, std::uint64_t> counts;
+        std::uint64_t nth = 0;
+        {
+            std::lock_guard lock(countsMutex);
+            nth = counts[address]++;
+        }
+        if (std::any_of(skipped.begin(), skipped.end(), [&](const Skip& skip) { return skip.program == address && (skip.nth == EveryDispatch || skip.nth == nth); })) return;
+    }
     const auto& snapshot = *it->second;
     require(address - snapshot.codeAddress < snapshot.code.size() * sizeof(std::uint32_t), "compute program is outside registered shader code");
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
@@ -38,6 +144,40 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::vector<std::uint32_t> userData;
     for (std::uint32_t i = 0; i < userCount; ++i) {
         userData.push_back(readRegister(queue.shader, 0x240 + i));
+    }
+    // Debug aid: APS5_WATCH_PROGRAM=<hex> prints that compute program's dispatch size and user data, and
+    // the 16 qwords behind the pointer in user data 4-5 (guest memory as it is, GPU writes may be pending);
+    // APS5_WATCH_PROGRAM=1 prints every dispatch's program, size and user data.
+    static const std::uint64_t watchedProgram = [] {
+        const char* text = std::getenv("APS5_WATCH_PROGRAM");
+        return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+    }();
+    if (address == watchedProgram || watchedProgram == 1) {
+        std::string text;
+        char item[48];
+        for (const auto word : userData) {
+            std::snprintf(item, sizeof(item), " %08x", word);
+            text += item;
+        }
+        std::fprintf(stderr, "[watch] program 0x%llx dispatch %u x %u x %u, user data%s\n", static_cast<unsigned long long>(address), packet.size() > 1 ? packet[1] : 0, packet.size() > 2 ? packet[2] : 0, packet.size() > 3 ? packet[3] : 0, text.c_str());
+        if (address == watchedProgram && userData.size() >= 6) {
+            const auto pointer = (userData[4] | (static_cast<std::uint64_t>(userData[5]) << 32u)) & 0xffffffffffffull;
+            text.clear();
+            for (std::size_t i = 0; i < 16; ++i) {
+                std::snprintf(item, sizeof(item), " %016llx", static_cast<unsigned long long>(reinterpret_cast<const volatile std::uint64_t*>(pointer)[i]));
+                text += item;
+            }
+            std::fprintf(stderr, "[watch]   0x%llx:%s\n", static_cast<unsigned long long>(pointer), text.c_str());
+        }
+    }
+    static const bool checkBvh = std::getenv("APS5_CHECK_BVH") != nullptr;
+    if (checkBvh) {
+        NoteDispatchForBvh(address, userData);
+        static constexpr std::array<std::uint32_t, 6> RefitStart{0xbfa00003u, 0xd7460001u, 0x04010c06u, 0xf4041a82u, 0xfa000040u, 0xbf8cc07fu};
+        const auto word = (address - snapshot.codeAddress) / sizeof(std::uint32_t);
+        if (userData.size() >= 6 && word + RefitStart.size() <= snapshot.code.size() && std::equal(RefitStart.begin(), RefitStart.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(word))) {
+            CheckBvh((userData[4] | (static_cast<std::uint64_t>(userData[5]) << 32u)) & 0xffffffffffffull);
+        }
     }
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};

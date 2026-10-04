@@ -62,6 +62,7 @@ struct Options {
     std::uint32_t pngScale = 1;
     bool pngAllLoops = false;
     bool deltaMerge = true;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> dumpRanges;
     std::optional<std::filesystem::path> compare;
     bool pacing = true;
     bool settle = false;
@@ -682,6 +683,7 @@ public:
             } else {
                 restore();
             }
+            dumpRanges("start");
             for (std::size_t queue = 0; queue < QueueCount; ++queue) base[queue] = ReplayPacketsExecuted(static_cast<std::uint32_t>(queue));
             nextFlip.store(0);
             const auto presentedBefore = presenter->Presented();
@@ -700,6 +702,10 @@ public:
             const bool finished = drain();
             presenter->WaitDone();
             rethrowFailure();
+            if (!options.dumpRanges.empty()) {
+                ReplaySettle();
+                dumpRanges("end");
+            }
             const auto replayMs = std::chrono::duration<double, std::milli>(Clock::now() - replayStarted).count();
             const auto setupMs = std::chrono::duration<double, std::milli>(replayStarted - started).count();
             const auto frames = presenter->Presented() - presentedBefore;
@@ -1005,6 +1011,17 @@ private:
         }
     }
 
+    // --dump-range: the range's guest bytes (GPU writes flushed) into range_<address>_loop<n>_<when>.bin.
+    void dumpRanges(const char* when) {
+        for (const auto& [address, bytes] : options.dumpRanges) {
+            AgcDriver::GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
+            char name[96];
+            std::snprintf(name, sizeof(name), "range_%llx_loop%u_%s.bin", static_cast<unsigned long long>(address), loop, when);
+            std::ofstream file(name, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(static_cast<std::uintptr_t>(address)), static_cast<std::streamsize>(bytes));
+        }
+    }
+
     bool drain() {
         std::optional<Clock::time_point> stalledAt;
         for (;;) {
@@ -1197,6 +1214,12 @@ Options ParseOptions(int argc, char** argv) {
         else if (argument == "--no-pacing") options.pacing = false;
         else if (argument == "--no-restore-collect") options.restoreCollect = false;
         else if (argument == "--no-delta-merge") options.deltaMerge = false;
+        else if (argument == "--dump-range") {
+            const auto text = value();
+            const auto colon = text.find(':');
+            if (colon == std::string::npos) Fail("--dump-range takes <hex address>:<hex bytes>");
+            options.dumpRanges.emplace_back(std::stoull(text.substr(0, colon), nullptr, 16), std::stoull(text.substr(colon + 1), nullptr, 16));
+        }
         else if (argument == "--settle") options.settle = true;
         else if (argument == "--hidden") options.hidden = true;
         else if (argument == "--shader-cache") options.shaderCache = value();
