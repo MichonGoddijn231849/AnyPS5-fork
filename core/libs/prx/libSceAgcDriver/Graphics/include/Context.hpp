@@ -141,6 +141,7 @@ struct Context {
     bool sampleRateShading = false;
     bool clipDistance = false;
     bool cullDistance = false;
+    bool demoteToHelperInvocation = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;

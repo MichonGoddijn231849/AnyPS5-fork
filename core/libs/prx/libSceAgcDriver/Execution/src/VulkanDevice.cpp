@@ -197,6 +197,7 @@ struct VulkanDevice::State {
     bool shaderCullDistance = false;
     bool shaderClock = false;
     bool narrowSubgroupClock = false;
+    bool demoteToHelperInvocation = false;
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
     // graphics stages, and compute workgroups wider than a wave).
     bool descriptorIndexing = false;
@@ -780,6 +781,14 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->narrowSubgroupClock = NarrowSubgroupClock(driver.driverID, state->properties.deviceName);
         APS5_LOG_OUT("Shader clock driver=%d narrowSubgroupClock=%d", static_cast<int>(driver.driverID), state->narrowSubgroupClock ? 1 : 0);
     }
+    VkPhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT demoteFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT};
+    if (hasExtension(VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &demoteFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        state->demoteToHelperInvocation = demoteFeatures.shaderDemoteToHelperInvocation == VK_TRUE;
+    }
+    demoteFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT};
+    demoteFeatures.shaderDemoteToHelperInvocation = VK_TRUE;
     std::vector<const char*> deviceExtensions;
     if (window != nullptr) deviceExtensions.assign(presentationExtensions.begin(), presentationExtensions.end());
     if (state->fragmentShaderBarycentric) {
@@ -820,6 +829,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->capabilities.push_back(spv::CapabilityInt64ImageEXT);
         state->imageInt64Atomics = true;
         state->spirvExtensions.push_back("SPV_EXT_shader_image_int64");
+    }
+    if (state->demoteToHelperInvocation) {
+        deviceExtensions.push_back(VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME);
+        state->capabilities.push_back(spv::CapabilityDemoteToHelperInvocation);
+        state->spirvExtensions.push_back("SPV_EXT_demote_to_helper_invocation");
     }
     deviceExtensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
     state->capabilities.push_back(spv::CapabilitySignedZeroInfNanPreserve);
@@ -1044,6 +1058,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     if (imageInt64Atomics) {
         imageAtomicInt64Features.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &imageAtomicInt64Features;
+    }
+    if (state->demoteToHelperInvocation) {
+        demoteFeatures.pNext = byteFeatures.pNext;
+        byteFeatures.pNext = &demoteFeatures;
     }
     VkPhysicalDeviceImageRobustnessFeaturesEXT imageRobustnessFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT, nullptr, VK_TRUE};
     if (imageRobustness) {
@@ -2516,6 +2534,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.sampleRateShading = state->sampleRateShading;
     context.clipDistance = state->shaderClipDistance;
     context.cullDistance = state->shaderCullDistance;
+    context.demoteToHelperInvocation = state->demoteToHelperInvocation;
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
