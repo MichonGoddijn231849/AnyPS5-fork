@@ -22,7 +22,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     for (std::uint32_t i = 0; i < userCount; ++i) {
         userData.push_back(readRegister(queue.shader, 0x240 + i));
     }
-    auto compute = Graphics::DecodeComputeStageInfo(queue.shader);
+    auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
 
     static const bool unlockedDevice = std::getenv("APS5_NO_UNLOCKED_DEVICE") == nullptr;

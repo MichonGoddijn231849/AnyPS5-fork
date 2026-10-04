@@ -44,6 +44,8 @@ struct ShaderComputeStageInfo {
     bool tgSizeEnable;
     std::uint32_t threadIdComponentCount;
     std::array<std::uint32_t, 3> partialThreads;
+    // Per-lane private (scratch) memory in dwords when COMPUTE_PGM_RSRC2.SCRATCH_EN is set.
+    std::uint32_t scratchDwords = 0;
 
     [[nodiscard]] bool PartialGroups() const {
         return partialThreads != std::array<std::uint32_t, 3>{};
