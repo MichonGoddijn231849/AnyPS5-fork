@@ -46,6 +46,7 @@ public:
     void WaitIdle();
     std::uint64_t RelieveMemory();
     void PrepareForReplacement();
+    void DropCaches(bool resources, bool textures, bool tables, bool space);
     // Sends recorded work to the GPU without waiting for it. With `reapFirst` it first retires batches
     // that already finished, so the in-flight list stays short (APS5_NO_OPPORTUNISTIC_REAP=1 skips
     // that). A reap runs completion actions, and a write-back can wait for a later batch under the

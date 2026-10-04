@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -1169,6 +1170,24 @@ void VulkanDevice::PrepareForReplacement() {
     Graphics::PublishAllShadows(state->context, Graphics::PublishReason::Teardown);
     WaitIdle();
     Graphics::DestroyShadows(state->device);
+}
+
+void VulkanDevice::DropCaches(bool resources, bool textures, bool tables, bool space) {
+    GuestMemory::AssertGpuLockHeld("VulkanDevice::DropCaches");
+    WaitIdle();
+    if (resources) state->resourceCache.Clear();
+    if (textures) {
+        Graphics::FlushCachedTextures(state->device);
+        WaitIdle();
+        Graphics::ClearCachedTextures(state->device);
+        state->textureCache = std::make_unique<Graphics::TextureCache>(graphicsContext());
+    }
+    if (tables) {
+        Graphics::ClearSampledTables(state->device);
+        Graphics::BdaResources::ClearTableCache();
+    }
+    if (space) Graphics::DropAddressSpaceCache();
+    WaitIdle();
 }
 
 std::uint64_t VulkanDevice::RelieveMemory() {

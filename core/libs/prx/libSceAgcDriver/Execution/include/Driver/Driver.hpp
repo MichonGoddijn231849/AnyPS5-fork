@@ -65,6 +65,7 @@ public:
     void RestoreQueueState(std::uint32_t queue, std::span<const std::byte> state);
     void RestoreDriverState(bool reset, std::span<const std::byte> gds);
     void RegisterShaderSnapshot(ShaderSnapshot snapshot);
+    void ClearCaches(std::uint32_t classes);
 
 private:
     friend class SampledReadScope;

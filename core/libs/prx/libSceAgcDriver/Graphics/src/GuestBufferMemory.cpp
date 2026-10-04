@@ -1219,6 +1219,10 @@ std::uint64_t HostImportLimit() {
     return Imports().limit.load(std::memory_order_relaxed);
 }
 
+void DropAddressSpaceCache() {
+    Spaces().current.store(nullptr);
+}
+
 std::uint64_t RelieveGpuMemory(const Context& context) {
     if (GuestMemory::GpuMutex().HeldByThisThread()) return 0;
     const auto before = LiveGpuMemory();

@@ -643,6 +643,9 @@ void FlushCachedTextures(VkDevice device) {
     }
 }
 
+// The replay's cold loops clear the sampled-table cache; this branch keeps none.
+void ClearSampledTables(VkDevice) {}
+
 void ClearCachedTextures(VkDevice device) {
     Require(device != VK_NULL_HANDLE, "cannot clear textures without a Vulkan device");
     auto& sampled = Textures();

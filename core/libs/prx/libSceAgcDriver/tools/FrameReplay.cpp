@@ -62,6 +62,7 @@ struct Options {
     bool settle = false;
     bool hidden = false;
     std::optional<std::filesystem::path> shaderCache;
+    std::uint32_t cold = 0;
 };
 
 struct Event {
@@ -485,6 +486,28 @@ private:
     Replayer& owner;
 };
 
+struct Image {
+    int width = 0;
+    int height = 0;
+    std::vector<std::uint8_t> pixels;
+};
+
+std::optional<Image> LoadPng(const std::filesystem::path& path, std::chrono::seconds wait) {
+    const auto deadline = Clock::now() + wait;
+    for (;;) {
+        int width = 0;
+        int height = 0;
+        int channels = 0;
+        if (auto* data = stbi_load(path.string().c_str(), &width, &height, &channels, 4)) {
+            Image image{width, height, std::vector<std::uint8_t>(data, data + static_cast<std::size_t>(width) * height * 4)};
+            stbi_image_free(data);
+            return image;
+        }
+        if (Clock::now() >= deadline) return std::nullopt;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
 std::filesystem::path FramePath(const std::filesystem::path& directory, std::uint32_t loop, std::uint64_t flip) {
     char name[48];
     if (loop == 0) std::snprintf(name, sizeof(name), "frame_%05llu.png", static_cast<unsigned long long>(flip));
@@ -554,6 +577,7 @@ public:
             }
         }
         ReplaySettle();
+        if (options.png) waitForFrames();
     }
 
     std::shared_ptr<AgcDriver::IFlipRequest> ReserveFlip() {
@@ -577,6 +601,17 @@ public:
     const std::vector<std::optional<PresentEvent>>& Presents() const { return presents; }
 
 private:
+    void waitForFrames() {
+        const auto loops = options.pngAllLoops ? loop : std::min<std::uint32_t>(loop, 1);
+        for (std::uint32_t written = 0; written < loops; ++written) {
+            for (std::size_t flip = 0; flip < presents.size(); ++flip) {
+                if (!presents[flip] || !presents[flip]->hasBuffer) continue;
+                const auto path = FramePath(*options.png, written, flip);
+                if (!LoadPng(path, std::chrono::seconds(30))) std::fprintf(stderr, "[replay] %s was not written\n", path.string().c_str());
+            }
+        }
+    }
+
     void setImageRange() {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
         for (std::size_t i = 0; i < prologueEnd; ++i) {
@@ -743,6 +778,11 @@ private:
 
     void restore() {
         ReplaySettle();
+        if (options.cold != 0) {
+            const auto started = Clock::now();
+            ReplayClearCaches(options.cold);
+            std::fprintf(stderr, "[replay] loop %u: driver caches cleared (classes 0x%x) in %.1f ms\n", loop, options.cold, std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+        }
         std::vector<Piece> removed;
         std::vector<Piece> added;
         std::set_difference(space.Pieces().begin(), space.Pieces().end(), initialPieces.begin(), initialPieces.end(), std::back_inserter(removed), PieceLess);
@@ -804,28 +844,6 @@ void ReplayOutput::Fail(std::exception_ptr error) noexcept {
     owner.NoteFailure(error);
 }
 
-struct Image {
-    int width = 0;
-    int height = 0;
-    std::vector<std::uint8_t> pixels;
-};
-
-std::optional<Image> LoadPng(const std::filesystem::path& path, std::chrono::seconds wait) {
-    const auto deadline = Clock::now() + wait;
-    for (;;) {
-        int width = 0;
-        int height = 0;
-        int channels = 0;
-        if (auto* data = stbi_load(path.string().c_str(), &width, &height, &channels, 4)) {
-            Image image{width, height, std::vector<std::uint8_t>(data, data + static_cast<std::size_t>(width) * height * 4)};
-            stbi_image_free(data);
-            return image;
-        }
-        if (Clock::now() >= deadline) return std::nullopt;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-}
-
 int Compare(const std::filesystem::path& replayed, const std::filesystem::path& reference, const std::vector<std::optional<PresentEvent>>& presents) {
     std::fprintf(stderr, "[compare] %s against %s\n", replayed.string().c_str(), reference.string().c_str());
     double worst = std::numeric_limits<double>::infinity();
@@ -871,10 +889,24 @@ int Compare(const std::filesystem::path& replayed, const std::filesystem::path& 
     return missing == 0 ? 0 : 1;
 }
 
+std::uint32_t ParseCacheClasses(const std::string& list) {
+    static const std::map<std::string, std::uint32_t> names{{"dispatch", CacheDispatch}, {"draw", CacheDraw}, {"resources", CacheResources}, {"textures", CacheTextures}, {"tables", CacheTables}, {"space", CacheSpace}, {"all", CacheAll}};
+    std::uint32_t classes = 0;
+    std::size_t start = 0;
+    while (start <= list.size()) {
+        const auto end = std::min(list.find(',', start), list.size());
+        const auto found = names.find(list.substr(start, end - start));
+        if (found == names.end()) Fail("unknown cache class '" + list.substr(start, end - start) + "' (dispatch, draw, resources, textures, tables, space, all)");
+        classes |= found->second;
+        start = end + 1;
+    }
+    return classes;
+}
+
 Options ParseOptions(int argc, char** argv) {
     Options options;
     const auto usage = [] {
-        Fail("usage: agc_frame_replay <capture dir> [--loop N] [--png DIR] [--png-scale N] [--png-all-loops] [--compare DIR] [--no-pacing] [--settle] [--hidden] [--shader-cache DIR]");
+        Fail("usage: agc_frame_replay <capture dir> [--loop N] [--png DIR] [--png-scale N] [--png-all-loops] [--compare DIR] [--no-pacing] [--settle] [--hidden] [--shader-cache DIR] [--cold[=dispatch,draw,resources,textures,tables,space]]");
     };
     if (argc < 2) usage();
     for (int i = 1; i < argc; ++i) {
@@ -892,6 +924,8 @@ Options ParseOptions(int argc, char** argv) {
         else if (argument == "--settle") options.settle = true;
         else if (argument == "--hidden") options.hidden = true;
         else if (argument == "--shader-cache") options.shaderCache = value();
+        else if (argument == "--cold") options.cold = CacheAll;
+        else if (argument.starts_with("--cold=")) options.cold = ParseCacheClasses(argument.substr(7));
         else if (!argument.starts_with("--") && options.capture.empty()) options.capture = argument;
         else usage();
     }

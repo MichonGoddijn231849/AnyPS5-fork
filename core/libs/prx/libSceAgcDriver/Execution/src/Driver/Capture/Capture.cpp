@@ -151,6 +151,34 @@ void Driver::RestoreDriverState(bool reset, std::span<const std::byte> gds) {
     std::memcpy(reinterpret_cast<void*>(Pm4::GdsAddress()), gds.data(), gds.size());
 }
 
+void Driver::ClearCaches(std::uint32_t classes) {
+    {
+        std::lock_guard lock(mutex);
+        require(completed >= accepted, "caches cleared while submissions are pending");
+    }
+    if ((classes & Capture::CacheDispatch) != 0) {
+        std::lock_guard lock(dispatchCacheMutex);
+        dispatchCache.clear();
+        dispatchOrder.clear();
+        priorValueSets.clear();
+        dispatchCacheVariants = 0;
+        dispatchCacheVariantBytes = 0;
+    }
+    if ((classes & Capture::CacheDraw) != 0) {
+        std::lock_guard lock(drawCacheMutex);
+        drawCache.clear();
+        drawShapes.clear();
+        drawFailures.clear();
+        drawFailureCount.store(0, std::memory_order_relaxed);
+        drawOrder.clear();
+        drawCacheVariants = 0;
+        drawCacheVariantBytes = 0;
+    }
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    if (const auto localDevice = device.Load()) localDevice->DropCaches((classes & Capture::CacheResources) != 0, (classes & Capture::CacheTextures) != 0, (classes & Capture::CacheTables) != 0, (classes & Capture::CacheSpace) != 0);
+}
+
 bool Driver::captureStart() {
     auto& capture = Capture::FrameCapture::Get();
     if (!DrainFor(std::chrono::seconds(3))) {
@@ -249,6 +277,10 @@ namespace AgcDriver::Capture {
 
 std::uint64_t ReplayPacketsExecuted(std::uint32_t queue) {
     return DriverDetail::Driver::Get().PacketsExecuted(queue);
+}
+
+void ReplayClearCaches(std::uint32_t classes) {
+    DriverDetail::Driver::Get().ClearCaches(classes);
 }
 
 bool ReplayStalled() {

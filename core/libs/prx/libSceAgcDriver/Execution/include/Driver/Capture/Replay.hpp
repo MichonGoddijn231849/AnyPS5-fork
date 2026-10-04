@@ -9,7 +9,18 @@
 
 namespace AgcDriver::Capture {
 
+enum CacheClass : std::uint32_t {
+    CacheDispatch = 1,
+    CacheDraw = 2,
+    CacheResources = 4,
+    CacheTextures = 8,
+    CacheTables = 16,
+    CacheSpace = 32,
+    CacheAll = 63,
+};
+
 std::uint64_t ReplayPacketsExecuted(std::uint32_t queue);
+void ReplayClearCaches(std::uint32_t classes);
 bool ReplayStalled();
 bool ReplayDrain(std::chrono::milliseconds limit);
 void ReplaySettle();

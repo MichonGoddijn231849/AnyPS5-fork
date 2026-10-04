@@ -34,6 +34,7 @@ Output:
 | `--settle` | Also drain the device before every memory delta. |
 | `--shader-cache DIR` | Shader/pipeline disk cache (default: next to the exe); point it at the game's run dir cache for a warm first loop. |
 | `--hidden` | Do not show the presentation window. |
+| `--cold[=classes]` | Between loops clear the driver's in-memory caches so every loop misses them like new frames: `dispatch` (dispatch cache and its recipes), `draw` (draw cache and recipes), `resources` (resource cache), `textures` (sampled/storage textures, flushed first), `tables` (bindless sampled tables, BDA tables), `space` (address-space cache); `--cold` alone clears all. The shader disk cache, compiled shaders and pipelines stay warm. On Wolverine's intros `--cold=dispatch,draw,resources,tables,space` matches the game's per-dispatch costs best: the game keeps its textures resident across frames. |
 
 All driver environment variables apply (`APS5_PROFILE_DRAW=1`, `APS5_PROFILE_GPU=1`, ...). Profile lines report every 10 s, so profile with enough loops. Exit code: 0 on success, 2 when commands differed from the capture or queues were left blocked, 1 on errors or missing/different frames in `--compare`.
 
@@ -60,7 +61,7 @@ A piece is a mapped run of guest memory: private arena memory, direct memory (a 
 
 ## Limitations
 
-- Looping the same frames makes every dispatch, draw and texture hit the driver's caches after loop 0, while live frames with new content miss them; compare cache-sensitive classes with care and capture more frames to reduce the effect.
+- Looping the same frames makes every dispatch, draw and texture hit the driver's caches after loop 0, while live frames with new content miss them; `--cold` clears the caches between loops.
 - Loop 0 starts with cold driver caches (the shader disk cache can be warm).
 - Pacing waits for packets the workers executed, not for deferred labels or GPU completion; `--settle` is the strict variant.
 - CPU writes to memory outside the write-watched arena (the main image's data sections) after the base snapshot are not recorded.

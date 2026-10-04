@@ -48,6 +48,7 @@ ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);
 
 std::uint64_t RelieveGpuMemory(const Context& context);
+void DropAddressSpaceCache();
 std::uint64_t HostImportLimit();
 
 // The host import of the registered allocation containing [address, address + bytes), made on demand
