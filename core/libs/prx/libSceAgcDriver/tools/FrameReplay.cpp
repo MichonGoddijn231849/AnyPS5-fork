@@ -865,7 +865,9 @@ private:
                 std::memcpy(guestWords, recorded.data(), recorded.size_bytes());
             }
             if (TracePacingMs() >= 0) std::fprintf(stderr, "[pacing] submit queue %u, %u words at 0x%llx\n", submit.queue, submit.packetWords, static_cast<unsigned long long>(submit.packetAddress));
-            ReplayExpectCommands(submit.hash);
+            // A carried submission's hash covers its guest words, which the driver's copy may stop short of
+            // (at a REWIND, whose tail runs on its own): those words matching is the check.
+            if (recorded.size() != submit.packetWords || HashWords(std::span<const std::uint32_t>(guestWords, submit.packetWords)) != submit.hash) ReplayExpectCommands(submit.hash);
             Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(submit.packetAddress)), submit.packetWords, 0, {}};
             AgcDriver::Submit(&packet, submit.queue);
             ++submits;
