@@ -19,8 +19,10 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -464,6 +466,92 @@ private:
 
 class Replayer;
 
+// Helper threads for large memory events: Run hands out `parts` indices to them and to the caller,
+// and returns once every part ran (rethrowing the first part's failure).
+class WritePool {
+public:
+    explicit WritePool(std::size_t threads) {
+        for (std::size_t i = 0; i < threads; ++i) workers.emplace_back([this] { work(); });
+    }
+    WritePool(const WritePool&) = delete;
+    WritePool& operator=(const WritePool&) = delete;
+    ~WritePool() {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        wake.notify_all();
+        for (auto& worker : workers) worker.join();
+    }
+
+    void Run(std::size_t parts, const std::function<void(std::size_t)>& job) {
+        {
+            std::lock_guard lock(mutex);
+            current = &job;
+            total = parts;
+            next = 0;
+            finished = 0;
+            failure = nullptr;
+            ++generation;
+        }
+        wake.notify_all();
+        claim();
+        std::unique_lock lock(mutex);
+        done.wait(lock, [&] { return finished == total; });
+        current = nullptr;
+        if (failure) std::rethrow_exception(failure);
+    }
+
+private:
+    // Runs parts until none is left (the caller and the workers alike).
+    void claim() {
+        for (;;) {
+            std::size_t part = 0;
+            const std::function<void(std::size_t)>* job = nullptr;
+            {
+                std::lock_guard lock(mutex);
+                if (current == nullptr || next >= total) return;
+                part = next++;
+                job = current;
+            }
+            std::exception_ptr error;
+            try {
+                (*job)(part);
+            } catch (...) {
+                error = std::current_exception();
+            }
+            std::lock_guard lock(mutex);
+            if (error && !failure) failure = error;
+            if (++finished == total) done.notify_all();
+        }
+    }
+
+    void work() {
+        std::uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock lock(mutex);
+                wake.wait(lock, [&] { return stopping || (generation != seen && current != nullptr); });
+                if (stopping) return;
+                seen = generation;
+            }
+            claim();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable done;
+    std::vector<std::thread> workers;
+    const std::function<void(std::size_t)>* current = nullptr;
+    std::size_t total = 0;
+    std::size_t next = 0;
+    std::size_t finished = 0;
+    std::uint64_t generation = 0;
+    std::exception_ptr failure;
+    bool stopping = false;
+};
+
 class ReplayFlip final : public AgcDriver::IFlipRequest {
 public:
     ReplayFlip(Replayer& owner, std::uint64_t flip) : owner(owner), flip(flip) {}
@@ -568,6 +656,8 @@ public:
             const auto presentedBefore = presenter->Presented();
             const auto replayStarted = Clock::now();
             pacingMs = 0;
+            memoryMs = 0;
+            memoryBytes = 0;
             stallReleases = 0;
             submits = 0;
             mappingChanges = 0;
@@ -581,6 +671,23 @@ public:
             const auto setupMs = std::chrono::duration<double, std::milli>(replayStarted - started).count();
             const auto frames = presenter->Presented() - presentedBefore;
             std::fprintf(stderr, "[replay] loop %u: %llu submissions, %llu frames in %.1f ms (%.2f FPS); setup %.1f ms; pacing waits %.1f ms, %llu stall releases; mapping changes %llu (+%llu/-%llu pieces); command mismatches %llu%s\n", loop, static_cast<unsigned long long>(submits), static_cast<unsigned long long>(frames), replayMs, frames != 0 ? 1000.0 * static_cast<double>(frames) / replayMs : 0.0, setupMs, pacingMs, static_cast<unsigned long long>(stallReleases), static_cast<unsigned long long>(mappingChanges), static_cast<unsigned long long>(piecesMapped), static_cast<unsigned long long>(piecesUnmapped), static_cast<unsigned long long>(ReplayCommandMismatches()), finished ? "" : "; QUEUES STILL BLOCKED at the end");
+            {
+                // Each frame's time: from the loop's start (frame 0) or the previous frame's GPU
+                // completion to its own. Frame 0 carries the loop's restore effects (every page the
+                // loop wrote is written back), later frames see only the capture's own changes.
+                std::lock_guard lock(flipTimesMutex);
+                std::string text;
+                auto previous = replayStarted;
+                for (const auto& at : flipTimes) {
+                    char item[32];
+                    std::snprintf(item, sizeof(item), " %.1f", std::chrono::duration<double, std::milli>(at - previous).count());
+                    text += item;
+                    previous = at;
+                }
+                std::fprintf(stderr, "[replay] loop %u: frame ms:%s\n", loop, text.c_str());
+                std::fprintf(stderr, "[replay] loop %u: memory deltas written in %.1f ms (%.1f MiB)\n", loop, memoryMs, static_cast<double>(memoryBytes) / 1048576.0);
+                flipTimes.clear();
+            }
             if (!finished) {
                 stuck = true;
                 break;
@@ -595,6 +702,11 @@ public:
     }
 
     void FlipReady(std::uint64_t flip, const std::shared_ptr<AgcDriver::FrameTiming>& timing) {
+        {
+            std::lock_guard lock(flipTimesMutex);
+            if (flipTimes.size() <= flip) flipTimes.resize(static_cast<std::size_t>(flip) + 1);
+            flipTimes[static_cast<std::size_t>(flip)] = Clock::now();
+        }
         PresentJob job;
         job.timing = timing;
         if (flip < presents.size()) job.present = presents[static_cast<std::size_t>(flip)];
@@ -677,7 +789,10 @@ private:
         case EventType::Memory: {
             const auto kind = reader.Get<MemoryKind>();
             const auto runs = reader.GetSpan<MemoryRun>();
+            const auto memoryStarted = Clock::now();
             writeRuns(runs, reader.GetSpan<std::uint32_t>(), false);
+            memoryMs += std::chrono::duration<double, std::milli>(Clock::now() - memoryStarted).count();
+            for (const auto& run : runs) memoryBytes += static_cast<std::uint64_t>(run.pages) * PageBytes;
             if (kind == MemoryKind::Base || kind == MemoryKind::Mapped) space.ApplyProtections();
             break;
         }
@@ -736,6 +851,24 @@ private:
     }
 
     void writeRuns(std::span<const MemoryRun> runs, std::span<const std::uint32_t> indices, bool compareFirst) {
+        std::size_t total = 0;
+        for (const auto& run : runs) total += run.pages;
+        if (!compareFirst && total >= ParallelWritePages) {
+            // A large delta (a video frame, a streamed buffer): the game's threads wrote it alongside
+            // the GPU work, and the first store to each watched page costs a write-watch fault, so
+            // the pages are written by several threads. The event still completes before the next.
+            if (total > indices.size()) Fail("capture memory event has fewer pages than its runs");
+            std::vector<std::uint64_t> addresses;
+            addresses.reserve(total);
+            for (const auto& run : runs) {
+                for (std::uint32_t page = 0; page < run.pages; ++page) addresses.push_back(run.address + static_cast<std::uint64_t>(page) * PageBytes);
+            }
+            writers.Run((total + WriteChunkPages - 1) / WriteChunkPages, [&](std::size_t chunk) {
+                const auto end = std::min(total, (chunk + 1) * WriteChunkPages);
+                for (auto i = chunk * WriteChunkPages; i < end; ++i) space.Write(addresses[i], capture.Page(indices[i]), PageBytes, false);
+            });
+            return;
+        }
         std::size_t next = 0;
         for (const auto& run : runs) {
             if (compareFirst) AgcDriver::GuestMemory::FlushGpuWrites(run.address, static_cast<std::size_t>(run.pages) * PageBytes);
@@ -772,7 +905,23 @@ private:
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
         if (options.settle) ReplaySettle();
-        pacingMs += std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+        const auto waitedMs = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+        pacingMs += waitedMs;
+        // APS5_TRACE_PACING=ms: the pacing waits longer than that, with every queue's progress.
+        static const double traceMs = [] {
+            const char* value = std::getenv("APS5_TRACE_PACING");
+            return value != nullptr ? std::strtod(value, nullptr) : -1.0;
+        }();
+        if (traceMs >= 0 && waitedMs > traceMs) {
+            std::string text;
+            for (std::size_t queue = 0; queue < target.size() && queue < QueueCount; ++queue) {
+                if (target[queue] == 0) continue;
+                char item[64];
+                std::snprintf(item, sizeof(item), " queue %zu %llu/%llu", queue, static_cast<unsigned long long>(ReplayPacketsExecuted(static_cast<std::uint32_t>(queue)) - base[queue]), static_cast<unsigned long long>(target[queue]));
+                text += item;
+            }
+            std::fprintf(stderr, "[pacing] waited %.2f ms until%s\n", waitedMs, text.c_str());
+        }
     }
 
     bool drain() {
@@ -847,8 +996,16 @@ private:
     std::map<std::uint32_t, std::shared_ptr<ReplayOutput>> outputs;
     std::array<std::uint64_t, QueueCount> base{};
     std::atomic<std::uint64_t> nextFlip{0};
+    std::mutex flipTimesMutex;
+    std::vector<Clock::time_point> flipTimes;
     std::uint32_t loop = 0;
     double pacingMs = 0;
+    static constexpr std::size_t ParallelWritePages = 256;
+    static constexpr std::size_t WriteChunkPages = 64;
+    WritePool writers{3};
+    // The capture's memory deltas written during the loop (the game's CPU stores between submissions).
+    double memoryMs = 0;
+    std::uint64_t memoryBytes = 0;
     std::uint64_t stallReleases = 0;
     std::uint64_t submits = 0;
     std::uint64_t mappingChanges = 0;
