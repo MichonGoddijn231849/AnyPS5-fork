@@ -36,6 +36,9 @@ Output:
 | `--hidden` | Do not show the presentation window. |
 | `--cold[=classes]` | Between loops clear the driver's in-memory caches so every loop misses them like new frames do in the game. Classes: `dispatch` (dispatch cache and its recipes), `draw` (draw cache and recipes), `resources` (resource cache), `textures` (sampled/storage textures, flushed first), `tables` (bindless sampled tables, BDA tables), `space` (address-space cache); presets `live` (everything but textures, the default of `--cold`) and `all`. The shader disk cache, compiled shaders and pipelines stay warm. |
 | `--for-seconds S` | Loop until S seconds have passed after loop 0 (instead of `--loop`). |
+| `--no-restore-collect` | Leave the restore's write-watch walk to the first frame (by default the replay collects the pages it rewrote before the loop starts). |
+
+Each loop also prints `frame ms` (every frame's time: from the loop start, or the previous frame's GPU completion, to its own) and the time spent writing the capture's memory deltas. Deltas of 256 pages or more are written by four threads, as the title's own threads write them in the game. `APS5_TRACE_PACING=ms` lists the pacing waits longer than that with every queue's progress.
 
 All driver environment variables apply (`APS5_PROFILE_DRAW=1`, `APS5_PROFILE_GPU=1`, ...). Profile lines report every 10 s, so profile with enough loops. Exit code: 0 on success, 2 when commands differed from the capture or queues were left blocked, 1 on errors or missing/different frames in `--compare`.
 
@@ -54,6 +57,19 @@ Wolverine intro, frames 400-402, ms per dispatch (live = one profiling run of th
 | loop of 3 frames | ~0.88 s | 0.75 s | ~1.0-1.2 s | 2.78 s |
 
 GPU time per frame: live 4.2 ms, replay 4.1-4.5 ms. `--cold=all` re-uploads the ~7000 bindless textures that stay resident in the game.
+
+### Frames after the first
+
+The first frame of every loop carries the restore: every page the previous loop changed is written back (several times what the game writes between two frames), and its stamps make the first frame's lookups miss. The later frames see only the capture's own changes, like the game. `replay-bench.ps1` prints the per-frame medians and "frames after the first" in ms and FPS: judge a change by that line and by the loop median. Use a capture whose frames show something (Wolverine frames 250-252, the PlayStation logo; frames 400-402 and 885-887 are black, so `--compare` proves nothing on them). `ps5run	oolseplay-verify.sh <capture>` replays three loops with PNGs and checks that every frame of loops 1 and 2 is byte-identical to the capture's `live` frames.
+
+Wolverine frames 250-252, `-Cold 'dispatch,draw,resources,space'` (tables stay warm: the game rebuilds them incrementally, ~14 full builds against ~8500 incremental ones), no profiling:
+
+| Build | Loop | Frames after the first | Last frame |
+|---|---|---|---|
+| frame-capture cb9c1434 (2026-10-04 15:05) | 385 ms | 66.7 ms | ~62 ms |
+| frame-capture 1a48ebde | 183 ms | 39.2 ms (25.5 FPS) | 33.6 ms |
+
+The game itself ran the intros at ~24 FPS on 1a48ebde (~3 FPS on 4885945d).
 
 ### How to measure a driver change
 
