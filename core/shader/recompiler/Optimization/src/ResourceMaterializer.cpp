@@ -414,8 +414,20 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         for (std::uint32_t key = 0; key < entries; key++) keys[key] = key;
     }
     counters.outOfRange.fetch_add(outOfRange, std::memory_order_relaxed);
+    // A table that selects no usable entry (no key in range, or only null and unusable T#s) binds
+    // null T#s: every key samples zeros, as it does on hardware.
+    const auto bindNullTable = [&] {
+        DescriptorValue null;
+        null.dwordCount = 8u;
+        resolution = TableResolution{};
+        resolution.direct = !materialMode;
+        resolution.slots.assign(slotCount, null);
+        resolved = null;
+        counters.rejected[static_cast<std::size_t>(BindlessRejection::NoEntry)].fetch_add(1, std::memory_order_relaxed);
+    };
     if (keys.empty()) {
-        rejectTable(BindlessRejection::NoEntry, "bindless image table selects no entry");
+        bindNullTable();
+        return;
     }
 
     const std::uint64_t heapBase = heap.Base48();
@@ -487,10 +499,9 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
             if (!entry->groups.empty()) entry->groups += ", ";
             entry->groups += describeShape(group) + " " + std::to_string(count) + (group == *shape ? "*" : "");
         }
-        if (!shape.has_value()) {
-            rejectTable(BindlessRejection::NoEntry, "bindless image table has no valid entry (" + std::to_string(keys.size()) + " candidates, first T# " + describeWords(candidates.front()) + ")");
-        }
-        const auto pad = candidates[static_cast<std::size_t>(std::find(valid.begin(), valid.end(), std::uint8_t{1}) - valid.begin())];
+        DescriptorValue null;
+        null.dwordCount = 8u;
+        const auto pad = shape.has_value() ? candidates[static_cast<std::size_t>(std::find(valid.begin(), valid.end(), std::uint8_t{1}) - valid.begin())] : null;
         auto& result = entry->resolution;
         result.direct = direct;
         result.slots = candidates;
