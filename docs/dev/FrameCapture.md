@@ -55,6 +55,15 @@ Wolverine intro, frames 400-402, ms per dispatch (live = one profiling run of th
 
 GPU time per frame: live 4.2 ms, replay 4.1-4.5 ms. `--cold=all` re-uploads the ~7000 bindless textures that stay resident in the game.
 
+### How to measure a driver change
+
+1. Keep the PC quiet: no game, no build of another tree. `replay-bench.ps1` prints the CPU time other processes used during the run; anything above a few seconds (`cc1plus`, `eboot`) invalidates the timings.
+2. Baseline: `replay-bench.ps1 -Capture wolverine-400 -Cold live -Loops 12 -Label base`. Change the driver, then `replay-bench.ps1 -Capture wolverine-400 -Cold live -Loops 12 -Build -Label change`. Use `-Cold live` (new frames miss the dispatch/draw/resource/table caches as in the game); `-Cold warm` isolates the cache-hit path; never `-Cold all` for comparisons with the game.
+3. Compare, in this order: command mismatches (must stay 0); the median loop time of loops 1..N (loop 0 is one-time work: pipeline creation, first texture uploads, and depends on the shader cache); the per-class ms per dispatch (`replay_phases.py`, averaged over every window after loop 0) and its top phases; GPU ms per frame.
+4. Repeat each side twice when the difference is under ~10%: single runs vary by that much.
+
+Every 10 s the driver's profile report (`APS5_PROFILE_DRAW`) stalls the workers for about a second; with ~3 s per loop including the restore, roughly every third loop takes 2-2.5 s. The median ignores those loops; the per-dispatch averages include them. The replay opts out of Windows power throttling (efficiency mode and ignored timer resolution), which otherwise doubled loop times when its window was not in the foreground.
+
 Known biases: with no game CPU between submissions the queues overlap more than in the game, so direct dispatches wait longer for the GPU mutex behind queue 0 (about 1.4-1.8x live). Shader-memory walks that meet pending GPU writes wait for them depending on GPU timing, which makes single runs vary (cold loops 0.85-2.8 s in the worst runs); compare medians of repeated runs.
 
 ## Format (version 2)

@@ -949,8 +949,19 @@ Options ParseOptions(int argc, char** argv) {
 
 }
 
+void DisablePowerThrottling() {
+    constexpr ULONG executionSpeed = 0x1;
+    constexpr ULONG ignoreTimerResolution = 0x4;
+    PROCESS_POWER_THROTTLING_STATE state{};
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask = executionSpeed | ignoreTimerResolution;
+    state.StateMask = 0;
+    if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state))) std::fprintf(stderr, "[replay] could not opt out of power throttling (error %lu); timings may vary\n", GetLastError());
+}
+
 int main(int argc, char** argv) {
     try {
+        DisablePowerThrottling();
         const auto options = ParseOptions(argc, argv);
         if (options.shaderCache && _wputenv_s(L"ANYPS5_SHADER_CACHE_DIR", options.shaderCache->wstring().c_str()) != 0) Fail("cannot set ANYPS5_SHADER_CACHE_DIR");
         CaptureFile capture(options.capture);
