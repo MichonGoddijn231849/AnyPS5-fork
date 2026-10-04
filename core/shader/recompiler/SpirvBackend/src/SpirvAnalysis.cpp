@@ -108,6 +108,10 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                 } else if (addressAccess == AddressAccess::Write && !program.Info().bdaWrites) {
                     throw std::runtime_error("writable FLAT/GLOBAL addresses require GPU ownership tracking");
                 }
+                // A compute FLAT access may reach the private aperture (see RoutesApertures).
+                if (program.Resources().memoryInfo.at(memoryIndex).kind == ResourceKind::Flat && program.Resources().stage == IrShaderStage::Compute && program.Info().scratchDwords != 0u) {
+                    requirements.functionScratch = true;
+                }
             }
             if (BufferAccessOf(inst->Opcode()) != BufferAccess::None) {
                 const auto memoryIndex = inst->Flags<MemoryFlags>().index;

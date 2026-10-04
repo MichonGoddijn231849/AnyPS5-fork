@@ -818,9 +818,72 @@ const MemoryInfo& SharedMemory(SpirvValueEmitContext& ctx, const IrValue& inst) 
     return mem;
 }
 
+// The console's apertures: a FLAT-segment address whose high dword is 0x8000xxxx reaches the
+// workgroup's LDS at its low dword and 0x7000xxxx the lane's private (scratch) memory, as SH_MEM_BASES
+// maps them (GTA V's ray traversal keeps its stack in LDS and spills it to scratch through such
+// addresses). Compute programs route them; other FLAT addresses are guest memory read through BDA.
+constexpr std::uint32_t SharedApertureTop = 0x8000u;
+constexpr std::uint32_t PrivateApertureTop = 0x7000u;
+
+bool RoutesApertures(const SpirvEmitterState& state, const MemoryInfo& mem) {
+    return mem.kind == ResourceKind::Flat && state.program.Resources().stage == IrShaderStage::Compute;
+}
+
+struct ApertureAddress {
+    std::uint32_t low = 0;
+    std::uint32_t shared = 0;
+    std::uint32_t priv = 0;
+};
+
+ApertureAddress SplitAperture(SpirvEmitterState& state, std::uint32_t address) {
+    const auto u32 = TypeU32(state);
+    const auto high = Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpShiftRightLogical, TypeScalarU64(state), address, BdaConstant(state, 32u)));
+    const auto top = Binary(state, spv::OpShiftRightLogical, u32, high, ConstantU32(state, 16u));
+    return {Unary(state, spv::OpUConvert, u32, address), Binary(state, spv::OpIEqual, TypeBool(state), top, ConstantU32(state, SharedApertureTop)), Binary(state, spv::OpIEqual, TypeBool(state), top, ConstantU32(state, PrivateApertureTop))};
+}
+
+// The LDS or scratch dword (or narrower element) at a byte offset; zero outside the storage.
+std::uint32_t LoadApertureElement(SpirvValueEmitContext& ctx, ResourceKind kind, std::uint32_t byteOffset, std::uint32_t bits) {
+    auto& state = ctx.state;
+    if (kind == ResourceKind::Scratch && state.program.Info().scratchDwords == 0u) return ConstantU32(state, 0u);
+    MemoryInfo storage{};
+    storage.kind = kind;
+    const auto resource = PrepareMemoryResourceAccess(state, storage);
+    const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byteOffset, ConstantU32(state, 2u));
+    return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, resource, index), [&] {
+        return bits == 32u ? LoadWordInBounds(ctx, resource, index) : LoadSubwordInBounds(ctx, resource, byteOffset, index, bits, false);
+    });
+}
+
+void StoreApertureWord(SpirvValueEmitContext& ctx, ResourceKind kind, std::uint32_t byteOffset, std::uint32_t data) {
+    auto& state = ctx.state;
+    if (kind == ResourceKind::Scratch && state.program.Info().scratchDwords == 0u) return;
+    MemoryInfo storage{};
+    storage.kind = kind;
+    const auto resource = PrepareMemoryResourceAccess(state, storage);
+    const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byteOffset, ConstantU32(state, 2u));
+    EmitIfCondition(state, EmitMemoryElementInBounds(state, resource, index), [&] { StoreWordInBounds(ctx, resource, index, data); });
+}
+
+// A FLAT load of `type` routed by aperture: `aperture(kind, low)` reads LDS or scratch, `global()` guest memory.
+template<typename TAperture, typename TGlobal>
+std::uint32_t RouteFlatLoad(SpirvEmitterState& state, std::uint32_t address, std::uint32_t type, TAperture&& aperture, TGlobal&& global) {
+    const auto split = SplitAperture(state, address);
+    return EmitValueIfElse(state, split.shared, type, [&] { return aperture(ResourceKind::Lds, split.low); }, [&] {
+        return EmitValueIfElse(state, split.priv, type, [&] { return aperture(ResourceKind::Scratch, split.low); }, global);
+    });
+}
+
 void LoadAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t bits) {
     const auto& mem = ctx.Memory(inst);
     if (bits == 32u && mem.planningOnly) {
+        return;
+    }
+    if (RoutesApertures(ctx.state, mem)) {
+        ctx.Define(inst, EmitValueOrZeroIfCondition(ctx.state, ActiveArgument(ctx, inst), [&] {
+            const auto address = GuestAddress(ctx, inst, mem);
+            return RouteFlatLoad(ctx.state, address, TypeU32(ctx.state), [&](ResourceKind kind, std::uint32_t low) { return LoadApertureElement(ctx, kind, low, bits); }, [&] { return EmitBdaRead(ctx, inst, address, bits); });
+        }));
         return;
     }
     switch (mem.kind) {
@@ -849,6 +912,22 @@ void LoadAddressWide(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint3
     if (mem.planningOnly) {
         return;
     }
+    if (RoutesApertures(ctx.state, mem)) {
+        auto& state = ctx.state;
+        const auto type = TypeU32Composite(state, components);
+        ctx.Define(inst, EmitValueOrDefaultIfCondition(state, ActiveArgument(ctx, inst), type, ConstantU32CompositeZero(state, components), [&] {
+            const auto base = GuestAddressBase(ctx, inst, mem);
+            const auto address = AddBdaImmediate(ctx, inst, base, static_cast<std::int32_t>(mem.offset));
+            return RouteFlatLoad(state, address, type, [&](ResourceKind kind, std::uint32_t low) {
+                std::array<std::uint32_t, 4> values{};
+                for (std::uint32_t component = 0; component < components; component++) {
+                    values[component] = LoadApertureElement(ctx, kind, Binary(state, spv::OpIAdd, TypeU32(state), low, ConstantU32(state, component * 4u)), 32u);
+                }
+                return ConstructU32Composite(state, components, values);
+            }, [&] { return ConstructU32Composite(state, components, EmitBdaDwordReads(ctx, inst, base, mem.offset, components)); });
+        }));
+        return;
+    }
     switch (mem.kind) {
     case ResourceKind::Flat:
     case ResourceKind::Global:
@@ -865,7 +944,20 @@ void StoreAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t
         // A FLAT/GLOBAL dword store writes through BDA, noted for GPU ownership like a store through a
         // GPU-selected V#; narrower stores would need a read-modify-write of the dword.
         if (bits != 32u) ctx.Fail(inst, "is a sub-dword FLAT/GLOBAL store, which has no emitter");
-        EmitIfCondition(ctx.state, ActiveArgument(ctx, inst), [&] { EmitBdaWrite(ctx, inst, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.ArgumentCount() - 2u)); });
+        auto& state = ctx.state;
+        EmitIfCondition(state, ActiveArgument(ctx, inst), [&] {
+            const auto address = GuestAddress(ctx, inst, mem);
+            const auto data = ctx.Arg(inst, inst.ArgumentCount() - 2u);
+            if (!RoutesApertures(state, mem)) {
+                EmitBdaWrite(ctx, inst, address, data);
+                return;
+            }
+            const auto split = SplitAperture(state, address);
+            EmitIfCondition(state, split.shared, [&] { StoreApertureWord(ctx, ResourceKind::Lds, split.low, data); });
+            EmitIfCondition(state, split.priv, [&] { StoreApertureWord(ctx, ResourceKind::Scratch, split.low, data); });
+            const auto global = Unary(state, spv::OpLogicalNot, TypeBool(state), Binary(state, spv::OpLogicalOr, TypeBool(state), split.shared, split.priv));
+            EmitIfCondition(state, global, [&] { EmitBdaWrite(ctx, inst, address, data); });
+        });
         return;
     }
     if (bits == 32u) {
