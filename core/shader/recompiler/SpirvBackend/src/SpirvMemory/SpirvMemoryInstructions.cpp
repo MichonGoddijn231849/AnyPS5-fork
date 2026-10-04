@@ -849,7 +849,11 @@ void LoadAddressWide(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint3
 void StoreAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t bits) {
     const auto& mem = ctx.Memory(inst);
     if (mem.kind != ResourceKind::Scratch) {
-        ctx.Fail(inst, "must write a scratch resource because physical address stores have no emitter");
+        // A FLAT/GLOBAL dword store writes through BDA, noted for GPU ownership like a store through a
+        // GPU-selected V#; narrower stores would need a read-modify-write of the dword.
+        if (bits != 32u) ctx.Fail(inst, "is a sub-dword FLAT/GLOBAL store, which has no emitter");
+        EmitIfCondition(ctx.state, ActiveArgument(ctx, inst), [&] { EmitBdaWrite(ctx, inst, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.ArgumentCount() - 2u)); });
+        return;
     }
     if (bits == 32u) {
         StoreWord(ctx, inst, mem);
