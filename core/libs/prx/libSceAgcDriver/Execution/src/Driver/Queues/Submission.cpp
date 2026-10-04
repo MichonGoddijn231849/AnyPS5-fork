@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Capture/Replay.hpp"
 #include <bit>
 #include <cstdlib>
 
@@ -103,7 +104,11 @@ void Driver::executeRewindTail(const Submission& stalled) {
     }
     Submission tail{};
     tail.queue = stalled.queue;
-    copyCommands(tail, stalled.rewindTail, stalled.rewindWords);
+    {
+        // A replay may be writing the delta that released this REWIND: copy only once it is complete.
+        std::shared_lock replayWrites(Capture::ReplayMemoryWriteMutex());
+        copyCommands(tail, stalled.rewindTail, stalled.rewindWords);
+    }
     validate(tail.commands, tail.queue, stalled.rewindTail);
     waitForFlipRoom(tail);
     {

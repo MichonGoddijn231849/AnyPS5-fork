@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <shared_mutex>
 #include <utility>
 
 namespace AgcDriver::Capture {
@@ -26,6 +27,10 @@ void ReplayClearCaches(std::uint32_t classes);
 bool ReplayStalled();
 bool ReplayDrain(std::chrono::milliseconds limit);
 void ReplaySettle();
+// Held exclusively while the replay writes a memory delta. A released REWIND copies the commands the CPU
+// appended under it shared, so it never reads a delta half written (the replay writes pages in parallel,
+// the control word's page can land before the commands').
+std::shared_mutex& ReplayMemoryWriteMutex();
 // Collects the CPU writes over the ranges (a restore's), stamping them as any collect would: the
 // write-watch walk and reset then happen here instead of inside the next frame's first lookups.
 void ReplayCollectWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);

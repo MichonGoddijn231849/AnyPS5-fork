@@ -183,6 +183,7 @@ bool Driver::captureStart() {
     // frame) are carried: the capture starts with the rest of each one executing and every queued one,
     // in submission order, as its first submissions.
     std::vector<BlockedWait> carried;
+    std::vector<std::uint32_t> skippedPacket;
     if (!DrainFor(drainLimit)) {
         std::uint64_t pending = 0;
         {
@@ -191,8 +192,26 @@ bool Driver::captureStart() {
             for (std::uint32_t queue = 0; queue < inFlightSource.size(); ++queue) {
                 const auto* source = inFlightSource[queue].load(std::memory_order_acquire);
                 if (source == nullptr) continue;
-                const auto cursor = inFlightCursor[queue].load(std::memory_order_relaxed);
-                carried.push_back({source, cursor, inFlightWords[queue].load(std::memory_order_relaxed) - cursor, inFlightCommands[queue].load(std::memory_order_relaxed), inFlightReceived[queue].load(std::memory_order_relaxed), queue});
+                // The worker is blocked on the packet at the cursor (a wait the rest of the frame
+                // releases); the carried part starts after it, or is empty.
+                const auto* commands = inFlightCommands[queue].load(std::memory_order_relaxed);
+                const auto words = inFlightWords[queue].load(std::memory_order_relaxed);
+                auto cursor = inFlightCursor[queue].load(std::memory_order_relaxed);
+                // Blocked on its closing REWIND: the CPU appends the frame's commands behind it later.
+                // The REWIND and the whole buffer behind it are carried from guest memory, so the
+                // replay waits on the same control word and runs what the CPU writes there.
+                const auto* rewindTail = inFlightRewindTail[queue].load(std::memory_order_relaxed);
+                if (rewindTail != nullptr && cursor < words && cursor + Pm4::PacketWords(commands[cursor]) >= words) {
+                    const auto rewindPacket = Pm4::PacketWords(commands[cursor]);
+                    const auto tail = inFlightRewindWords[queue].load(std::memory_order_relaxed);
+                    carried.push_back({rewindTail - rewindPacket, 0, rewindPacket + tail, rewindTail - rewindPacket, inFlightReceived[queue].load(std::memory_order_relaxed), queue});
+                    continue;
+                }
+                if (cursor < words) {
+                    cursor = std::min<std::size_t>(words, cursor + Pm4::PacketWords(commands[cursor]));
+                    skippedPacket.push_back(queue);
+                }
+                carried.push_back({source, cursor, words - cursor, commands, inFlightReceived[queue].load(std::memory_order_relaxed), queue});
             }
             for (const auto& [queue, worker] : workers) {
                 for (const auto& waiting : worker.pending) {
@@ -234,9 +253,13 @@ bool Driver::captureStart() {
             for (const auto& [address, snapshot] : *shaders) registered.push_back(snapshot);
         }
         for (std::size_t queue = 0; queue < progressBase.size(); ++queue) progressBase[queue] = packetsExecuted[queue].load(std::memory_order_acquire);
+        // The packet an executing carried submission is blocked on still completes live, but the replay
+        // starts after it: it does not count as recorded progress.
+        for (const auto queue : skippedPacket) ++progressBase[queue];
     }
     for (const auto& snapshot : registered) captureShader(*snapshot);
     for (const auto& wait : carried) {
+        if (wait.words == 0) continue;
         // The words are the driver's copy: the game may have reused the command buffer already, and
         // the replay writes them back over guest memory when it differs.
         const auto rest = std::span<const std::uint32_t>(wait.commands + wait.cursor, wait.words);
@@ -313,6 +336,11 @@ void Driver::captureFinish() {
 }
 
 namespace AgcDriver::Capture {
+
+std::shared_mutex& ReplayMemoryWriteMutex() {
+    static std::shared_mutex mutex;
+    return mutex;
+}
 
 std::uint64_t ReplayPacketsExecuted(std::uint32_t queue) {
     return DriverDetail::Driver::Get().PacketsExecuted(queue);

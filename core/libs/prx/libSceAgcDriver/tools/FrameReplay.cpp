@@ -790,7 +790,10 @@ private:
             const auto kind = reader.Get<MemoryKind>();
             const auto runs = reader.GetSpan<MemoryRun>();
             const auto memoryStarted = Clock::now();
-            writeRuns(runs, reader.GetSpan<std::uint32_t>(), false);
+            {
+                std::unique_lock replayWrites(ReplayMemoryWriteMutex());
+                writeRuns(runs, reader.GetSpan<std::uint32_t>(), false);
+            }
             memoryMs += std::chrono::duration<double, std::milli>(Clock::now() - memoryStarted).count();
             for (const auto& run : runs) memoryBytes += static_cast<std::uint64_t>(run.pages) * PageBytes;
             if (kind == MemoryKind::Base || kind == MemoryKind::Mapped) space.ApplyProtections();

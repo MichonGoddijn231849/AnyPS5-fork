@@ -356,6 +356,8 @@ private:
     std::array<std::atomic<std::size_t>, Capture::QueueCount> inFlightCursor{};
     std::array<std::atomic<std::size_t>, Capture::QueueCount> inFlightWords{};
     std::array<std::atomic<const std::uint32_t*>, Capture::QueueCount> inFlightCommands{};
+    std::array<std::atomic<const std::uint32_t*>, Capture::QueueCount> inFlightRewindTail{};
+    std::array<std::atomic<std::size_t>, Capture::QueueCount> inFlightRewindWords{};
     std::array<std::atomic<std::uint64_t>, Capture::QueueCount> inFlightReceived{};
     std::array<std::atomic<bool>, Capture::QueueCount> queueBlocked{};
     std::array<std::uint64_t, Capture::QueueCount> progressBase{};

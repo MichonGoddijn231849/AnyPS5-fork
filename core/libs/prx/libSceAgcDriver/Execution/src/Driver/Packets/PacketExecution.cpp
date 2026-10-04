@@ -144,6 +144,8 @@ void Driver::execute(const Submission& submission) {
         inFlightCursor[submission.queue].store(0, std::memory_order_relaxed);
         inFlightWords[submission.queue].store(submission.commands.size(), std::memory_order_relaxed);
         inFlightCommands[submission.queue].store(submission.commands.data(), std::memory_order_relaxed);
+        inFlightRewindTail[submission.queue].store(submission.rewindTail, std::memory_order_relaxed);
+        inFlightRewindWords[submission.queue].store(submission.rewindWords, std::memory_order_relaxed);
         inFlightReceived[submission.queue].store(submission.received, std::memory_order_relaxed);
         inFlightSource[submission.queue].store(submission.source, std::memory_order_release);
     }
