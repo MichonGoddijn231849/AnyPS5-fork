@@ -60,6 +60,7 @@ public:
     void RegisterShader(const Shader* shader);
     std::uint64_t PacketsExecuted(std::uint32_t queue) const;
     bool Stalled();
+    std::uint64_t QueueAwaited(std::uint32_t queue) const { return queueAwaited.at(queue).load(std::memory_order_acquire); }
     bool DrainFor(std::chrono::milliseconds limit);
     void Settle();
     void RestoreQueueState(std::uint32_t queue, std::span<const std::byte> state);
@@ -360,6 +361,7 @@ private:
     std::array<std::atomic<std::size_t>, Capture::QueueCount> inFlightRewindWords{};
     std::array<std::atomic<std::uint64_t>, Capture::QueueCount> inFlightReceived{};
     std::array<std::atomic<bool>, Capture::QueueCount> queueBlocked{};
+    std::array<std::atomic<std::uint64_t>, Capture::QueueCount> queueAwaited{};
     std::array<std::uint64_t, Capture::QueueCount> progressBase{};
 
 };

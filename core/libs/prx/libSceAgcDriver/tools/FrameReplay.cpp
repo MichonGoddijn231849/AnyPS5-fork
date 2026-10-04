@@ -30,6 +30,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
@@ -202,7 +203,10 @@ public:
         pendingProtections.clear();
     }
 
-    void Write(std::uint64_t address, const std::byte* source, std::size_t bytes, bool compareFirst) {
+    // A merge writes only the words the capture changed since `previous` (the page's earlier captured
+    // version, null for zeros): the others may hold what the replay's GPU wrote ahead of the capture
+    // (labels, buffers), which the capture saw only later or never.
+    void Write(std::uint64_t address, const std::byte* source, std::size_t bytes, bool compareFirst, bool merge = false, const std::byte* previous = nullptr) {
         auto* target = reinterpret_cast<std::byte*>(address);
         if (compareFirst) {
             const bool same = source != nullptr ? std::memcmp(target, source, bytes) == 0 : std::all_of(target, target + bytes, [](std::byte value) { return value == std::byte{0}; });
@@ -213,15 +217,19 @@ public:
         const auto* piece = find(address);
         if (piece == nullptr) Fail("capture writes " + Hex(address) + " outside every mapped piece");
         const bool applied = std::find(pendingProtections.begin(), pendingProtections.end(), *piece) == pendingProtections.end();
+        const auto store = [&] {
+            if (merge) mergeWords(target, source, previous, bytes);
+            else copy(target, source, bytes);
+        };
         if (!applied || piece->writable) {
-            copy(target, source, bytes);
+            store();
             return;
         }
         const auto page = address & ~(ViewBytes - 1);
-        DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(page), ViewBytes, PAGE_READWRITE, &previous)) Fail("cannot open read-only guest page " + Hex(page) + " for a capture write");
-        copy(target, source, bytes);
-        if (!VirtualProtect(reinterpret_cast<void*>(page), ViewBytes, previous, &previous)) Fail("cannot restore guest page protection at " + Hex(page));
+        DWORD protection;
+        if (!VirtualProtect(reinterpret_cast<void*>(page), ViewBytes, PAGE_READWRITE, &protection)) Fail("cannot open read-only guest page " + Hex(page) + " for a capture write");
+        store();
+        if (!VirtualProtect(reinterpret_cast<void*>(page), ViewBytes, protection, &protection)) Fail("cannot restore guest page protection at " + Hex(page));
     }
 
     const std::vector<Piece>& Pieces() const { return pieces; }
@@ -245,6 +253,16 @@ private:
     static void copy(std::byte* target, const std::byte* source, std::size_t bytes) {
         if (source != nullptr) std::memcpy(target, source, bytes);
         else std::memset(target, 0, bytes);
+    }
+
+    static void mergeWords(std::byte* target, const std::byte* source, const std::byte* previous, std::size_t bytes) {
+        for (std::size_t offset = 0; offset < bytes; offset += sizeof(std::uint32_t)) {
+            std::uint32_t now = 0;
+            std::uint32_t before = 0;
+            if (source != nullptr) std::memcpy(&now, source + offset, sizeof(now));
+            if (previous != nullptr) std::memcpy(&before, previous + offset, sizeof(before));
+            if (now != before) std::memcpy(target + offset, &now, sizeof(now));
+        }
     }
 
     const Piece* find(std::uint64_t address) const {
@@ -464,6 +482,16 @@ private:
     std::exception_ptr failure;
 };
 
+// APS5_TRACE_PACING=ms: the pacing waits longer than that, with every queue's progress, and the events that
+// touch what queue 0 waits on.
+double TracePacingMs() {
+    static const double traceMs = [] {
+        const char* value = std::getenv("APS5_TRACE_PACING");
+        return value != nullptr ? std::strtod(value, nullptr) : -1.0;
+    }();
+    return traceMs;
+}
+
 class Replayer;
 
 // Helper threads for large memory events: Run hands out `parts` indices to them and to the caller,
@@ -649,6 +677,7 @@ public:
                 for (std::size_t i = 0; i < prologueEnd; ++i) apply(capture.events[i]);
                 initialPieces = space.Pieces();
                 initialRegistry = space.Registry();
+                initialLastPage = lastPage;
             } else {
                 restore();
             }
@@ -792,10 +821,29 @@ private:
         case EventType::Memory: {
             const auto kind = reader.Get<MemoryKind>();
             const auto runs = reader.GetSpan<MemoryRun>();
+            for (std::uint32_t queue = 0; queue < QueueCount && TracePacingMs() >= 0; ++queue) {
+                const auto awaited = ReplayQueueAwaited(queue) & ~std::uint64_t{3};
+                if (awaited == 0) continue;
+                Reader again(event.payload);
+                static_cast<void>(again.Get<MemoryKind>());
+                static_cast<void>(again.GetSpan<MemoryRun>());
+                const auto indices = again.GetSpan<std::uint32_t>();
+                std::size_t next = 0;
+                for (const auto& run : runs) {
+                    const auto end = run.address + static_cast<std::uint64_t>(run.pages) * PageBytes;
+                    if (awaited >= run.address && awaited < end) {
+                        const auto page = next + static_cast<std::size_t>((awaited - run.address) / PageBytes);
+                        std::uint32_t value = 0;
+                        if (page < indices.size()) std::memcpy(&value, capture.Page(indices[page]) + (awaited % PageBytes), sizeof(value));
+                        std::fprintf(stderr, "[pacing] memory event writes queue %u's awaited 0x%llx: 0x%x -> 0x%x\n", queue, static_cast<unsigned long long>(awaited), *reinterpret_cast<const volatile std::uint32_t*>(static_cast<std::uintptr_t>(awaited)), value);
+                    }
+                    next += run.pages;
+                }
+            }
             const auto memoryStarted = Clock::now();
             {
                 std::unique_lock replayWrites(ReplayMemoryWriteMutex());
-                writeRuns(runs, reader.GetSpan<std::uint32_t>(), false);
+                writeRuns(runs, reader.GetSpan<std::uint32_t>(), false, kind == MemoryKind::Delta);
             }
             memoryMs += std::chrono::duration<double, std::milli>(Clock::now() - memoryStarted).count();
             for (const auto& run : runs) memoryBytes += static_cast<std::uint64_t>(run.pages) * PageBytes;
@@ -816,6 +864,7 @@ private:
             if (recorded.size() == submit.packetWords && HashWords(std::span<const std::uint32_t>(guestWords, submit.packetWords)) != submit.hash && HashWords(recorded) == submit.hash) {
                 std::memcpy(guestWords, recorded.data(), recorded.size_bytes());
             }
+            if (TracePacingMs() >= 0) std::fprintf(stderr, "[pacing] submit queue %u, %u words at 0x%llx\n", submit.queue, submit.packetWords, static_cast<unsigned long long>(submit.packetAddress));
             ReplayExpectCommands(submit.hash);
             Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(submit.packetAddress)), submit.packetWords, 0, {}};
             AgcDriver::Submit(&packet, submit.queue);
@@ -825,6 +874,7 @@ private:
         }
         case EventType::RewindTail: {
             const auto tail = reader.Get<RewindTailEvent>();
+            if (TracePacingMs() >= 0) std::fprintf(stderr, "[pacing] rewind tail queue %u, next tail 0x%llx\n", tail.queue, static_cast<unsigned long long>(tail.nextTail));
             ReplayPushRewindTail(tail.queue, reader.GetSpan<std::uint32_t>(), tail.nextTail, tail.nextWords);
             break;
         }
@@ -868,33 +918,43 @@ private:
         }
     }
 
-    void writeRuns(std::span<const MemoryRun> runs, std::span<const std::uint32_t> indices, bool compareFirst) {
+    // A delta (`merge`) writes only what the capture changed in each page since its last captured version;
+    // a base, a mapping or a restore writes whole pages.
+    void writeRuns(std::span<const MemoryRun> runs, std::span<const std::uint32_t> indices, bool compareFirst, bool merge = false) {
         std::size_t total = 0;
         for (const auto& run : runs) total += run.pages;
+        if (total > indices.size()) Fail("capture memory event has fewer pages than its runs");
+        std::vector<std::uint64_t> addresses;
+        addresses.reserve(total);
+        for (const auto& run : runs) {
+            if (compareFirst) AgcDriver::GuestMemory::FlushGpuWrites(run.address, static_cast<std::size_t>(run.pages) * PageBytes);
+            for (std::uint32_t page = 0; page < run.pages; ++page) addresses.push_back(run.address + static_cast<std::uint64_t>(page) * PageBytes);
+        }
+        constexpr std::uint64_t NoPage = std::uint64_t{1} << 32u;
+        std::vector<std::uint64_t> previous(total, NoPage);
+        for (std::size_t i = 0; i < total; ++i) {
+            auto& last = lastPage[addresses[i]];
+            if (merge && last != 0) previous[i] = last - 1;
+            last = std::uint64_t{indices[i]} + 1;
+        }
+        const auto writePage = [&](std::size_t i) {
+            if (previous[i] == NoPage) {
+                space.Write(addresses[i], capture.Page(indices[i]), PageBytes, compareFirst);
+            } else if (previous[i] != indices[i]) {
+                space.Write(addresses[i], capture.Page(indices[i]), PageBytes, false, true, capture.Page(static_cast<std::uint32_t>(previous[i])));
+            }
+        };
         if (!compareFirst && total >= ParallelWritePages) {
             // A large delta (a video frame, a streamed buffer): the game's threads wrote it alongside
             // the GPU work, and the first store to each watched page costs a write-watch fault, so
             // the pages are written by several threads. The event still completes before the next.
-            if (total > indices.size()) Fail("capture memory event has fewer pages than its runs");
-            std::vector<std::uint64_t> addresses;
-            addresses.reserve(total);
-            for (const auto& run : runs) {
-                for (std::uint32_t page = 0; page < run.pages; ++page) addresses.push_back(run.address + static_cast<std::uint64_t>(page) * PageBytes);
-            }
             writers.Run((total + WriteChunkPages - 1) / WriteChunkPages, [&](std::size_t chunk) {
                 const auto end = std::min(total, (chunk + 1) * WriteChunkPages);
-                for (auto i = chunk * WriteChunkPages; i < end; ++i) space.Write(addresses[i], capture.Page(indices[i]), PageBytes, false);
+                for (auto i = chunk * WriteChunkPages; i < end; ++i) writePage(i);
             });
             return;
         }
-        std::size_t next = 0;
-        for (const auto& run : runs) {
-            if (compareFirst) AgcDriver::GuestMemory::FlushGpuWrites(run.address, static_cast<std::size_t>(run.pages) * PageBytes);
-            for (std::uint32_t page = 0; page < run.pages; ++page) {
-                if (next >= indices.size()) Fail("capture memory event has fewer pages than its runs");
-                space.Write(run.address + static_cast<std::uint64_t>(page) * PageBytes, capture.Page(indices[next++]), PageBytes, compareFirst);
-            }
-        }
+        for (std::size_t i = 0; i < total; ++i) writePage(i);
     }
 
     void pace(std::span<const std::uint64_t> target) {
@@ -925,18 +985,18 @@ private:
         if (options.settle) ReplaySettle();
         const auto waitedMs = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
         pacingMs += waitedMs;
-        // APS5_TRACE_PACING=ms: the pacing waits longer than that, with every queue's progress.
-        static const double traceMs = [] {
-            const char* value = std::getenv("APS5_TRACE_PACING");
-            return value != nullptr ? std::strtod(value, nullptr) : -1.0;
-        }();
+        const double traceMs = TracePacingMs();
         if (traceMs >= 0 && waitedMs > traceMs) {
             std::string text;
             for (std::size_t queue = 0; queue < target.size() && queue < QueueCount; ++queue) {
                 if (target[queue] == 0) continue;
-                char item[64];
+                char item[96];
                 std::snprintf(item, sizeof(item), " queue %zu %llu/%llu", queue, static_cast<unsigned long long>(ReplayPacketsExecuted(static_cast<std::uint32_t>(queue)) - base[queue]), static_cast<unsigned long long>(target[queue]));
                 text += item;
+                if (const auto awaited = ReplayQueueAwaited(static_cast<std::uint32_t>(queue)); awaited != 0) {
+                    std::snprintf(item, sizeof(item), " (awaits 0x%llx = 0x%x)", static_cast<unsigned long long>(awaited), *reinterpret_cast<const volatile std::uint32_t*>(static_cast<std::uintptr_t>(awaited & ~std::uint64_t{3})));
+                    text += item;
+                }
             }
             std::fprintf(stderr, "[pacing] waited %.2f ms until%s\n", waitedMs, text.c_str());
         }
@@ -985,6 +1045,7 @@ private:
                 apply(event);
             }
         }
+        lastPage = initialLastPage;
         space.ApplyProtections();
         // The restore rewrites every page the loop changed, several times what the game writes
         // between two frames: collected here, the write-watch walk and reset of those pages land in
@@ -1025,6 +1086,9 @@ private:
     double memoryMs = 0;
     std::uint64_t memoryBytes = 0;
     std::uint64_t stallReleases = 0;
+    // Each written page's last captured version (page index + 1), at the loop's start and now.
+    std::unordered_map<std::uint64_t, std::uint64_t> initialLastPage;
+    std::unordered_map<std::uint64_t, std::uint64_t> lastPage;
     std::uint64_t submits = 0;
     std::uint64_t mappingChanges = 0;
     std::uint64_t piecesMapped = 0;

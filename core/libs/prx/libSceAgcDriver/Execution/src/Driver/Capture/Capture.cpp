@@ -436,6 +436,10 @@ void ReplayClearCaches(std::uint32_t classes) {
     DriverDetail::Driver::Get().ClearCaches(classes);
 }
 
+std::uint64_t ReplayQueueAwaited(std::uint32_t queue) {
+    return DriverDetail::Driver::Get().QueueAwaited(queue);
+}
+
 bool ReplayStalled() {
     return DriverDetail::Driver::Get().Stalled();
 }

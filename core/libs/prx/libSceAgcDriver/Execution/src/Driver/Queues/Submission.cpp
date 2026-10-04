@@ -264,6 +264,7 @@ bool Driver::orderReleased(std::uint32_t queue, std::uint64_t received) const {
 
 void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool blocked) {
     queueBlocked[queue].store(blocked, std::memory_order_release);
+    queueAwaited[queue].store(blocked ? awaited : 0, std::memory_order_release);
     if (blocked) runningWorkers.fetch_sub(1, std::memory_order_acq_rel);
     else runningWorkers.fetch_add(1, std::memory_order_acq_rel);
     if (queue == 0) queue0Awaited.store(blocked ? awaited : 0, std::memory_order_release);

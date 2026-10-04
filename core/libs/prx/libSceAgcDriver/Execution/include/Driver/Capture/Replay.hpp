@@ -27,6 +27,8 @@ enum CacheClass : std::uint32_t {
 std::uint64_t ReplayPacketsExecuted(std::uint32_t queue);
 void ReplayClearCaches(std::uint32_t classes);
 bool ReplayStalled();
+// The address a queue is blocked on (a REWIND control word or a WAIT_REG_MEM), 0 when it is not blocked.
+std::uint64_t ReplayQueueAwaited(std::uint32_t queue);
 bool ReplayDrain(std::chrono::milliseconds limit);
 void ReplaySettle();
 // Held exclusively while the replay writes a memory delta. A released REWIND copies the commands the CPU
