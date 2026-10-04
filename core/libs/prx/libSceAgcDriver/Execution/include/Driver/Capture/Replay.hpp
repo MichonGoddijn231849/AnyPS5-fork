@@ -17,6 +17,7 @@ enum CacheClass : std::uint32_t {
     CacheTables = 16,
     CacheSpace = 32,
     CacheAll = 63,
+    CacheLive = CacheDispatch | CacheDraw | CacheResources | CacheTables | CacheSpace,
 };
 
 std::uint64_t ReplayPacketsExecuted(std::uint32_t queue);

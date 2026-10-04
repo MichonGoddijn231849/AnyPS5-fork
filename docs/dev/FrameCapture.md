@@ -34,9 +34,28 @@ Output:
 | `--settle` | Also drain the device before every memory delta. |
 | `--shader-cache DIR` | Shader/pipeline disk cache (default: next to the exe); point it at the game's run dir cache for a warm first loop. |
 | `--hidden` | Do not show the presentation window. |
-| `--cold[=classes]` | Between loops clear the driver's in-memory caches so every loop misses them like new frames: `dispatch` (dispatch cache and its recipes), `draw` (draw cache and recipes), `resources` (resource cache), `textures` (sampled/storage textures, flushed first), `tables` (bindless sampled tables, BDA tables), `space` (address-space cache); `--cold` alone clears all. The shader disk cache, compiled shaders and pipelines stay warm. On Wolverine's intros `--cold=dispatch,draw,resources,tables,space` matches the game's per-dispatch costs best: the game keeps its textures resident across frames. |
+| `--cold[=classes]` | Between loops clear the driver's in-memory caches so every loop misses them like new frames do in the game. Classes: `dispatch` (dispatch cache and its recipes), `draw` (draw cache and recipes), `resources` (resource cache), `textures` (sampled/storage textures, flushed first), `tables` (bindless sampled tables, BDA tables), `space` (address-space cache); presets `live` (everything but textures, the default of `--cold`) and `all`. The shader disk cache, compiled shaders and pipelines stay warm. |
+| `--for-seconds S` | Loop until S seconds have passed after loop 0 (instead of `--loop`). |
 
 All driver environment variables apply (`APS5_PROFILE_DRAW=1`, `APS5_PROFILE_GPU=1`, ...). Profile lines report every 10 s, so profile with enough loops. Exit code: 0 on success, 2 when commands differed from the capture or queues were left blocked, 1 on errors or missing/different frames in `--compare`.
+
+## Benchmarking a driver change
+
+`ps5run\tools\replay-bench.ps1 -Capture <name> [-Build] [-Cold live|all|warm] [-Seconds 22 | -Loops N] [-Libs <build dir>]` builds `agc_frame_replay` (with `-Build`, which relinks the driver), replays with `APS5_PROFILE_DRAW=1 APS5_PROFILE_GPU=1`, and prints loop 0, median/min/max loop time, command mismatches, GPU ms per frame, the `bench_summary.py` lines of the last 10 s profile window, and which other processes used CPU during the run. A run takes about a minute (build 5 s, setup 10 s, loop 0 15-30 s, 22 s of loops).
+
+Wolverine intro, frames 400-402, ms per dispatch (live = one profiling run of the same build at the same frames):
+
+| Class | Live | Warm loops | `--cold=live` | `--cold=all` |
+|---|---|---|---|---|
+| other queues indirect | 9.11 | 8.43 | 10.5 | 29.2 |
+| queue 0 indirect | 39.6 | 22.7 | 37.0 | 36.6 |
+| queue 0 direct | 0.38 | 0.45 | 0.54 | 1.17 |
+| other queues direct | 0.52 | 0.88 | 0.92 | 1.38 |
+| loop of 3 frames | ~0.88 s | 0.75 s | ~1.0-1.2 s | 2.78 s |
+
+GPU time per frame: live 4.2 ms, replay 4.1-4.5 ms. `--cold=all` re-uploads the ~7000 bindless textures that stay resident in the game.
+
+Known biases: with no game CPU between submissions the queues overlap more than in the game, so direct dispatches wait longer for the GPU mutex behind queue 0 (about 1.4-1.8x live). Shader-memory walks that meet pending GPU writes wait for them depending on GPU timing, which makes single runs vary (cold loops 0.85-2.8 s in the worst runs); compare medians of repeated runs.
 
 ## Format (version 2)
 

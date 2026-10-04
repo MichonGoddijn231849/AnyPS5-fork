@@ -54,6 +54,7 @@ std::string Hex(std::uint64_t value) {
 struct Options {
     std::filesystem::path capture;
     std::uint32_t loops = 1;
+    double forSeconds = 0;
     std::optional<std::filesystem::path> png;
     std::uint32_t pngScale = 1;
     bool pngAllLoops = false;
@@ -547,7 +548,9 @@ public:
         presenter->dumpScale = options.pngScale;
         presenter->Enqueue({true, std::nullopt, {}, nullptr});
         presenter->WaitDone();
-        for (loop = 0; loop < options.loops; ++loop) {
+        std::optional<Clock::time_point> measuredSince;
+        for (loop = 0; options.forSeconds > 0 ? (loop < 2 || std::chrono::duration<double>(Clock::now() - *measuredSince).count() < options.forSeconds) : loop < options.loops; ++loop) {
+            if (loop == 1) measuredSince = Clock::now();
             const auto started = Clock::now();
             if (loop == 0) {
                 for (std::size_t i = 0; i < prologueEnd; ++i) apply(capture.events[i]);
@@ -563,6 +566,9 @@ public:
             pacingMs = 0;
             stallReleases = 0;
             submits = 0;
+            mappingChanges = 0;
+            piecesMapped = 0;
+            piecesUnmapped = 0;
             for (std::size_t i = prologueEnd; i < capture.events.size(); ++i) apply(capture.events[i]);
             const bool finished = drain();
             presenter->WaitDone();
@@ -570,7 +576,7 @@ public:
             const auto replayMs = std::chrono::duration<double, std::milli>(Clock::now() - replayStarted).count();
             const auto setupMs = std::chrono::duration<double, std::milli>(replayStarted - started).count();
             const auto frames = presenter->Presented() - presentedBefore;
-            std::fprintf(stderr, "[replay] loop %u: %llu submissions, %llu frames in %.1f ms (%.2f FPS); setup %.1f ms; pacing waits %.1f ms, %llu stall releases; command mismatches %llu%s\n", loop, static_cast<unsigned long long>(submits), static_cast<unsigned long long>(frames), replayMs, frames != 0 ? 1000.0 * static_cast<double>(frames) / replayMs : 0.0, setupMs, pacingMs, static_cast<unsigned long long>(stallReleases), static_cast<unsigned long long>(ReplayCommandMismatches()), finished ? "" : "; QUEUES STILL BLOCKED at the end");
+            std::fprintf(stderr, "[replay] loop %u: %llu submissions, %llu frames in %.1f ms (%.2f FPS); setup %.1f ms; pacing waits %.1f ms, %llu stall releases; mapping changes %llu (+%llu/-%llu pieces); command mismatches %llu%s\n", loop, static_cast<unsigned long long>(submits), static_cast<unsigned long long>(frames), replayMs, frames != 0 ? 1000.0 * static_cast<double>(frames) / replayMs : 0.0, setupMs, pacingMs, static_cast<unsigned long long>(stallReleases), static_cast<unsigned long long>(mappingChanges), static_cast<unsigned long long>(piecesMapped), static_cast<unsigned long long>(piecesUnmapped), static_cast<unsigned long long>(ReplayCommandMismatches()), finished ? "" : "; QUEUES STILL BLOCKED at the end");
             if (!finished) {
                 stuck = true;
                 break;
@@ -659,6 +665,9 @@ private:
             const auto registryRemoved = reader.GetSpan<RegistryRange>();
             const auto registryAdded = reader.GetSpan<RegistryRange>();
             space.Apply(backings, removed, added, registryRemoved, registryAdded);
+            ++mappingChanges;
+            piecesMapped += added.size();
+            piecesUnmapped += removed.size();
             break;
         }
         case EventType::Memory: {
@@ -823,6 +832,9 @@ private:
     double pacingMs = 0;
     std::uint64_t stallReleases = 0;
     std::uint64_t submits = 0;
+    std::uint64_t mappingChanges = 0;
+    std::uint64_t piecesMapped = 0;
+    std::uint64_t piecesUnmapped = 0;
     bool stuck = false;
     std::mutex failureMutex;
     std::exception_ptr failure;
@@ -890,13 +902,13 @@ int Compare(const std::filesystem::path& replayed, const std::filesystem::path& 
 }
 
 std::uint32_t ParseCacheClasses(const std::string& list) {
-    static const std::map<std::string, std::uint32_t> names{{"dispatch", CacheDispatch}, {"draw", CacheDraw}, {"resources", CacheResources}, {"textures", CacheTextures}, {"tables", CacheTables}, {"space", CacheSpace}, {"all", CacheAll}};
+    static const std::map<std::string, std::uint32_t> names{{"dispatch", CacheDispatch}, {"draw", CacheDraw}, {"resources", CacheResources}, {"textures", CacheTextures}, {"tables", CacheTables}, {"space", CacheSpace}, {"all", CacheAll}, {"live", CacheLive}};
     std::uint32_t classes = 0;
     std::size_t start = 0;
     while (start <= list.size()) {
         const auto end = std::min(list.find(',', start), list.size());
         const auto found = names.find(list.substr(start, end - start));
-        if (found == names.end()) Fail("unknown cache class '" + list.substr(start, end - start) + "' (dispatch, draw, resources, textures, tables, space, all)");
+        if (found == names.end()) Fail("unknown cache class '" + list.substr(start, end - start) + "' (live, all, dispatch, draw, resources, textures, tables, space)");
         classes |= found->second;
         start = end + 1;
     }
@@ -906,7 +918,7 @@ std::uint32_t ParseCacheClasses(const std::string& list) {
 Options ParseOptions(int argc, char** argv) {
     Options options;
     const auto usage = [] {
-        Fail("usage: agc_frame_replay <capture dir> [--loop N] [--png DIR] [--png-scale N] [--png-all-loops] [--compare DIR] [--no-pacing] [--settle] [--hidden] [--shader-cache DIR] [--cold[=dispatch,draw,resources,textures,tables,space]]");
+        Fail("usage: agc_frame_replay <capture dir> [--loop N] [--png DIR] [--png-scale N] [--png-all-loops] [--compare DIR] [--no-pacing] [--settle] [--hidden] [--shader-cache DIR] [--cold[=live|all|dispatch,draw,resources,textures,tables,space]]");
     };
     if (argc < 2) usage();
     for (int i = 1; i < argc; ++i) {
@@ -916,6 +928,7 @@ Options ParseOptions(int argc, char** argv) {
             return argv[++i];
         };
         if (argument == "--loop") options.loops = static_cast<std::uint32_t>(std::stoul(value()));
+        else if (argument == "--for-seconds") options.forSeconds = std::stod(value());
         else if (argument == "--png") options.png = value();
         else if (argument == "--png-scale") options.pngScale = static_cast<std::uint32_t>(std::stoul(value()));
         else if (argument == "--png-all-loops") options.pngAllLoops = true;
@@ -924,7 +937,7 @@ Options ParseOptions(int argc, char** argv) {
         else if (argument == "--settle") options.settle = true;
         else if (argument == "--hidden") options.hidden = true;
         else if (argument == "--shader-cache") options.shaderCache = value();
-        else if (argument == "--cold") options.cold = CacheAll;
+        else if (argument == "--cold") options.cold = CacheLive;
         else if (argument.starts_with("--cold=")) options.cold = ParseCacheClasses(argument.substr(7));
         else if (!argument.starts_with("--") && options.capture.empty()) options.capture = argument;
         else usage();
