@@ -514,25 +514,27 @@ std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextu
 
 struct NullTextures {
     std::mutex mutex;
-    std::map<std::pair<VkDevice, int>, std::shared_ptr<Texture>> textures;
+    std::map<std::tuple<VkDevice, int, bool>, std::shared_ptr<Texture>> textures;
 };
 NullTextures& NullTextureCache() {
     static NullTextures cache;
     return cache;
 }
 
-std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::DescriptorImageShape shape) {
+// A zero texture for a null or unusable T#. A comparison binding gets an R32 float one (sampled as D32),
+// which a depth comparison can read.
+std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::DescriptorImageShape shape, bool depthCompare = false) {
     constexpr VkComponentMapping mapping{VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO};
     auto& cache = NullTextureCache();
     std::lock_guard lock(cache.mutex);
-    auto& texture = cache.textures[{context.device, static_cast<int>(shape)}];
+    auto& texture = cache.textures[{context.device, static_cast<int>(shape), depthCompare}];
     if (texture == nullptr) {
         GuestTextureResource resource{};
         resource.width = 1;
         resource.height = 1;
         resource.mipCount = 1;
         resource.tileMode = TextureTileMode::kLinear;
-        resource.format = 56;
+        resource.format = depthCompare ? 22u : 56u;
         switch (shape) {
             case ShaderRecompiler::DescriptorImageShape::Image1D: resource.dimension = TextureDimension::k1D; break;
             case ShaderRecompiler::DescriptorImageShape::Image2D: resource.dimension = TextureDimension::k2D; break;
@@ -545,9 +547,17 @@ std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::D
         resource.dstSelZ = 6;
         resource.dstSelW = 7;
         const std::vector<std::byte> zeros(static_cast<std::size_t>(DescribeSurface(resource).guestBytes));
-        texture = std::make_shared<Texture>(context, *context.detiler, resource, mapping, zeros);
+        texture = std::make_shared<Texture>(context, *context.detiler, resource, mapping, zeros, depthCompare);
     }
     return texture;
+}
+
+// A T# a comparison binding cannot sample (a format that is no R32 float or R16 unorm depth, or 3D):
+// such an entry of a shadow table reads as a null T#.
+bool compareUnreadable(const GuestTextureResource& resource, bool depthCompare) {
+    if (!depthCompare) return false;
+    const auto format = ResolveTextureFormat(resource.format);
+    return (format != VK_FORMAT_R32_SFLOAT && format != VK_FORMAT_R16_UNORM) || resource.dimension == TextureDimension::k3D;
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
@@ -1715,8 +1725,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                             ++textureIndex;
                             continue;
                         }
-                        if (IsNullTextureDescriptor(words) && binding.imageShape.has_value()) {
-                            if (textureIndex >= textures.size() || nullTexture(context, *binding.imageShape) != textures[textureIndex]) return false;
+                        const bool compareElement = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
+                        if (binding.imageShape.has_value() && (IsNullTextureDescriptor(words) || compareUnreadable(DecodeTextureResource(words), compareElement))) {
+                            if (textureIndex >= textures.size() || nullTexture(context, *binding.imageShape, compareElement) != textures[textureIndex]) return false;
                             ++textureIndex;
                             continue;
                         }
@@ -2566,8 +2577,9 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 item.imageAllocations.push_back(textures.size() - 1);
                 continue;
             }
-            if (IsNullTextureDescriptor(words) && binding.imageShape.has_value()) {
-                textures.push_back(nullTexture(context, *binding.imageShape));
+            const bool compareElement = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
+            if (binding.imageShape.has_value() && (IsNullTextureDescriptor(words) || compareUnreadable(record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words), compareElement))) {
+                textures.push_back(nullTexture(context, *binding.imageShape, compareElement));
                 textureFirstLayer.push_back(false);
                 describedRanges.push_back({"texture", 0, 0, 1, 1, 56, 0, 0});
                 item.imageAllocations.push_back(textures.size() - 1);
