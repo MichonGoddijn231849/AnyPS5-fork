@@ -118,6 +118,17 @@ void Driver::executeRewindTail(const Submission& stalled) {
         copyCommands(tail, stalled.rewindTail, stalled.rewindWords);
     }
     if (auto& capture = Capture::FrameCapture::Get(); capture.Recording()) {
+        // The CPU writes this tail's commands depend on are recorded with it, so the replay's memory is
+        // what the game's GPU saw here. The submitting thread may hold the capture lock while it waits
+        // for this queue (flip room): the delta is then left to its next submission.
+        std::unique_lock captureLock(capture.SubmitMutex(), std::try_to_lock);
+        if (captureLock.owns_lock()) {
+            try {
+                capture.RecordDelta(captureProgress());
+            } catch (const std::exception& error) {
+                captureFailed(error);
+            }
+        }
         capture.RecordRewindTail({tail.queue, 0, reinterpret_cast<std::uintptr_t>(tail.rewindTail), tail.rewindWords}, tail.commands);
     }
     validate(tail.commands, tail.queue, stalled.rewindTail);
