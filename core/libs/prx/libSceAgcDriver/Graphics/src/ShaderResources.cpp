@@ -21,7 +21,6 @@
 #include <limits>
 #include <list>
 #include <map>
-#include <tuple>
 #include <optional>
 #include <set>
 #include <string>
@@ -512,27 +511,20 @@ std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextu
     return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
 }
 
-bool IsNullTextureDescriptor(std::span<const std::uint32_t> words) {
-    return words.size() == 8 && words[0] == 0 && (words[1] & 0xffu) == 0;
-}
-
 struct NullTextures {
     std::mutex mutex;
-    std::map<std::tuple<VkDevice, int, std::uint32_t>, std::shared_ptr<Texture>> textures;
+    std::map<std::pair<VkDevice, int>, std::shared_ptr<Texture>> textures;
 };
 NullTextures& NullTextureCache() {
     static NullTextures cache;
     return cache;
 }
 
-std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::DescriptorImageShape shape, std::span<const std::uint32_t> words) {
-    const auto swizzle = words.size() > 3 ? words[3] & 0xfffu : 0u;
-    const auto select = [&](std::uint32_t channel) { return ((swizzle >> (3u * channel)) & 7u) == 1u ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO; };
-    const VkComponentMapping mapping{select(0), select(1), select(2), select(3)};
-    const auto ones = static_cast<std::uint32_t>(mapping.r == VK_COMPONENT_SWIZZLE_ONE) | static_cast<std::uint32_t>(mapping.g == VK_COMPONENT_SWIZZLE_ONE) << 1u | static_cast<std::uint32_t>(mapping.b == VK_COMPONENT_SWIZZLE_ONE) << 2u | static_cast<std::uint32_t>(mapping.a == VK_COMPONENT_SWIZZLE_ONE) << 3u;
+std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::DescriptorImageShape shape) {
+    constexpr VkComponentMapping mapping{VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO};
     auto& cache = NullTextureCache();
     std::lock_guard lock(cache.mutex);
-    auto& texture = cache.textures[{context.device, static_cast<int>(shape), ones}];
+    auto& texture = cache.textures[{context.device, static_cast<int>(shape)}];
     if (texture == nullptr) {
         GuestTextureResource resource{};
         resource.width = 1;
@@ -1694,7 +1686,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
                         if (IsNullTextureDescriptor(words) && binding.imageShape.has_value()) {
-                            if (textureIndex >= textures.size() || nullTexture(context, *binding.imageShape, words) != textures[textureIndex]) return false;
+                            if (textureIndex >= textures.size() || nullTexture(context, *binding.imageShape) != textures[textureIndex]) return false;
                             ++textureIndex;
                             continue;
                         }
@@ -2527,7 +2519,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
             const auto* record = nextRecord();
             if (IsNullTextureDescriptor(words) && binding.imageShape.has_value()) {
-                textures.push_back(nullTexture(context, *binding.imageShape, words));
+                textures.push_back(nullTexture(context, *binding.imageShape));
                 textureFirstLayer.push_back(false);
                 describedRanges.push_back({"texture", 0, 0, 1, 1, 56, 0, 0});
                 item.imageAllocations.push_back(textures.size() - 1);
