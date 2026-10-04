@@ -651,6 +651,12 @@ if(WIN32)
     target_link_libraries(agc_frame_replay PRIVATE libSceAgcDriver libkernel libc SDL2-static)
     target_compile_definitions(agc_frame_replay PRIVATE _WIN32_WINNT=0x0A00)
     set_target_properties(agc_frame_replay PROPERTIES CXX_EXTENSIONS OFF RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:libSceAgcDriver>")
+    # The replay maps the captured game image where the game had it (near 0x7ff7'00000000, where
+    # high-entropy ASLR also places executables): loaded at its fixed base, the replay itself can
+    # never occupy that range.
+    if(MINGW)
+        target_link_options(agc_frame_replay PRIVATE -Wl,--disable-dynamicbase -Wl,--disable-high-entropy-va)
+    endif()
     configure_windows_unwind(agc_frame_replay)
 endif()
 
