@@ -1522,7 +1522,9 @@ void validationTests() {
             expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "fragmentShaderBarycentric");
         }
         pixel.spirv = makeModule({.fragment = true, .sampleId = true, .layer = true, .fragDepth = true, .sampleMaskLength = 1});
-        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false);
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, true, true);
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, true); }, "unsupported device capability 2");
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, true, false); }, "unsupported device capability 35");
         pixel.spirv = makeModule({.fragment = true, .sampleMaskLength = 2});
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported fragment built-in");
         vertex.spirv = makeModule({.parameterOutput = true, .sampleId = true});
