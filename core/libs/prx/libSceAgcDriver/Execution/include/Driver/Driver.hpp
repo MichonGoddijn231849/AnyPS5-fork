@@ -350,6 +350,13 @@ private:
     ValidateCounters validateCounters;
 
     std::array<std::atomic<std::uint64_t>, Capture::QueueCount> packetsExecuted{};
+    // While a frame capture is armed, each queue worker publishes the submission it executes and the
+    // packet it is at, so a capture can start with it unfinished (the rest of its commands are carried).
+    std::array<std::atomic<const std::uint32_t*>, Capture::QueueCount> inFlightSource{};
+    std::array<std::atomic<std::size_t>, Capture::QueueCount> inFlightCursor{};
+    std::array<std::atomic<std::size_t>, Capture::QueueCount> inFlightWords{};
+    std::array<std::atomic<const std::uint32_t*>, Capture::QueueCount> inFlightCommands{};
+    std::array<std::atomic<std::uint64_t>, Capture::QueueCount> inFlightReceived{};
     std::array<std::atomic<bool>, Capture::QueueCount> queueBlocked{};
     std::array<std::uint64_t, Capture::QueueCount> progressBase{};
 

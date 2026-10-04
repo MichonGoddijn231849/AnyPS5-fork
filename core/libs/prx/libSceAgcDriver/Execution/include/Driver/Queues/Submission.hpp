@@ -35,6 +35,20 @@ struct Submission {
     std::chrono::steady_clock::time_point enqueuedAt{};
     const std::uint32_t* rewindTail = nullptr;
     std::size_t rewindWords = 0;
+    // The guest command buffer the commands were copied from (a frame capture carries the rest of a
+    // submission blocked in a wait from there).
+    const std::uint32_t* source = nullptr;
+};
+
+// A submission a frame capture carries unfinished: where the rest of its commands start in guest memory.
+struct BlockedWait {
+    const std::uint32_t* source = nullptr;
+    std::size_t cursor = 0;
+    std::size_t words = 0;
+    // The driver's copy of the commands (guest memory may already hold other commands).
+    const std::uint32_t* commands = nullptr;
+    std::uint64_t received = 0;
+    std::uint32_t queue = 0;
 };
 
 struct QueueWorker {

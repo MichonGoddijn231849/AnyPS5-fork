@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Capture/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -133,7 +134,21 @@ void Driver::execute(const Submission& submission) {
     ++packetProfile.submissions;
 
     bumpEpoch(&EpochBumps::submissions);
+    // A frame capture can start while this submission is unfinished: publish where it is.
+    const bool publishInFlight = submission.source != nullptr && submission.queue < inFlightSource.size() && Capture::FrameCapture::Get().Active();
+    struct InFlight {
+        std::atomic<const std::uint32_t*>* source;
+        ~InFlight() { if (source != nullptr) source->store(nullptr, std::memory_order_release); }
+    } inFlight{publishInFlight ? &inFlightSource[submission.queue] : nullptr};
+    if (publishInFlight) {
+        inFlightCursor[submission.queue].store(0, std::memory_order_relaxed);
+        inFlightWords[submission.queue].store(submission.commands.size(), std::memory_order_relaxed);
+        inFlightCommands[submission.queue].store(submission.commands.data(), std::memory_order_relaxed);
+        inFlightReceived[submission.queue].store(submission.received, std::memory_order_relaxed);
+        inFlightSource[submission.queue].store(submission.source, std::memory_order_release);
+    }
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
+        if (publishInFlight) inFlightCursor[submission.queue].store(cursor, std::memory_order_relaxed);
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
         const auto header = submission.commands[cursor];

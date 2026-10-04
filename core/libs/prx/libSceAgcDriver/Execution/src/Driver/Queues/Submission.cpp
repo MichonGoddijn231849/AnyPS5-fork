@@ -139,6 +139,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         require(descriptor.dw_num <= std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t), "command size overflow");
         GuestMemory::CheckRange(descriptor.addr, static_cast<std::size_t>(descriptor.dw_num) * sizeof(std::uint32_t), alignof(std::uint32_t));
         copyCommands(submission, descriptor.addr, descriptor.dw_num);
+        submission.source = static_cast<const std::uint32_t*>(descriptor.addr);
     }
     const auto copied = profile ? std::chrono::steady_clock::now() : start;
     checkReplayCommands(submission.commands);

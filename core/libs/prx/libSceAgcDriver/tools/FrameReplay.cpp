@@ -802,7 +802,14 @@ private:
         case EventType::Submit: {
             space.ApplyProtections();
             const auto submit = reader.Get<SubmitEvent>();
-            static_cast<void>(reader.GetSpan<std::uint32_t>());
+            const auto recorded = reader.GetSpan<std::uint32_t>();
+            // A submission the capture carried unfinished records the driver's copy of its commands; the
+            // game may have reused that command buffer before the capture began, so guest memory is
+            // brought back to the recorded words.
+            auto* guestWords = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(submit.packetAddress));
+            if (recorded.size() == submit.packetWords && HashWords(std::span<const std::uint32_t>(guestWords, submit.packetWords)) != submit.hash && HashWords(recorded) == submit.hash) {
+                std::memcpy(guestWords, recorded.data(), recorded.size_bytes());
+            }
             ReplayExpectCommands(submit.hash);
             Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(submit.packetAddress)), submit.packetWords, 0, {}};
             AgcDriver::Submit(&packet, submit.queue);

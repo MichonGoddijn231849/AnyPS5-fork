@@ -177,17 +177,43 @@ void Driver::ClearCaches(std::uint32_t classes) {
 
 bool Driver::captureStart() {
     auto& capture = Capture::FrameCapture::Get();
-    if (!DrainFor(std::chrono::seconds(3))) {
-        std::fprintf(stderr, "[frame-capture] the driver did not go idle within 3 s after flip %llu; retrying after the next flip\n", static_cast<unsigned long long>(capture.flips));
-        return false;
+    // APS5_CAPTURE_DRAIN_SECONDS: how long the driver may take to go idle at the flip (default 3).
+    static const auto drainLimit = std::chrono::seconds(std::getenv("APS5_CAPTURE_DRAIN_SECONDS") != nullptr ? std::strtoul(std::getenv("APS5_CAPTURE_DRAIN_SECONDS"), nullptr, 10) : 3ul);
+    // Submissions still pending when the drain times out (an async queue waiting for work of the next
+    // frame) are carried: the capture starts with the rest of each one executing and every queued one,
+    // in submission order, as its first submissions.
+    std::vector<BlockedWait> carried;
+    if (!DrainFor(drainLimit)) {
+        std::uint64_t pending = 0;
+        {
+            std::lock_guard lock(mutex);
+            pending = accepted - completed;
+            for (std::uint32_t queue = 0; queue < inFlightSource.size(); ++queue) {
+                const auto* source = inFlightSource[queue].load(std::memory_order_acquire);
+                if (source == nullptr) continue;
+                const auto cursor = inFlightCursor[queue].load(std::memory_order_relaxed);
+                carried.push_back({source, cursor, inFlightWords[queue].load(std::memory_order_relaxed) - cursor, inFlightCommands[queue].load(std::memory_order_relaxed), inFlightReceived[queue].load(std::memory_order_relaxed), queue});
+            }
+            for (const auto& [queue, worker] : workers) {
+                for (const auto& waiting : worker.pending) {
+                    if (waiting.source != nullptr) carried.push_back({waiting.source, 0, waiting.commands.size(), waiting.commands.data(), waiting.received, queue});
+                }
+            }
+        }
+        std::sort(carried.begin(), carried.end(), [](const BlockedWait& a, const BlockedWait& b) { return a.received < b.received; });
+        std::fprintf(stderr, "[frame-capture] %llu submissions still pending, %zu of them can be carried\n", static_cast<unsigned long long>(pending), carried.size());
+        if (carried.empty() || carried.size() != pending) {
+            std::fprintf(stderr, "[frame-capture] the driver did not go idle within %llu s after flip %llu; retrying after the next flip\n", static_cast<unsigned long long>(drainLimit.count()), static_cast<unsigned long long>(capture.flips));
+            return false;
+        }
     }
     Settle();
-    std::fprintf(stderr, "[frame-capture] starting after flip %llu\n", static_cast<unsigned long long>(capture.flips));
+    std::fprintf(stderr, "[frame-capture] starting after flip %llu%s\n", static_cast<unsigned long long>(capture.flips), carried.empty() ? "" : " with blocked submissions carried");
     capture.Begin(capture.flips);
     std::vector<std::shared_ptr<const ShaderSnapshot>> registered;
     {
         std::lock_guard lock(mutex);
-        require(completed >= accepted, "submissions arrived while the capture started");
+        require(completed + carried.size() >= accepted, "submissions arrived while the capture started");
         for (const auto& [queue, state] : queues) {
             Capture::Writer writer;
             writer.Put(queue);
@@ -210,6 +236,15 @@ bool Driver::captureStart() {
         for (std::size_t queue = 0; queue < progressBase.size(); ++queue) progressBase[queue] = packetsExecuted[queue].load(std::memory_order_acquire);
     }
     for (const auto& snapshot : registered) captureShader(*snapshot);
+    for (const auto& wait : carried) {
+        // The words are the driver's copy: the game may have reused the command buffer already, and
+        // the replay writes them back over guest memory when it differs.
+        const auto rest = std::span<const std::uint32_t>(wait.commands + wait.cursor, wait.words);
+        const Capture::SubmitEvent event{wait.queue, 0, reinterpret_cast<std::uintptr_t>(wait.source + wait.cursor), static_cast<std::uint32_t>(rest.size()), static_cast<std::uint32_t>(rest.size()), Capture::HashWords(rest)};
+        capture.RecordSubmit(event, rest);
+        ++capture.submissions;
+        std::fprintf(stderr, "[frame-capture] carried %zu words of a submission on queue 0x%x (from word %zu)\n", rest.size(), wait.queue, wait.cursor);
+    }
     return true;
 }
 
