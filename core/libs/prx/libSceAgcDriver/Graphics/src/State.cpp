@@ -161,7 +161,8 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     const bool stencil = (read(cx, 0x011) & 1u) != 0;
     Require(zFormat != 2, "Z_24 depth is unsupported");
     Require(zFormat != 0 || (depthControl & 2u) == 0, "depth test without a depth plane");
-    Require(stencil || (depthControl & 1u) == 0, "stencil test without a stencil plane");
+    // Without a stencil plane (DB_STENCIL_INFO FORMAT invalid) the stencil test passes and writes nothing,
+    // as Vulkan does for a stencil test without a stencil aspect: it is dropped below.
     const auto base = [&](std::uint32_t low, std::uint32_t highOffset) {
         const auto high = find(cx, highOffset);
         return (high == cx.end() ? 0ull : static_cast<std::uint64_t>(high->second & 0xffu) << 40u) | (static_cast<std::uint64_t>(read(cx, low)) << 8u);
@@ -197,7 +198,7 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
         result.minDepthBounds = readFloat(cx, 0x008);
         result.maxDepthBounds = readFloat(cx, 0x009);
     }
-    result.stencilTest = (depthControl & 1u) != 0;
+    result.stencilTest = stencil && (depthControl & 1u) != 0;
     if (result.stencilTest) {
         const auto ops = read(cx, 0x10b);
         result.stencilFront = stencilFace((depthControl >> 8u) & 7u, ops, read(cx, 0x10c), stencilReadOnly);

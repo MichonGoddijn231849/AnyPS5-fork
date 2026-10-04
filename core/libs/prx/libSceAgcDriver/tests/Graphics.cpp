@@ -488,6 +488,10 @@ void DepthStencilTests() {
         const auto stencilTiled = AgcDriver::Graphics::DecodeState(queue);
         Require(stencilTiled.depth && stencilTiled.depth->htileStencil, "HTILE holds the stencil state without TILE_STENCIL_DISABLE");
         queue.context[0x011] |= 1u << 29u;
+        queue.context[0x011] &= ~1u;
+        const auto noStencil = AgcDriver::Graphics::DecodeState(queue);
+        Require(noStencil.depth && noStencil.depth->stencilAddress == 0 && !noStencil.stencilTest, "a stencil test without a stencil plane must pass without a stencil aspect");
+        queue.context[0x011] |= 1u;
         queue.context[0x010] &= ~(1u << 29u);
         const auto untiled = AgcDriver::Graphics::DecodeState(queue);
         Require(untiled.depth && untiled.depth->htileAddress == 0, "HTILE must be ignored without TILE_SURFACE_ENABLE");
