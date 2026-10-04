@@ -215,6 +215,7 @@ function(add_shader_recompiler target runtimeTarget)
             RecompileCacheKey::ContextHash
             RecompileResult
             ResolveSource
+            ResourceMaterializer::SetBindlessTableLimit
             ResourceMaterializer::SpecializationNanoseconds
             SetDebugProbeActive
             ShaderCacheDirectory
