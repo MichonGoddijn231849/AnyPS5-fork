@@ -4,7 +4,11 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
 #include <optional>
 
 namespace AgcDriver::DriverDetail {
@@ -336,6 +340,65 @@ void Driver::captureFinish() {
 }
 
 namespace AgcDriver::Capture {
+
+namespace {
+
+struct RecordedTail {
+    std::vector<std::uint32_t> words;
+    std::uint64_t nextTail = 0;
+    std::uint64_t nextWords = 0;
+};
+
+struct RewindTailFeed {
+    std::mutex mutex;
+    std::condition_variable ready;
+    bool active = false;
+    std::map<std::uint32_t, std::deque<RecordedTail>> tails;
+};
+
+RewindTailFeed& TailFeed() {
+    static RewindTailFeed feed;
+    return feed;
+}
+
+}
+
+void ReplayFeedRewindTails(bool active) {
+    auto& feed = TailFeed();
+    std::lock_guard lock(feed.mutex);
+    feed.active = active;
+    feed.tails.clear();
+}
+
+void ReplayPushRewindTail(std::uint32_t queue, std::span<const std::uint32_t> words, std::uint64_t nextTail, std::uint64_t nextWords) {
+    auto& feed = TailFeed();
+    {
+        std::lock_guard lock(feed.mutex);
+        feed.tails[queue].push_back({std::vector<std::uint32_t>(words.begin(), words.end()), nextTail, nextWords});
+    }
+    feed.ready.notify_all();
+}
+
+bool ReplayTakeRewindTail(std::uint32_t queue, std::vector<std::uint32_t>& words, std::uint64_t& nextTail, std::uint64_t& nextWords, const std::function<void()>& poll) {
+    auto& feed = TailFeed();
+    std::unique_lock lock(feed.mutex);
+    if (!feed.active) return false;
+    for (;;) {
+        auto& waiting = feed.tails[queue];
+        if (!waiting.empty()) {
+            auto tail = std::move(waiting.front());
+            waiting.pop_front();
+            words = std::move(tail.words);
+            nextTail = tail.nextTail;
+            nextWords = tail.nextWords;
+            return true;
+        }
+        feed.ready.wait_for(lock, std::chrono::milliseconds(5));
+        lock.unlock();
+        poll();
+        lock.lock();
+    }
+}
 
 std::shared_mutex& ReplayMemoryWriteMutex() {
     static std::shared_mutex mutex;

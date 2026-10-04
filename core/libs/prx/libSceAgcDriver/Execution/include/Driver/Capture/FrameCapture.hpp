@@ -66,6 +66,7 @@ public:
     void RecordDelta(std::span<const std::uint64_t> progress);
     void RecordShader(std::uint64_t codeAddress, std::uint64_t headerAddress, std::uint8_t type, std::span<const std::uint32_t> code, std::span<const std::byte> header);
     void RecordSubmit(const SubmitEvent& submit, std::span<const std::uint32_t> words);
+    void RecordRewindTail(const RewindTailEvent& tail, std::span<const std::uint32_t> words);
     void NotePresent(const DisplayBuffer* buffer, bool opaque, std::string& dumpPath);
     bool PresentsReached(std::uint64_t flipsEnd) const;
     void Finish(const EndEvent& end);

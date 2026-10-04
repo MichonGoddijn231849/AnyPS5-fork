@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Capture/Replay.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Capture/FrameCapture.hpp"
 #include <bit>
 #include <cstdlib>
 
@@ -104,10 +105,20 @@ void Driver::executeRewindTail(const Submission& stalled) {
     }
     Submission tail{};
     tail.queue = stalled.queue;
-    {
-        // A replay may be writing the delta that released this REWIND: copy only once it is complete.
+    // A replay runs the words the game's driver copied at this release (its memory deltas are coarser
+    // than the game's hand-off, so the chunk in guest memory may already hold later commands).
+    std::uint64_t nextTail = 0;
+    std::uint64_t nextWords = 0;
+    if (Capture::ReplayTakeRewindTail(stalled.queue, tail.commands, nextTail, nextWords, [&] { CheckFailure(); checkStopping(); })) {
+        tail.rewindTail = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(nextTail));
+        tail.rewindWords = static_cast<std::size_t>(nextWords);
+    } else {
+        // A replay without recorded tails may be writing the delta that released this REWIND.
         std::shared_lock replayWrites(Capture::ReplayMemoryWriteMutex());
         copyCommands(tail, stalled.rewindTail, stalled.rewindWords);
+    }
+    if (auto& capture = Capture::FrameCapture::Get(); capture.Recording()) {
+        capture.RecordRewindTail({tail.queue, 0, reinterpret_cast<std::uintptr_t>(tail.rewindTail), tail.rewindWords}, tail.commands);
     }
     validate(tail.commands, tail.queue, stalled.rewindTail);
     waitForFlipRoom(tail);

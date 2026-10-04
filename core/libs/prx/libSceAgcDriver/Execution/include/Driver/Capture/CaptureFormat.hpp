@@ -31,6 +31,9 @@ enum class EventType : std::uint32_t {
     VideoOutput = 10,
     Present = 11,
     End = 12,
+    // The words a released REWIND continued with, as the driver copied them (the CPU may rewrite the
+    // chunk before the capture's next memory delta); the replay executes these instead of guest memory.
+    RewindTail = 13,
 };
 
 struct EventHeader {
@@ -94,6 +97,14 @@ struct SubmitEvent {
     std::uint32_t packetWords;
     std::uint32_t words;
     std::uint64_t hash;
+};
+
+struct RewindTailEvent {
+    std::uint32_t queue;
+    std::uint32_t reserved;
+    // The REWIND the copied words end at (0 when none) and how many guest words follow it.
+    std::uint64_t nextTail;
+    std::uint64_t nextWords;
 };
 
 struct DisplayBufferRecord {

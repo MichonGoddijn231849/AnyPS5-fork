@@ -644,6 +644,7 @@ public:
         for (loop = 0; options.forSeconds > 0 ? (loop < 2 || std::chrono::duration<double>(Clock::now() - *measuredSince).count() < options.forSeconds) : loop < options.loops; ++loop) {
             if (loop == 1) measuredSince = Clock::now();
             const auto started = Clock::now();
+            ReplayFeedRewindTails(true);
             if (loop == 0) {
                 for (std::size_t i = 0; i < prologueEnd; ++i) apply(capture.events[i]);
                 initialPieces = space.Pieces();
@@ -818,6 +819,11 @@ private:
             AgcDriver::Submit(&packet, submit.queue);
             ++submits;
             rethrowFailure();
+            break;
+        }
+        case EventType::RewindTail: {
+            const auto tail = reader.Get<RewindTailEvent>();
+            ReplayPushRewindTail(tail.queue, reader.GetSpan<std::uint32_t>(), tail.nextTail, tail.nextWords);
             break;
         }
         case EventType::Suspend:

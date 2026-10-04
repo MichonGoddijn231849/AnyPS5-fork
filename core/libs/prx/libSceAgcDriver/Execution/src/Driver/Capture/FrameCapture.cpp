@@ -294,6 +294,13 @@ void FrameCapture::RecordShader(std::uint64_t codeAddress, std::uint64_t headerA
     shaderBytes += code.size_bytes() + header.size();
 }
 
+void FrameCapture::RecordRewindTail(const RewindTailEvent& tail, std::span<const std::uint32_t> words) {
+    Writer event;
+    event.Put(tail);
+    event.PutSpan(words);
+    RecordEvent(EventType::RewindTail, event.data);
+}
+
 void FrameCapture::RecordSubmit(const SubmitEvent& submit, std::span<const std::uint32_t> words) {
     Writer event;
     event.Put(submit);
