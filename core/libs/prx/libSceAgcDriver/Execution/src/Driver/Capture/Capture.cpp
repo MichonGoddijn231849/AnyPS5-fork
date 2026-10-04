@@ -291,6 +291,10 @@ void ReplaySettle() {
     DriverDetail::Driver::Get().Settle();
 }
 
+void ReplayCollectWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    for (const auto& [begin, end] : ranges) GuestMemory::CollectWritesUncached(begin, static_cast<std::size_t>(end - begin));
+}
+
 void ReplayRestoreQueueState(std::uint32_t queue, std::span<const std::byte> state) {
     DriverDetail::Driver::Get().RestoreQueueState(queue, state);
 }

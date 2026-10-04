@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 
 namespace AgcDriver::Capture {
 
@@ -25,6 +26,9 @@ void ReplayClearCaches(std::uint32_t classes);
 bool ReplayStalled();
 bool ReplayDrain(std::chrono::milliseconds limit);
 void ReplaySettle();
+// Collects the CPU writes over the ranges (a restore's), stamping them as any collect would: the
+// write-watch walk and reset then happen here instead of inside the next frame's first lookups.
+void ReplayCollectWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 void ReplayRestoreQueueState(std::uint32_t queue, std::span<const std::byte> state);
 void ReplayRestoreDriverState(bool resetGraphics, std::span<const std::byte> gds);
 void ReplayRegisterShader(std::uint64_t codeAddress, std::uint64_t headerAddress, std::uint8_t type, std::span<const std::uint32_t> code, std::span<const std::byte> header);

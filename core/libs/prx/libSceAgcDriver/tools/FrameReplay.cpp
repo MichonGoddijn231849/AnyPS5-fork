@@ -62,6 +62,8 @@ struct Options {
     bool pacing = true;
     bool settle = false;
     bool hidden = false;
+    // Collect the restore's writes before the loop starts (see restore()).
+    bool restoreCollect = true;
     std::optional<std::filesystem::path> shaderCache;
     std::uint32_t cold = 0;
 };
@@ -204,6 +206,7 @@ public:
             const bool same = source != nullptr ? std::memcmp(target, source, bytes) == 0 : std::all_of(target, target + bytes, [](std::byte value) { return value == std::byte{0}; });
             if (same) return;
             ++restoredPages;
+            restoredRanges.emplace_back(address & ~std::uint64_t{4095}, (address + bytes + 4095) & ~std::uint64_t{4095});
         }
         const auto* piece = find(address);
         if (piece == nullptr) Fail("capture writes " + Hex(address) + " outside every mapped piece");
@@ -222,6 +225,7 @@ public:
     const std::vector<Piece>& Pieces() const { return pieces; }
     const std::vector<RegistryRange>& Registry() const { return registry; }
     std::uint64_t restoredPages = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> restoredRanges;
 
 private:
     template<typename T, typename TLess>
@@ -802,6 +806,7 @@ private:
         std::set_difference(initialRegistry.begin(), initialRegistry.end(), space.Registry().begin(), space.Registry().end(), std::back_inserter(registryAdded), RegistryLess);
         if (!removed.empty() || !added.empty() || !registryRemoved.empty() || !registryAdded.empty()) space.Apply({}, removed, added, registryRemoved, registryAdded);
         space.restoredPages = 0;
+        space.restoredRanges.clear();
         for (std::size_t i = 0; i < prologueEnd; ++i) {
             const auto& event = capture.events[i];
             Reader reader(event.payload);
@@ -814,6 +819,20 @@ private:
             }
         }
         space.ApplyProtections();
+        // The restore rewrites every page the loop changed, several times what the game writes
+        // between two frames: collected here, the write-watch walk and reset of those pages land in
+        // the setup instead of the first frame's lookups. They are stamped as written as before.
+        // --no-restore-collect leaves them to the frame.
+        if (options.restoreCollect && !space.restoredRanges.empty()) {
+            auto& ranges = space.restoredRanges;
+            std::sort(ranges.begin(), ranges.end());
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+            for (const auto& range : ranges) {
+                if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+                else merged.push_back(range);
+            }
+            ReplayCollectWrites(merged);
+        }
         std::fprintf(stderr, "[replay] loop %u: restored %llu pages to the capture's start state\n", loop, static_cast<unsigned long long>(space.restoredPages));
     }
 
@@ -934,6 +953,7 @@ Options ParseOptions(int argc, char** argv) {
         else if (argument == "--png-all-loops") options.pngAllLoops = true;
         else if (argument == "--compare") options.compare = value();
         else if (argument == "--no-pacing") options.pacing = false;
+        else if (argument == "--no-restore-collect") options.restoreCollect = false;
         else if (argument == "--settle") options.settle = true;
         else if (argument == "--hidden") options.hidden = true;
         else if (argument == "--shader-cache") options.shaderCache = value();
