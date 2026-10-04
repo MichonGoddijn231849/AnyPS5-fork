@@ -1018,7 +1018,7 @@ struct Vop1SdwaRule {
 };
 
 constexpr Vop1SdwaRule vop1SdwaRules[] = {
-    {RdnaOpcode::VMovB32, sdwaSelAll(), sdwaSelWords(), sdwaSelWords() | sdwaSelFull(), false},
+    {RdnaOpcode::VMovB32, sdwaSelAll(), sdwaSelBytes() | sdwaSelWords(), sdwaSelWords() | sdwaSelFull(), false},
     {RdnaOpcode::VCvtF32U32, sdwaSelAll(), 0, 0, false},
     {RdnaOpcode::VCvtF32I32, sdwaSelAll(), 0, 0, false},
     {RdnaOpcode::VCvtF32Ubyte0, sdwaSelAll(), 0, 0, false},
@@ -1090,7 +1090,9 @@ void validateVop1Sdwa(const RdnaInstruction& instruction, std::uint32_t destinat
         throw std::invalid_argument("VOP1 SDWA output modifiers are not supported");
     }
     if (!isVop1SdwaDestinationSupported(instruction.op, destinationSelector, destinationUnused, sourceSelector)) {
-        throw std::invalid_argument("VOP1 SDWA destination selector is not supported");
+        char text[128];
+        std::snprintf(text, sizeof(text), "VOP1 SDWA destination selector %u (unused %u, source selector %u) of opcode 0x%x at pc 0x%x is not supported", destinationSelector, destinationUnused, sourceSelector, instruction.opcodeId, instruction.programCounter);
+        throw std::invalid_argument(text);
     }
     if (!isVop1SdwaSourceSupported(instruction.op, sourceSelector, sourceNegate, sourceAbsolute)) {
         char text[96];
