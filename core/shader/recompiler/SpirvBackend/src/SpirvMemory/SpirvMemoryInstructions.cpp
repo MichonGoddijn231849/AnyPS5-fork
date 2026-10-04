@@ -664,8 +664,8 @@ const MemoryInfo& BufferMemory(SpirvValueEmitContext& ctx, const IrValue& inst) 
     if (mem.kind != ResourceKind::Buffer) {
         ctx.Fail(inst, "must access a buffer resource");
     }
-    if (mem.gpuDescriptor) {
-        ctx.Fail(inst, "accesses a GPU-selected V# in a way only raw dword loads and stores support");
+    if (mem.gpuDescriptor && BufferAccessOf(inst.Opcode()) != BufferAccess::Atomic) {
+        ctx.Fail(inst, "accesses a GPU-selected V# in a way only raw dword loads, stores and dword atomics support");
     }
     return mem;
 }
@@ -1007,6 +1007,25 @@ void NoteBufferAtomicSite(bool zeroSkip, bool zeroLoad) {
 
 std::uint32_t Atomic32(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem) {
     auto& state = ctx.state;
+    if (mem.gpuDescriptor) {
+        // A dword atomic through a V# the shader selected: the element address as for its loads and
+        // stores, the atomic on the BDA pointer, the write noted for GPU ownership.
+        return EmitValueOrZeroIfCondition(state, ActiveArgument(ctx, inst), [&] {
+            std::uint32_t guest = 0;
+            std::uint32_t inBounds = 0;
+            ForEachGpuDescriptorDword(ctx, inst, mem, 1u, [&](std::uint32_t, std::uint32_t address, std::uint32_t valid) {
+                guest = address;
+                inBounds = valid;
+            });
+            return EmitValueOrZeroIfCondition(state, inBounds, [&] {
+                return EmitBdaAtomic(ctx, inst, guest, [&](std::uint32_t pointer) {
+                    const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
+                    EmitDeviceAtomicMemoryBarrier(state);
+                    return old;
+                });
+            });
+        });
+    }
     const bool lds = mem.kind == ResourceKind::Lds;
     const std::uint32_t scope = lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
     // Buffer atomic arguments are {resource, index, offset, soffset, value, exec}. A non-zero
