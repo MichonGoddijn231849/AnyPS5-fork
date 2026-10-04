@@ -100,6 +100,7 @@ private:
     std::uint64_t registryGeneration = 0;
     std::uint64_t flipsBefore = 0;
     std::string triggerPath;
+    bool triggerOnLoopGuard = false;
     std::atomic<std::uint64_t> presentsSeen{0};
 
     struct Counts {

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Capture/FrameCapture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -96,8 +97,13 @@ FrameCapture::FrameCapture() {
     limitBytes = (limit != nullptr ? std::strtoull(limit, nullptr, 10) : 20ull) << 30u;
     if (limitBytes == 0) throw std::invalid_argument("APS5_CAPTURE_MAX_GB must be positive");
     nextAttempt = firstFrame;
-    if (const char* trigger = std::getenv("APS5_CAPTURE_TRIGGER"); trigger != nullptr && *trigger != '    nextAttempt = firstFrame;') {
+    if (const char* trigger = std::getenv("APS5_CAPTURE_TRIGGER"); trigger != nullptr && *trigger != '\0') {
         triggerPath = trigger;
+        nextAttempt = std::numeric_limits<std::uint64_t>::max();
+    }
+    // APS5_CAPTURE_ON_LOOP_GUARD=1: the first APS5_LOOP_GUARD trip triggers the capture, as the trigger file would.
+    if (const char* onGuard = std::getenv("APS5_CAPTURE_ON_LOOP_GUARD"); onGuard != nullptr && *onGuard == '1') {
+        triggerOnLoopGuard = true;
         nextAttempt = std::numeric_limits<std::uint64_t>::max();
     }
     std::fprintf(stderr, "[frame-capture] armed: frames %llu-%llu into %s (limit %.0f GiB)\n", static_cast<unsigned long long>(firstFrame), static_cast<unsigned long long>(lastFrame), directory.c_str(), Gib(limitBytes));
@@ -105,10 +111,12 @@ FrameCapture::FrameCapture() {
 }
 
 void FrameCapture::PollTrigger() {
-    if (triggerPath.empty() || nextAttempt != std::numeric_limits<std::uint64_t>::max()) return;
+    if ((triggerPath.empty() && !triggerOnLoopGuard) || nextAttempt != std::numeric_limits<std::uint64_t>::max()) return;
     std::error_code error;
-    if (!std::filesystem::exists(triggerPath, error)) return;
-    std::filesystem::remove(triggerPath, error);
+    const bool guard = triggerOnLoopGuard && Graphics::LoopGuardTripped();
+    if (!guard && (triggerPath.empty() || !std::filesystem::exists(triggerPath, error))) return;
+    if (!triggerPath.empty()) std::filesystem::remove(triggerPath, error);
+    if (guard) std::fprintf(stderr, "[frame-capture] the loop guard tripped\n");
     const auto span = lastFrame - firstFrame;
     firstFrame = flips + 1;
     lastFrame = firstFrame + span;
