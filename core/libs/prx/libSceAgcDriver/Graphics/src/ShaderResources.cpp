@@ -511,6 +511,44 @@ std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextu
     return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
 }
 
+struct NullTextures {
+    std::mutex mutex;
+    std::map<std::pair<VkDevice, int>, std::shared_ptr<Texture>> textures;
+};
+NullTextures& NullTextureCache() {
+    static NullTextures cache;
+    return cache;
+}
+
+std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::DescriptorImageShape shape) {
+    constexpr VkComponentMapping mapping{VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO};
+    auto& cache = NullTextureCache();
+    std::lock_guard lock(cache.mutex);
+    auto& texture = cache.textures[{context.device, static_cast<int>(shape)}];
+    if (texture == nullptr) {
+        GuestTextureResource resource{};
+        resource.width = 1;
+        resource.height = 1;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kLinear;
+        resource.format = 56;
+        switch (shape) {
+            case ShaderRecompiler::DescriptorImageShape::Image1D: resource.dimension = TextureDimension::k1D; break;
+            case ShaderRecompiler::DescriptorImageShape::Image2D: resource.dimension = TextureDimension::k2D; break;
+            case ShaderRecompiler::DescriptorImageShape::Image2DArray: resource.dimension = TextureDimension::k2DArray; break;
+            case ShaderRecompiler::DescriptorImageShape::ImageCube: resource.dimension = TextureDimension::kCube; resource.depthOrLastArray = 5; break;
+            case ShaderRecompiler::DescriptorImageShape::Image3D: resource.dimension = TextureDimension::k3D; break;
+        }
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        const std::vector<std::byte> zeros(static_cast<std::size_t>(DescribeSurface(resource).guestBytes));
+        texture = std::make_shared<Texture>(context, *context.detiler, resource, mapping, zeros);
+    }
+    return texture;
+}
+
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes) {
     if (DepthSurfaceAt(resource.baseAddress)) {
@@ -583,6 +621,14 @@ void ClearCachedTextures(VkDevice device) {
         std::lock_guard lock(sampled.mutex);
         for (auto it = sampled.entries.begin(); it != sampled.entries.end();) {
             if (it->key.device == device) eraseTexture(sampled, it++);
+            else ++it;
+        }
+    }
+    {
+        auto& zeros = NullTextureCache();
+        std::lock_guard lock(zeros.mutex);
+        for (auto it = zeros.textures.begin(); it != zeros.textures.end();) {
+            if (std::get<0>(it->first) == device) it = zeros.textures.erase(it);
             else ++it;
         }
     }
@@ -1639,6 +1685,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     const auto elementWords = binding.count != 0 ? binding.guestDescriptor.size() / binding.count : 0;
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
+                        if (IsNullTextureDescriptor(words) && binding.imageShape.has_value()) {
+                            if (textureIndex >= textures.size() || nullTexture(context, *binding.imageShape) != textures[textureIndex]) return false;
+                            ++textureIndex;
+                            continue;
+                        }
                         const auto resource = DecodeTextureResource(words);
                         const VkComponentMapping components{ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
                         if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element)) != textures[textureIndex]) return false;
@@ -2370,6 +2421,11 @@ bool ShaderResources::precollectImages() {
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
             ImageRecord record;
             record.sampled = binding.kind == ShaderRecompiler::DescriptorKind::SampledImage;
+            if (IsNullTextureDescriptor(words)) {
+                record.decoded = false;
+                imageRecords.push_back(std::move(record));
+                continue;
+            }
             try {
                 record.resource = DecodeTextureResource(words);
                 record.guestBytes = DescribeSurface(record.resource).guestBytes;
@@ -2462,6 +2518,13 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         for (std::uint32_t element = 0; element < binding.count; ++element) {
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
             const auto* record = nextRecord();
+            if (IsNullTextureDescriptor(words) && binding.imageShape.has_value()) {
+                textures.push_back(nullTexture(context, *binding.imageShape));
+                textureFirstLayer.push_back(false);
+                describedRanges.push_back({"texture", 0, 0, 1, 1, 56, 0, 0});
+                item.imageAllocations.push_back(textures.size() - 1);
+                continue;
+            }
             const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
             const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
             if (!firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
@@ -2532,6 +2595,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
         for (const auto& range : describedRanges) {
             if (std::strcmp(range.kind, "texture") == 0 && textureIndex < textures.size()) {
                 const auto& texture = textures[textureIndex++];
+                if (range.bytes == 0) continue;
                 if (texture->ViewsStorageImage()) consider(range.format, range.address, range.bytes, false);
                 else consider(range.format, range.address, range.bytes, true);
             }
@@ -2552,6 +2616,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
     // Stage A has not run (an address-based build, or the pass is off): decoded from the shader.
     if (deferredCompute.program == nullptr) return surfaces;
     forEachImageElement(*deferredCompute.program, [&](const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t, std::span<const std::uint32_t> words) {
+        if (IsNullTextureDescriptor(words)) return;
         try {
             const auto resource = DecodeTextureResource(words);
             consider(resource.format, resource.baseAddress, DescribeSurface(resource).guestBytes, binding.kind == ShaderRecompiler::DescriptorKind::SampledImage);
