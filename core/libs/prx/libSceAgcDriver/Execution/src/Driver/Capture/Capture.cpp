@@ -218,6 +218,11 @@ void Driver::captureBeforeSubmit() {
     try {
         if (!capture.Recording()) {
             capture.PollTrigger();
+            static auto lastWaitReport = std::chrono::steady_clock::now();
+            if (std::chrono::steady_clock::now() - lastWaitReport > std::chrono::seconds(10)) {
+                lastWaitReport = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "[frame-capture] waiting: %llu flips submitted, %llu executed, next attempt at %llu\n", static_cast<unsigned long long>(capture.flips), static_cast<unsigned long long>(flipsCounted.load()), static_cast<unsigned long long>(capture.nextAttempt));
+            }
             if (capture.flips < capture.nextAttempt) return;
             if (!captureStart()) {
                 capture.nextAttempt = capture.flips + 1;
@@ -243,7 +248,9 @@ void Driver::captureSubmitted(const Submission& submission, const Packet& descri
             captureFailed(error);
         }
     }
-    capture.flips += submission.flips.size();
+    // Flips found at the submission's top level, or executed since: a flip inside a chained command
+    // buffer (GTA V in game) is only seen when it executes.
+    capture.flips = std::max<std::uint64_t>(capture.flips + submission.flips.size(), flipsCounted.load());
 }
 
 void Driver::captureAfterSubmit() {
