@@ -34,6 +34,6 @@ struct DirectMappingInfo {
     std::uint64_t backingBytes;
 };
 
-void DirectMemoryMappings_nid_postfix(std::vector<DirectMappingInfo>* mappings);
+extern "C" void DirectMemoryMappings_nid_postfix(std::vector<DirectMappingInfo>* mappings);
 
 #endif
