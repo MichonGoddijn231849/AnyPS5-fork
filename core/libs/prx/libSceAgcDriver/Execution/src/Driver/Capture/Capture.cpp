@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -356,6 +357,9 @@ struct RewindTailFeed {
     std::map<std::uint32_t, std::deque<RecordedTail>> tails;
 };
 
+// Odd while a loop's end abandons its waiting REWINDs.
+std::atomic<std::uint64_t> rewindGeneration{0};
+
 RewindTailFeed& TailFeed() {
     static RewindTailFeed feed;
     return feed;
@@ -368,6 +372,8 @@ void ReplayFeedRewindTails(bool active) {
     std::lock_guard lock(feed.mutex);
     feed.active = active;
     feed.tails.clear();
+    // A new loop's REWINDs wait again.
+    if (active && rewindGeneration.load(std::memory_order_acquire) % 2 != 0) rewindGeneration.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void ReplayPushRewindTail(std::uint32_t queue, std::span<const std::uint32_t> words, std::uint64_t nextTail, std::uint64_t nextWords) {
@@ -379,10 +385,26 @@ void ReplayPushRewindTail(std::uint32_t queue, std::span<const std::uint32_t> wo
     feed.ready.notify_all();
 }
 
-bool ReplayTakeRewindTail(std::uint32_t queue, std::vector<std::uint32_t>& words, std::uint64_t& nextTail, std::uint64_t& nextWords, const std::function<void()>& poll) {
+std::uint64_t ReplayRewindGeneration() {
+    return rewindGeneration.load(std::memory_order_acquire);
+}
+
+bool ReplayRewindAbandoned(std::uint64_t generation) {
+    const auto current = rewindGeneration.load(std::memory_order_acquire);
+    return current != generation || current % 2 != 0;
+}
+
+void ReplayAbandonRewinds() {
+    std::lock_guard lock(TailFeed().mutex);
+    if (rewindGeneration.load(std::memory_order_acquire) % 2 != 0) return;
+    rewindGeneration.fetch_add(1, std::memory_order_acq_rel);
+    TailFeed().ready.notify_all();
+}
+
+RewindFeed ReplayTakeRewindTail(std::uint32_t queue, std::uint64_t generation, std::vector<std::uint32_t>& words, std::uint64_t& nextTail, std::uint64_t& nextWords, const std::function<void()>& poll) {
     auto& feed = TailFeed();
     std::unique_lock lock(feed.mutex);
-    if (!feed.active) return false;
+    if (!feed.active) return RewindFeed::None;
     for (;;) {
         auto& waiting = feed.tails[queue];
         if (!waiting.empty()) {
@@ -391,8 +413,9 @@ bool ReplayTakeRewindTail(std::uint32_t queue, std::vector<std::uint32_t>& words
             words = std::move(tail.words);
             nextTail = tail.nextTail;
             nextWords = tail.nextWords;
-            return true;
+            return RewindFeed::Taken;
         }
+        if (ReplayRewindAbandoned(generation)) return RewindFeed::Abandoned;
         feed.ready.wait_for(lock, std::chrono::milliseconds(5));
         lock.unlock();
         poll();

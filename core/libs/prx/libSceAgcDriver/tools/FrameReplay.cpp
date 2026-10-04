@@ -665,6 +665,8 @@ public:
             piecesMapped = 0;
             piecesUnmapped = 0;
             for (std::size_t i = prologueEnd; i < capture.events.size(); ++i) apply(capture.events[i]);
+            // Every tail of the capture is fed: a REWIND still waiting is for commands of the next frame.
+            ReplayAbandonRewinds();
             const bool finished = drain();
             presenter->WaitDone();
             rethrowFailure();

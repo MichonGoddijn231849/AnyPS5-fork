@@ -89,6 +89,8 @@ void Driver::reserveOutputs(Submission& submission) {
 }
 
 void Driver::executeRewindTail(const Submission& stalled) {
+    // A replay loop's end abandons a REWIND waiting for commands past the capture.
+    const auto generation = Capture::ReplayRewindGeneration();
     std::atomic_ref<std::uint32_t> control(*const_cast<std::uint32_t*>(stalled.rewindTail - 1));
     if ((control.load(std::memory_order_acquire) & 0x80000000u) == 0) {
         noteWaitBlocked(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1), true);
@@ -100,6 +102,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
         while ((control.load(std::memory_order_acquire) & 0x80000000u) == 0) {
             CheckFailure();
             checkStopping();
+            if (Capture::ReplayRewindAbandoned(generation)) return;
             PollSleep();
         }
     }
@@ -109,7 +112,9 @@ void Driver::executeRewindTail(const Submission& stalled) {
     // than the game's hand-off, so the chunk in guest memory may already hold later commands).
     std::uint64_t nextTail = 0;
     std::uint64_t nextWords = 0;
-    if (Capture::ReplayTakeRewindTail(stalled.queue, tail.commands, nextTail, nextWords, [&] { CheckFailure(); checkStopping(); })) {
+    const auto fed = Capture::ReplayTakeRewindTail(stalled.queue, generation, tail.commands, nextTail, nextWords, [&] { CheckFailure(); checkStopping(); });
+    if (fed == Capture::RewindFeed::Abandoned) return;
+    if (fed == Capture::RewindFeed::Taken) {
         tail.rewindTail = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(nextTail));
         tail.rewindWords = static_cast<std::size_t>(nextWords);
     } else {
