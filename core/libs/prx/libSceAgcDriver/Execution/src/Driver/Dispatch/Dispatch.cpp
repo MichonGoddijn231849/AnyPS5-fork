@@ -555,6 +555,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
+    auto deviceStart = std::chrono::steady_clock::now();
 
     for (;;) {
 
@@ -593,6 +594,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             writersNoted = true;
         }
         phaseTiming.Phase(PhaseNoteWriters);
+        deviceStart = std::chrono::steady_clock::now();
         try {
             if (recipeHit != nullptr) {
                 VulkanDevice::IndirectOutcome outcome{0, 0};
@@ -626,6 +628,35 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         break;
     }
     phaseTiming.Phase(PhaseDevice);
+    if (profile) {
+        // APS5_PROFILE_DRAW: the device call by program, every 10 s ([device-call] line, costliest first).
+        struct Cost { std::uint64_t count = 0; double ms = 0; double maxMs = 0; };
+        static std::mutex costsMutex;
+        static std::map<std::uint64_t, Cost> costs;
+        static auto lastReport = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration<double, std::milli>(now - deviceStart).count();
+        std::lock_guard lock(costsMutex);
+        auto& cost = costs[address];
+        ++cost.count;
+        cost.ms += ms;
+        cost.maxMs = std::max(cost.maxMs, ms);
+        if (now - lastReport > std::chrono::seconds(10)) {
+            lastReport = now;
+            std::vector<std::pair<std::uint64_t, Cost>> sorted(costs.begin(), costs.end());
+            std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+            double total = 0;
+            for (const auto& entry : sorted) total += entry.second.ms;
+            std::string text;
+            char item[96];
+            for (std::size_t i = 0; i < std::min<std::size_t>(sorted.size(), 15); ++i) {
+                std::snprintf(item, sizeof(item), " 0x%llx x%llu %.0fms (max %.1f)", static_cast<unsigned long long>(sorted[i].first), static_cast<unsigned long long>(sorted[i].second.count), sorted[i].second.ms, sorted[i].second.maxMs);
+                text += item;
+            }
+            std::fprintf(stderr, "[device-call] %.0f ms in %zu programs (10 s), costliest:%s\n", total, sorted.size(), text.c_str());
+            costs.clear();
+        }
+    }
     if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, submission.queue, compiled);
     deviceMs += phaseTiming.Elapsed();
     phaseTiming.Phase(PhaseTail);

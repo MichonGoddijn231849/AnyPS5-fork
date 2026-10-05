@@ -2845,16 +2845,27 @@ struct DispatchTimer {
         }
         return text;
     }
-    // Every 1000 profiled dispatches: the totals per phase.
+    // Every 1000 profiled dispatches: the totals per phase, and the microseconds per dispatch each
+    // phase took over those 1000 (the totals carry the first builds' pipeline compiles).
     static void countDispatch(bool profile) {
         if (!profile) return;
         auto& d = Dispatches();
         if (++d.profiledDispatches % 1000 != 0) return;
+        static std::array<double, DispatchRows> previous{};
         std::string report;
-        for (std::size_t row = 0; row < DispatchPhaseCount; ++row) {
-            if (d.phaseTotals[row] != 0) report += " " + std::string(DispatchRowName(row)) + "=" + std::to_string(static_cast<long long>(d.phaseTotals[row] / 1000)) + "s";
+        std::string recent;
+        char row[96];
+        for (std::size_t i = 0; i < DispatchPhaseCount; ++i) {
+            if (d.phaseTotals[i] != 0) report += " " + std::string(DispatchRowName(i)) + "=" + std::to_string(static_cast<long long>(d.phaseTotals[i] / 1000)) + "s";
+            const auto us = d.phaseTotals[i] - previous[i];
+            if (us >= 10.0) {
+                std::snprintf(row, sizeof(row), " %s=%.0fus", DispatchRowName(i), us);
+                recent += row;
+            }
+            previous[i] = d.phaseTotals[i];
         }
         std::fprintf(stderr, "[dispatch] %llu dispatches, phase totals:%s\n", static_cast<unsigned long long>(d.profiledDispatches), report.c_str());
+        std::fprintf(stderr, "[dispatch] us per dispatch over the last 1000:%s\n", recent.c_str());
     }
     // The call's end: the proc lookups it made, the slow-call report, the [indirect] hold
     // accounting (`indirectHold`: the call was an indirect dispatch, CPU-resolved or not) and line.
