@@ -176,7 +176,9 @@ void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
 }
 #endif
 
-void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable) {
+namespace {
+
+void addRange(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable, bool releasable) {
     recordChange(mutation, pointer, bytes);
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest allocation range");
@@ -188,10 +190,18 @@ void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t 
         const auto& previous = *std::prev(next)->second;
         require(previous.address + previous.bytes <= address, "overlapping guest allocation");
     }
-    ranges.emplace(address, std::make_shared<const Range>(Range{address, bytes, readable, writable, address, bytes}));
+    ranges.emplace(address, std::make_shared<const Range>(Range{address, bytes, readable, writable, address, bytes, releasable}));
 }
+
+}
+
+void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable) {
+    addRange(mutation, pointer, bytes, readable, writable, true);
+}
+// Image ranges (the frame replay's captured module sections) are not releasable, like the main
+// image's: address-based builds mirror them on the GPU once instead of copying them every build.
 void GuestAllocationsAddImage_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable) {
-    GuestAllocationsAdd_nid_postfix(mutation, pointer, bytes, readable, writable);
+    addRange(mutation, pointer, bytes, readable, writable, false);
 }
 
 [[noreturn]] void PinnedFailure(std::uintptr_t address, std::size_t bytes, const char* why) {
