@@ -584,11 +584,41 @@ void FormattedStore(SpirvValueEmitContext& ctx, const IrValue& inst, const Memor
     });
 }
 
+// A coherent (glc) raw dwordx2 load is one 64-bit access on the GPU, so it never sees half of a
+// 64-bit atomic's update; two dword loads can. GTA V's prefix sum before its BVH build reads the
+// {flag, value} pairs other workgroups publish with buffer_atomic_swap_x2, and a flag from before
+// the swap with a value from after it counts earlier blocks twice (two BVH nodes then share
+// records). Where the program has the u64 view (it uses 64-bit buffer atomics), an 8-byte aligned
+// pair in bounds is read with one device-scope atomic load; others stay dword by dword.
+std::uint32_t LoadCoherentPair(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, const MemoryResourceAccess& resource) {
+    auto& state = ctx.state;
+    const auto wide = PrepareStorageBufferResourceAccess(state, mem, state.storageBufferU64Variable, TypeStorageBufferU64Pointer(state));
+    const auto byteAddress = Binary(state, spv::OpIAdd, TypeU32(state), ByteAddress(ctx, inst, mem), wide.byteOffset);
+    const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byteAddress, ConstantU32(state, 3u));
+    const auto aligned = Binary(state, spv::OpIEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, TypeU32(state), byteAddress, ConstantU32(state, 7u)), ConstantU32(state, 0u));
+    return EmitValueIfElse(state, AndCondition(state, aligned, EmitMemoryElementInBounds(state, wide, index)), TypeU32Composite(state, 2u), [&]() {
+        const auto pointer = EmitStorageBufferElementPointer(state, wide, index, TypeStorageBufferU64ElementPointer(state));
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAtomicLoad, TypeScalarU64(state), value, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone));
+        const auto high = Binary(state, spv::OpShiftRightLogical, TypeScalarU64(state), value, BdaConstant(state, 32u));
+        return ConstructU32Composite(state, 2u, {Unary(state, spv::OpUConvert, TypeU32(state), value), Unary(state, spv::OpUConvert, TypeU32(state), high), 0u, 0u});
+    }, [&]() {
+        std::array<std::uint32_t, 4> values{};
+        for (std::uint32_t component = 0; component < 2u; component++) {
+            values.at(component) = LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource);
+        }
+        return ConstructU32Composite(state, 2u, values);
+    });
+}
+
 std::uint32_t LoadWideBuffer(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::uint32_t components) {
     auto& state = ctx.state;
     return EmitValueOrDefaultIfCondition(state, ActiveArgument(ctx, inst), TypeU32Composite(state, components), ConstantU32CompositeZero(state, components), [&]() {
         const auto resource = PrepareMemoryResourceAccess(state, mem);
         const auto info = MemoryFormatInfo(state, mem);
+        if (info.type == SpirvFormatComponentType::Unknown && components == 2u && mem.coherent && state.storageBufferU64Variable != 0u) {
+            return LoadCoherentPair(ctx, inst, mem, resource);
+        }
         if (info.type != SpirvFormatComponentType::Unknown) {
             const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, components, FormattedAccess::Load);
             return EmitValueOrDefaultIfCondition(state, plan.inBounds, TypeU32Composite(state, components), FormattedOutOfBoundsValue(ctx, mem, plan, components), [&]() {
