@@ -35,6 +35,9 @@ struct BvhCheck {
     std::map<std::uint64_t, std::vector<std::byte>> lastBytes;
     std::deque<std::pair<std::uint64_t, std::string>> recent;
     std::uint64_t sequence = 0;
+    std::uint64_t checks = 0;
+    std::uint64_t badChecks = 0;
+    double reportedAt = -1e9;
 };
 
 BvhCheck& Bvh() {
@@ -111,6 +114,12 @@ void CheckBvh(std::uint64_t pointer) {
             if (FILE* file = std::fopen(trigger, "wb")) std::fclose(file);
             std::fprintf(stderr, "[bvh] first check: created %s\n", trigger);
         }
+    }
+    ++check.checks;
+    if (bad != 0) ++check.badChecks;
+    if (const auto now = TraceMs(); now - check.reportedAt >= 10000.0) {
+        std::fprintf(stderr, "[bvh] %.0f ms: %llu checks of %zu blobs so far, %llu with bad leaves\n", now, static_cast<unsigned long long>(check.checks), check.badLeaves.size() + (check.badLeaves.contains(pointer) ? 0 : 1), static_cast<unsigned long long>(check.badChecks));
+        check.reportedAt = now;
     }
     auto& known = check.badLeaves[pointer];
     auto& checkedAt = check.checkedAt[pointer];
@@ -234,6 +243,21 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const bool refit = word + RefitStart.size() <= snapshot.code.size() && std::equal(RefitStart.begin(), RefitStart.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(word));
         if (pointer != 0 && (refit || KnownBvh(pointer))) CheckBvh(pointer);
         if (refit && pointer != 0) checkAfterRefit.store(pointer, std::memory_order_release);
+        // The pass before a frame's BVH updates (its blob in user data 0-1) shows the blob as built.
+        static constexpr std::array<std::uint32_t, 6> SetupStart{0xbfa00003u, 0xd7460001u, 0x04010c0bu, 0xf4041a80u, 0xfa000048u, 0xbf8cc07fu};
+        if (userData.size() >= 2 && word + SetupStart.size() <= snapshot.code.size() && std::equal(SetupStart.begin(), SetupStart.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(word))) {
+            CheckBvh((userData[0] | (static_cast<std::uint64_t>(userData[1]) << 32u)) & 0xffffffffffffull);
+        }
+        // APS5_CHECK_BVH_BUILD_TRIGGER=<file>: the first dispatch of the BVH build kernel creates that file
+        // (APS5_CAPTURE_TRIGGER's), so a frame capture holds the builds of the following frames.
+        static constexpr std::array<std::uint32_t, 6> BuildStart{0xbfa00003u, 0xd7460003u, 0x04010c0fu, 0x7d06060eu, 0xbeea086au, 0xbefe046au};
+        static std::atomic<bool> buildTriggered{false};
+        if (word + BuildStart.size() <= snapshot.code.size() && std::equal(BuildStart.begin(), BuildStart.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(word)) && !buildTriggered.exchange(true)) {
+            if (const char* trigger = std::getenv("APS5_CHECK_BVH_BUILD_TRIGGER"); trigger != nullptr && *trigger != '\0') {
+                if (FILE* file = std::fopen(trigger, "wb")) std::fclose(file);
+                std::fprintf(stderr, "[bvh] %.1f ms: first BVH build dispatch, created %s\n", TraceMs(), trigger);
+            }
+        }
     }
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
