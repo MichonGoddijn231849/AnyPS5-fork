@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 

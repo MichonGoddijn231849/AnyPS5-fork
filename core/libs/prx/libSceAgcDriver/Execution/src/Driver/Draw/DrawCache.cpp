@@ -82,12 +82,6 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         if (found->second->decode != nullptr) replacement->decode = found->second->decode;
         replacement->recipes.store(found->second->recipes.load());
     }
-    auto superseded = drawCache.end();
-    if (found == drawCache.end() && shape != 0) {
-        if (const auto previous = drawShapes.find(shape); previous != drawShapes.end() && previous->second != key) {
-            superseded = drawCache.find(previous->second);
-        }
-    }
     for (std::size_t i = 0; i < fresh.size(); ++i) {
         if (fresh[i] == nullptr) continue;
         auto& variants = replacement->stages[i];
@@ -107,14 +101,6 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         }
     }
     replacement->touched = drawCacheHits;
-    if (superseded != drawCache.end()) {
-        for (const auto& variants : superseded->second->stages) {
-            for (const auto& variant : variants) accountDrawVariant(*variant, false);
-        }
-        drawOrder.erase(superseded->second->order);
-        drawCache.erase(superseded);
-        ++counters.superseded;
-    }
     if (replacement->decode != nullptr && shape != 0) drawShapes[shape] = key;
     if (found == drawCache.end()) {
         drawOrder.push_front(key);

@@ -132,7 +132,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             }
             fresh[i] = std::move(variant);
         }
-        insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr, registerKey ? shapeKey : 0);
+        insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr, registerKey && drawDataHits() ? shapeKey : 0);
         if (unstable != 0 || mismatches != 0 || differingSameRuns != 0 || differingRunsChanged != 0) {
             std::lock_guard cacheLock(drawCacheMutex);
             drawEntryCounters.unstable += unstable;
