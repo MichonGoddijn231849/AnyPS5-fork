@@ -103,6 +103,9 @@ struct SpirvEmitterState {
     // The lookup without fault recording that wide reads try first (see EmitBdaDwordReads); 0 when
     // every read takes the byte path.
     std::uint32_t bdaProbeFunction = 0;
+    // The range the lane's last read lookup found (Private begin, end and device base), which the
+    // read lookups try before their table search; 0 when not defined.
+    std::array<std::uint32_t, 3> bdaRangeCache{};
     std::uint32_t bdaWritePointerFunction = 0;
     std::uint32_t bdaNoteWriteFunction = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
