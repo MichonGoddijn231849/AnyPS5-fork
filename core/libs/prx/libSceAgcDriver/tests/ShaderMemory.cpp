@@ -957,6 +957,146 @@ void verifyTwoLaneUniformValues() {
     require(multiplies(32u) == oneLane, "two-lane uniform values: a two-lane invocation computes a scalar value once per lane");
 }
 
+void verifyFunctionLdsBound() {
+    using namespace ShaderRecompiler;
+    const auto build = [](const auto& body) {
+        IrProgram program;
+        program.Resources().stage = IrShaderStage::Pixel;
+        for (const std::uint32_t offset : {0u, 256u, 512u, 0xfffffff0u}) {
+            MemoryInfo lds;
+            lds.kind = ResourceKind::Lds;
+            lds.offset = offset;
+            program.Resources().memoryInfo.push_back(lds);
+        }
+        auto& block = program.CreateBlock();
+        program.SetEntryBlock(block);
+        program.BlockOrder().push_back(&block);
+        const auto emit = [&](IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments, std::uint32_t memory = ~0u) -> IrValue& {
+            std::uint64_t bits = 0;
+            if (memory != ~0u) {
+                MemoryFlags flags{memory, 0u};
+                std::memcpy(&bits, &flags, sizeof(flags));
+            }
+            auto& value = program.CreateValue(opcode, type, bits);
+            for (auto* argument : arguments) value.AddArgument(argument);
+            block.AppendInstruction(&value);
+            return value;
+        };
+        const auto constant = [&](std::uint32_t immediate) -> IrValue& {
+            auto& value = program.CreateValue(IrOpcode::Void, IrType::U32);
+            value.SetImmediateU32(immediate);
+            return value;
+        };
+        auto& active = program.CreateValue(IrOpcode::Void, IrType::U1);
+        active.SetImmediateBool(true);
+        body(program, block, emit, constant, active);
+        return std::pair{FunctionLdsDwords(program), AnalyzeProgramRequirements(program)};
+    };
+
+    const auto [laneSlots, laneRequirements] = build([](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
+        auto& lane = emit(IrOpcode::LaneId, IrType::U32, {});
+        auto& address = emit(IrOpcode::ShiftLeftLogical32, IrType::U32, {&lane, &constant(2u)});
+        for (const std::uint32_t memory : {0u, 1u, 2u}) emit(IrOpcode::WriteSharedU32, IrType::Void, {&address, &lane, &active}, memory);
+        emit(IrOpcode::LoadSharedU32, IrType::U32, {&address, &active}, 2u);
+    });
+    require(laneSlots == 192u, "function LDS: lane-strided slots up to byte 767 must take 192 dwords");
+    require(laneRequirements.functionLds && laneRequirements.functionLdsDwords == 192u, "function LDS: the requirements do not carry the bounded size");
+    {
+        std::vector<std::uint32_t> rebased;
+        for (const auto& [inst, address] : laneRequirements.functionLdsAddresses) rebased.push_back(address);
+        std::sort(rebased.begin(), rebased.end());
+        require(rebased == std::vector<std::uint32_t>{0u, 0u, 0u, 0u}, "function LDS: lane-strided slots must be addressed without the lane term");
+    }
+
+    const auto [mixed, mixedRequirements] = build([](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
+        auto& lane = emit(IrOpcode::LaneId, IrType::U32, {});
+        auto& address = emit(IrOpcode::ShiftLeftLogical32, IrType::U32, {&lane, &constant(2u)});
+        emit(IrOpcode::WriteSharedU32, IrType::Void, {&address, &lane, &active}, 0u);
+        emit(IrOpcode::LoadSharedU32, IrType::U32, {&constant(8u), &active}, 0u);
+    });
+    require(mixed == 64u && mixedRequirements.functionLdsAddresses.empty(), "function LDS: a constant address beside lane-strided ones must keep the lane term");
+
+    const auto [strides, stridesRequirements] = build([](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
+        auto& lane = emit(IrOpcode::LaneId, IrType::U32, {});
+        auto& four = emit(IrOpcode::ShiftLeftLogical32, IrType::U32, {&lane, &constant(2u)});
+        auto& eight = emit(IrOpcode::IMul32, IrType::U32, {&lane, &constant(8u)});
+        emit(IrOpcode::WriteSharedU32, IrType::Void, {&four, &lane, &active}, 0u);
+        emit(IrOpcode::LoadSharedU32, IrType::U32, {&eight, &active}, 0u);
+    });
+    require(strides == 128u && stridesRequirements.functionLdsAddresses.empty(), "function LDS: two lane strides must keep the lane term");
+
+    const auto [halfWord, halfWordRequirements] = build([](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
+        auto& lane = emit(IrOpcode::LaneId, IrType::U32, {});
+        auto& address = emit(IrOpcode::ShiftLeftLogical32, IrType::U32, {&lane, &constant(1u)});
+        emit(IrOpcode::WriteSharedU32, IrType::Void, {&address, &lane, &active}, 0u);
+    });
+    require(halfWord == 64u && halfWordRequirements.functionLdsAddresses.empty(), "function LDS: a lane stride that is not whole dwords must keep the lane term");
+
+    const auto [summed, summedRequirements] = build([](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
+        auto& lane = emit(IrOpcode::LaneId, IrType::U32, {});
+        auto& scaled = emit(IrOpcode::IMul32, IrType::U32, {&constant(16u), &lane});
+        auto& low = emit(IrOpcode::IAdd32, IrType::U32, {&scaled, &constant(4u)});
+        auto& other = emit(IrOpcode::LaneId, IrType::U32, {});
+        auto& shifted = emit(IrOpcode::ShiftLeftLogical32, IrType::U32, {&other, &constant(4u)});
+        auto& high = emit(IrOpcode::IAdd32, IrType::U32, {&constant(1024u), &shifted});
+        emit(IrOpcode::WriteSharedU32x2, IrType::Void, {&low, &lane, &lane, &active}, 0u);
+        emit(IrOpcode::LoadSharedU32x4, IrType::U32x4, {&high, &active}, 1u);
+    });
+    {
+        std::vector<std::uint32_t> rebased;
+        for (const auto& [inst, address] : summedRequirements.functionLdsAddresses) rebased.push_back(address);
+        std::sort(rebased.begin(), rebased.end());
+        require(rebased == std::vector<std::uint32_t>{4u, 1024u}, "function LDS: lane ids of separate instructions with one stride must share the rebase");
+        require(summedRequirements.functionLdsDwords == 384u && summed == 576u, "function LDS: the rebased array must hold the rebased addresses");
+    }
+
+    const auto [wide, wideRequirements] = build([](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
+        auto& lane = emit(IrOpcode::LaneId, IrType::U32, {});
+        auto& masked = emit(IrOpcode::BitwiseAnd32, IrType::U32, {&lane, &constant(7u)});
+        auto& scaled = emit(IrOpcode::IMul32, IrType::U32, {&masked, &constant(16u)});
+        auto& chosen = emit(IrOpcode::SelectU32, IrType::U32, {&active, &scaled, &constant(0x100u)});
+        emit(IrOpcode::LoadSharedU32x4, IrType::U32x4, {&chosen, &active}, 0u);
+    });
+    require(wide == 128u, "function LDS: a 4-dword access at byte 0x100 must take 68 dwords, rounded to 128");
+    require(wideRequirements.functionLdsDwords == 128u, "function LDS: the requirements do not carry the wide access's size");
+    require(wideRequirements.functionLdsAddresses.empty(), "function LDS: a selected address must keep the lane term");
+
+    const auto [unbounded, unboundedRequirements] = build([](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
+        auto& user = emit(IrOpcode::GetUserData, IrType::U32, {&constant(0u)});
+        emit(IrOpcode::WriteSharedU32, IrType::Void, {&user, &user, &active}, 0u);
+    });
+    require(unbounded == FunctionLdsDwordLimit && unboundedRequirements.functionLdsDwords == FunctionLdsDwordLimit, "function LDS: an address without a bound must keep the full array");
+
+    const auto wrapping = build([](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
+        emit(IrOpcode::LoadSharedU32, IrType::U32, {&constant(0x20u), &active}, 3u);
+    }).first;
+    require(wrapping == FunctionLdsDwordLimit, "function LDS: an offset that can wrap the address must keep the full array");
+
+    const auto loop = build([](IrProgram& program, IrBlock& block, auto& emit, auto& constant, IrValue& active) {
+        auto& phi = program.CreateValue(IrOpcode::Phi, IrType::U32);
+        block.AppendInstruction(&phi);
+        auto& next = emit(IrOpcode::IAdd32, IrType::U32, {&phi, &constant(4u)});
+        phi.AddPhiOperand(&block, &constant(0u));
+        phi.AddPhiOperand(&block, &next);
+        emit(IrOpcode::WriteSharedU32, IrType::Void, {&phi, &next, &active}, 0u);
+    }).first;
+    require(loop == FunctionLdsDwordLimit, "function LDS: a loop-carried address must keep the full array");
+
+    const auto joined = build([](IrProgram& program, IrBlock& block, auto& emit, auto& constant, IrValue& active) {
+        auto& phi = program.CreateValue(IrOpcode::Phi, IrType::U32);
+        block.AppendInstruction(&phi);
+        phi.AddPhiOperand(&block, &constant(0x40u));
+        phi.AddPhiOperand(&block, &constant(0x3fcu));
+        emit(IrOpcode::WriteSharedU32, IrType::Void, {&phi, &constant(1u), &active}, 0u);
+    }).first;
+    require(joined == 256u, "function LDS: a phi of bounded addresses must take its largest");
+
+    const auto unsized = build([](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
+        emit(IrOpcode::LoadShared, IrType::U32, {&constant(0u), &active}, 0u);
+    }).first;
+    require(unsized == FunctionLdsDwordLimit, "function LDS: an access without a known width must keep the full array");
+}
+
 int main() {
     try {
         using namespace ShaderRecompiler;
@@ -972,6 +1112,7 @@ int main() {
         verifyComputedTexelOffsets();
         verifyWaveUniformValues();
         verifyTwoLaneUniformValues();
+        verifyFunctionLdsBound();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
             0x07230203u, 0x00010000u, 0u, 5u, 0u,

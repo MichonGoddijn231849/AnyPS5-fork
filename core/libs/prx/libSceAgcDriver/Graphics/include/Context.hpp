@@ -156,6 +156,7 @@ struct Context {
     bool demoteToHelperInvocation = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
+    bool pipelineExecutableInfo = false;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

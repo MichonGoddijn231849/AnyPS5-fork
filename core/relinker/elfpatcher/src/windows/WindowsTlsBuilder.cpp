@@ -6,8 +6,10 @@
 #include <io/BufferUtils.hpp>
 #include <algorithm>
 #include <bit>
+#include <iomanip>
 #include <limits>
 #include <set>
+#include <sstream>
 #include <string>
 
 namespace Elfpatcher::Windows {
@@ -83,8 +85,14 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
                 const auto loadRegister = info.Length - position == 7 ? static_cast<std::uint8_t>(((bytes[position + 1] >> 3) & 7) | ((info.RexPrefix & 4) << 1)) : std::uint8_t{4};
                 const bool loadValue = supportedPrefixes && (info.RexPrefix == 0x48 || info.RexPrefix == 0x4c) && loadRegister != 4 && bytes[position] == 0x8b && (bytes[position + 1] & 0xc7) == 0x04 && bytes[position + 2] == 0x25;
                 const bool storeImmediate = supportedPrefixes && !hasOperandSizePrefix && (info.RexPrefix == 0 || info.RexPrefix == 0x40) && info.Length - position == 11 && bytes[position] == 0xc7 && bytes[position + 1] == 0x04 && bytes[position + 2] == 0x25 && Io::ReadU32(source, header.Offset + offset + position + 3) == 0x28;
-                if (!loadValue && !storeImmediate)
-                    throw Domain::RelinkerException("Unsupported Windows guest TLS instruction", header.Offset + offset);
+                if (!loadValue && !storeImmediate) {
+                    std::ostringstream message;
+                    message << "Unsupported Windows guest TLS instruction (bytes:" << std::hex << std::setfill('0');
+                    for (std::size_t index = 0; index < info.Length; ++index)
+                        message << ' ' << std::setw(2) << static_cast<unsigned int>(bytes[index]);
+                    message << ')';
+                    throw Domain::RelinkerException(message.str(), header.Offset + offset);
+                }
                 accesses.push_back({rva, header.Offset + offset, info.Length, storeImmediate, storeImmediate ? Io::ReadU32(source, header.Offset + offset + position + 7) : 0, storeImmediate ? std::uint8_t{0} : loadRegister, storeImmediate ? 0 : Io::ReadU32(source, header.Offset + offset + position + 3)});
             }
         }

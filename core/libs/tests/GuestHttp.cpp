@@ -12,6 +12,10 @@ int APS5_VABI sceHttpUriEscape(char*, std::size_t*, std::size_t, const char*);
 int APS5_VABI sceHttpCreateEpoll(int, HttpEpollHandle*);
 int APS5_VABI sceHttpDestroyEpoll(int, HttpEpollHandle);
 int APS5_VABI sceHttpReadData(int, void*, std::size_t);
+int APS5_VABI sceHttpCreateRequest2(int, const char*, const char*, std::uint64_t);
+int APS5_VABI sceHttpsEnableOption(int, std::uint32_t);
+int APS5_VABI sceHttpsLoadCert(int, int, void*, void*, void*);
+int APS5_VABI sceHttpGetLastErrno(int, int*);
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -91,4 +95,12 @@ int main() {
 
     char data[16];
     Require(sceHttpReadData(1, data, sizeof(data)) == network);
+
+    Require(sceHttpCreateRequest2(1, "GET", "/", 0) > 0);
+    Require(sceHttpsEnableOption(1, 0) == 0);
+    Require(sceHttpsLoadCert(1, 0, nullptr, nullptr, nullptr) == 0);
+    int httpErrno = -1;
+    Require(sceHttpGetLastErrno(1, &httpErrno) == 0);
+    Require(httpErrno == 0);
+    Require(sceHttpGetLastErrno(1, nullptr) == invalidValue);
 }

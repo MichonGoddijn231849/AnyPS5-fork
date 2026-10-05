@@ -2,6 +2,7 @@
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
@@ -22,7 +23,11 @@
 #else
 #include <time.h>
 #include <sys/time.h>
+#include <sys/times.h>
+#include <unistd.h>
 #endif
+
+extern "C" int* APS5_VABI __error_nid_postfix();
 
 static std::uint64_t RawMonotonicNanos() {
 #ifdef _WIN32
@@ -222,15 +227,15 @@ int APS5_VABI sceKernelUsleep_nid_postfix(KernelUseconds microseconds) {
     return 0;
 }
 
-int APS5_VABI sceKernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
-    if (rqtp == nullptr) {
-        return -1;
+static int SleepForRequest(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+    constexpr int guestFault = 14;
+    constexpr int guestInvalid = 22;
+    if (rqtp == nullptr) return guestFault;
+    if (rqtp->tv_nsec < 0 || rqtp->tv_nsec >= 1000000000LL) return guestInvalid;
+    if (rqtp->tv_sec >= 0) {
+        TimedWait::SleepNanos(static_cast<std::uint64_t>(rqtp->tv_sec) * 1000000000ULL +
+                              static_cast<std::uint64_t>(rqtp->tv_nsec));
     }
-    if (rqtp->tv_sec < 0 || rqtp->tv_nsec < 0 || rqtp->tv_nsec >= 1000000000LL) {
-        return -1;
-    }
-    TimedWait::SleepNanos(static_cast<std::uint64_t>(rqtp->tv_sec) * 1000000000ULL +
-                          static_cast<std::uint64_t>(rqtp->tv_nsec));
     if (rmtp != nullptr) {
         rmtp->tv_sec = 0;
         rmtp->tv_nsec = 0;
@@ -238,12 +243,20 @@ int APS5_VABI sceKernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmt
     return 0;
 }
 
+int APS5_VABI sceKernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+    const int error = SleepForRequest(rqtp, rmtp);
+    return error == 0 ? 0 : SceKernelError(error);
+}
+
 int APS5_VABI nanosleep_nid_postfix(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
-    return sceKernelNanosleep(rqtp, rmtp);
+    const int error = SleepForRequest(rqtp, rmtp);
+    if (error == 0) return 0;
+    *__error_nid_postfix() = error;
+    return -1;
 }
 
 int APS5_VABI _nanosleep_nid_postfix(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
-    return sceKernelNanosleep(rqtp, rmtp);
+    return nanosleep_nid_postfix(rqtp, rmtp);
 }
 
 int APS5_VABI usleep_nid_postfix(KernelUseconds microseconds) {
@@ -252,7 +265,7 @@ int APS5_VABI usleep_nid_postfix(KernelUseconds microseconds) {
 }
 
 #ifdef _WIN32
-static std::uint64_t CpuTimeNanos(bool callingThread) {
+static std::uint64_t CpuTimeNanos(bool callingThread, bool countKernel) {
     FILETIME creation{};
     FILETIME exitTime{};
     FILETIME kernel{};
@@ -267,7 +280,7 @@ static std::uint64_t CpuTimeNanos(bool callingThread) {
     const auto toTicks = [](const FILETIME& time) {
         return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
     };
-    return (toTicks(kernel) + toTicks(user)) * 100ULL;
+    return (toTicks(user) + (countKernel ? toTicks(kernel) : 0ULL)) * 100ULL;
 }
 
 static std::uint64_t CpuTimeResolutionNanos() {
@@ -280,11 +293,47 @@ static std::uint64_t CpuTimeResolutionNanos() {
         throw std::runtime_error("clock_getres: GetSystemTimeAdjustment reported no clock interrupt period");
     return static_cast<std::uint64_t>(increment) * 100ULL;
 }
+
+static std::uint64_t ProcessCpuNanos(bool countSystem) {
+    return CpuTimeNanos(false, countSystem);
+}
+
+static std::uint64_t ProcessCpuResolutionNanos() {
+    return CpuTimeResolutionNanos();
+}
+#else
+static std::uint64_t ClockTicksPerSecond() {
+    const long rate = sysconf(_SC_CLK_TCK);
+    if (rate <= 0)
+        throw std::runtime_error("clock_gettime: sysconf(_SC_CLK_TCK) reported no clock tick rate");
+    return static_cast<std::uint64_t>(rate);
+}
+
+static std::uint64_t ProcessCpuNanos(bool countSystem) {
+    struct tms usage{};
+    errno = 0;
+    if (times(&usage) == static_cast<clock_t>(-1) && errno != 0)
+        throw std::system_error(errno, std::generic_category(), "clock_gettime: times failed");
+    const std::uint64_t rate = ClockTicksPerSecond();
+    const std::uint64_t ticks = static_cast<std::uint64_t>(usage.tms_utime) + (countSystem ? static_cast<std::uint64_t>(usage.tms_stime) : 0ULL);
+    return ticks / rate * 1000000000ULL + ticks % rate * 1000000000ULL / rate;
+}
+
+static std::uint64_t ProcessCpuResolutionNanos() {
+    const std::uint64_t rate = ClockTicksPerSecond();
+    return (1000000000ULL + rate - 1ULL) / rate;
+}
 #endif
 
 int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp) {
     if (tp == nullptr) {
         APS5_INVALID_ARG_EX;
+    }
+    if (clockId == 1 || clockId == 2) {
+        const std::uint64_t nanos = ProcessCpuNanos(clockId == 2);
+        tp->tv_sec = static_cast<std::int64_t>(nanos / 1000000000ULL);
+        tp->tv_nsec = static_cast<std::int64_t>(nanos % 1000000000ULL);
+        return 0;
     }
 #ifdef _WIN32
     if (clockId == 0 || clockId == 9) {
@@ -304,17 +353,17 @@ int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp) {
         t -= 116444736000000000ULL;
         t *= 100ULL;
         tp->tv_sec = static_cast<std::int64_t>(t / 1000000000ULL);
-        tp->tv_nsec = static_cast<std::int64_t>(t % 1000000000ULL);
+        tp->tv_nsec = clockId == 13 ? 0 : static_cast<std::int64_t>(t % 1000000000ULL);
         return 0;
     }
-    if (clockId == 4 || clockId == 1 || clockId == 5 || clockId == 7 || clockId == 8 || clockId == 11 || clockId == 12) {
+    if (clockId == 4 || clockId == 5 || clockId == 7 || clockId == 8 || clockId == 11 || clockId == 12) {
         std::uint64_t nanos = GetMonotonicNanos();
         tp->tv_sec = static_cast<std::int64_t>(nanos / 1000000000ULL);
         tp->tv_nsec = static_cast<std::int64_t>(nanos % 1000000000ULL);
         return 0;
     }
     if (clockId == 14 || clockId == 15) {
-        const std::uint64_t nanos = CpuTimeNanos(clockId == 14);
+        const std::uint64_t nanos = CpuTimeNanos(clockId == 14, true);
         tp->tv_sec = static_cast<std::int64_t>(nanos / 1000000000ULL);
         tp->tv_nsec = static_cast<std::int64_t>(nanos % 1000000000ULL);
         return 0;
@@ -359,7 +408,7 @@ int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp) {
         return -1;
     }
     tp->tv_sec = static_cast<std::int64_t>(ts.tv_sec);
-    tp->tv_nsec = static_cast<std::int64_t>(ts.tv_nsec);
+    tp->tv_nsec = clockId == 13 ? 0 : static_cast<std::int64_t>(ts.tv_nsec);
     return 0;
 #endif
 }
@@ -394,13 +443,24 @@ int APS5_VABI clock_getres_nid_postfix(int clockId, KernelTimespec* res) {
     if (res == nullptr) {
         APS5_INVALID_ARG_EX;
     }
+    if (clockId == 1 || clockId == 2) {
+        const std::uint64_t nanos = ProcessCpuResolutionNanos();
+        res->tv_sec = static_cast<std::int64_t>(nanos / 1000000000ULL);
+        res->tv_nsec = static_cast<std::int64_t>(nanos % 1000000000ULL);
+        return 0;
+    }
+    if (clockId == 13) {
+        res->tv_sec = 1;
+        res->tv_nsec = 0;
+        return 0;
+    }
 #ifdef _WIN32
     if (clockId == 0 || clockId == 9) {
         res->tv_sec = 0;
         res->tv_nsec = 100LL;
         return 0;
     }
-    if (clockId == 4 || clockId == 1 || clockId == 5 || clockId == 7 || clockId == 8 || clockId == 10 || clockId == 11 || clockId == 12 || clockId == 13) {
+    if (clockId == 4 || clockId == 5 || clockId == 7 || clockId == 8 || clockId == 10 || clockId == 11 || clockId == 12) {
         static const std::uint64_t freq = [] {
             LARGE_INTEGER f{};
             QueryPerformanceFrequency(&f);
@@ -426,7 +486,6 @@ int APS5_VABI clock_getres_nid_postfix(int clockId, KernelTimespec* res) {
             nativeId = CLOCK_REALTIME;
             break;
         case 10:
-        case 13:
 #ifdef CLOCK_REALTIME_COARSE
             nativeId = CLOCK_REALTIME_COARSE;
 #else

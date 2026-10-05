@@ -239,6 +239,7 @@ public:
     // Entries leave the table with their batch (a memory bound only). The note also enters the
     // label's range as a pending write of the open batch (the flush hook syncs CPU reads), marked
     // as the label's own so it does not count as an overwrite of the entry.
+    static constexpr std::size_t LabelTableBytes = 64;
     void NoteLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
     // Late rule: an entry whose stamp is not newer than the wait's submission is still the value
     // memory will hold, unless a CPU store touched the dword since it was recorded (the table
@@ -289,6 +290,7 @@ public:
     static std::optional<LabelHit> LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal = nullptr);
     // The value alone, for callers asking whether any label is pending in a dword (afterStamp 0).
     static std::optional<std::uint64_t> LookupLabelValue(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp);
+    static bool WideLabelIn(std::uint64_t address, std::size_t bytes);
     // A label a queue worker decoded but has not recorded yet (Driver.cpp DeferredLabels): it
     // enters the table with no batch, and only a lookup made on the noting thread (a WAIT_REG_MEM
     // of the same queue) takes its value, since that queue's later work follows the label in queue
@@ -524,6 +526,7 @@ private:
         std::uint64_t readGeneration = 0;
         // Dword addresses this batch noted in the label table (removed when it finishes).
         std::vector<std::uint64_t> labelDwords;
+        std::vector<std::multimap<std::uint64_t, std::uint64_t>::iterator> wideLabels;
         // Labels stored by this batch's completion actions (see AfterCompletions); subtracted from
         // the lock-free pending count when the batch finishes, whether or not its completions ran.
         std::uint32_t completionLabelCount = 0;
@@ -645,6 +648,13 @@ private:
     PFN_vkEndCommandBuffer endCommandBuffer = nullptr;
     PFN_vkQueueSubmit queueSubmit = nullptr;
     PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
+    PFN_vkCmdBeginQuery cmdBeginQuery = nullptr;
+    PFN_vkCmdEndQuery cmdEndQuery = nullptr;
+    PFN_vkCmdResetQueryPool cmdResetQueryPool = nullptr;
+    PFN_vkCmdCopyQueryPoolResults cmdCopyQueryPoolResults = nullptr;
+    PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
+    PFN_vkCmdPushConstants cmdPushConstants = nullptr;
+    PFN_vkCmdDispatch cmdDispatch = nullptr;
     template<typename TFunction>
     TFunction function(TFunction resolved, const char* name) const {
         return resolved != nullptr ? resolved : context.Function<TFunction>(name);
@@ -713,6 +723,9 @@ private:
     // The queued entries (batch always null), by dword; a lookup on the noting queue's thread
     // prefers them (its newest store in program order), every other lookup sees `labels` alone.
     std::map<std::uint64_t, LabelEntry> queuedLabels;
+    std::multimap<std::uint64_t, std::uint64_t> wideLabels;
+    std::uint64_t wideLabelBytes = 0;
+    bool wideLabelInLocked(std::uint64_t address, std::size_t bytes) const;
     // labels.size(), readable without the table mutex: a noted write skips the mutex while the
     // table is empty (most of the time between label groups).
     std::atomic<std::size_t> recordedLabels{0};

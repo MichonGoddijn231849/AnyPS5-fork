@@ -25,6 +25,7 @@ struct MemoryOperand {
     std::uint8_t Sib;
     std::int32_t Displacement;
     bool StackBase;
+    std::size_t EncodedSize;
 };
 
 [[nodiscard]] MemoryOperand DecodeMemoryOperand(const std::uint8_t* data, std::size_t length, std::size_t modRmOffset, std::uint8_t rex, std::vector<std::uint8_t> prefixes);

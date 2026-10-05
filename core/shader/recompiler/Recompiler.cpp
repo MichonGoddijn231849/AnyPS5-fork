@@ -19,6 +19,7 @@
 #include "Optimization/include/Optimization/ConstantFolder.hpp"
 #include "Optimization/include/Optimization/DeadCodeEliminator.hpp"
 #include "Optimization/include/Optimization/DescriptorBindingBuilder.hpp"
+#include "Optimization/include/Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/include/Optimization/ReadLaneEliminator.hpp"
 #include "Optimization/include/Optimization/RequestMemoryView.hpp"
 #include "Optimization/include/Optimization/ResourceMaterializer.hpp"
@@ -153,6 +154,11 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
         constantFolder.Fold(program);
         ResolveControlFlowIdentities(program);
         deadCodeEliminator.RemoveIdentities(program);
+        deadCodeEliminator.Eliminate(program);
+    }
+
+    constexpr MaskedSelectEliminator maskedSelectEliminator;
+    if (maskedSelectEliminator.Eliminate(program).removedSelects != 0u) {
         deadCodeEliminator.Eliminate(program);
     }
 

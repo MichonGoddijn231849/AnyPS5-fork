@@ -182,6 +182,25 @@ bool TranslationContext::dsAtomic2(const RdnaInstruction& inst, IrOpcode opcode,
     return true;
 }
 
+bool TranslationContext::dsAtomic64(const RdnaInstruction& inst, IrOpcode opcode, bool returnsValue) {
+    if (inst.gds) {
+        throw std::runtime_error("64-bit GDS atomics are not supported");
+    }
+    const MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
+    const IrU32 address = readU32(inst.source0);
+    const IrU64 data0 = readU64(inst.source1);
+    IrValue& active = ir.GetExec();
+    IrValue* old;
+    if (IrOpcodeOperandCount(opcode) == 4u) {
+        const IrU64 data1 = readU64(inst.source2);
+        old = &ir.Emit(opcode, IrOpcodeType(opcode), {&address.Value(), &data0.Value(), &data1.Value(), &active}, addMemoryInfo(memory, inst.programCounter));
+    } else {
+        old = &ir.Emit(opcode, IrOpcodeType(opcode), {&address.Value(), &data0.Value(), &active}, addMemoryInfo(memory, inst.programCounter));
+    }
+    if (returnsValue) writeOperand(inst.destination, old);
+    return true;
+}
+
 bool TranslationContext::dsAppendConsume(const RdnaInstruction& inst, IrOpcode opcode) {
     const MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
     const IrU32 address = readU32(makeM0Operand());

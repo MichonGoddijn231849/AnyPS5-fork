@@ -814,8 +814,8 @@ std::uint32_t EmitMinMaxF32Value(SpirvEmitterState& state, std::uint32_t lhs, st
     const auto zeroBits = Binary(state, maxValue ? spv::OpBitwiseAnd : spv::OpBitwiseOr, TypeU32(state), lhsClass.bits, rhsClass.bits);
     const auto numericBits = Select(state, TypeU32(state), bothZero, zeroBits, orderedBits);
 
-    const auto rhsNanBits = Select(state, TypeU32(state), rhsClass.nan, lhsClass.bits, numericBits);
-    const auto resultBits = Select(state, TypeU32(state), lhsClass.nan, rhsClass.bits, rhsNanBits);
+    const auto lhsNanBits = Select(state, TypeU32(state), lhsClass.nan, rhsClass.bits, numericBits);
+    const auto resultBits = Select(state, TypeU32(state), rhsClass.nan, lhsClass.bits, lhsNanBits);
     return Unary(state, spv::OpBitcast, TypeF32(state), resultBits);
 }
 
@@ -920,6 +920,10 @@ void EmitProgram(SpirvEmitterState& state) {
         if (lane.scratchU32Variable != 0u) {
             state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)), lane.scratchU32Variable, spv::StorageClassFunction);
         }
+    }
+    if (state.requirements.ldsLock) {
+        state.module.AddFunction(spv::OpStore, EmitLdsLockPointer(state), ConstantU32(state, 0u));
+        state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
     }
     if (state.gdsVariable != 0u) {
         state.gdsLength = state.module.AllocateId();

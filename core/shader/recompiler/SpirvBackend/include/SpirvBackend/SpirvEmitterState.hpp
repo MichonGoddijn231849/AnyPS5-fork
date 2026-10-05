@@ -82,6 +82,7 @@ struct SpirvEmitterState {
 
     SpirvRequirements requirements;
     std::uint32_t laneCount = 1;
+    bool splitSubgroup = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     // The target's SPIR-V version and what the device accepts, for capabilities an emitter adds

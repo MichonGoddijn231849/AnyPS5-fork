@@ -53,11 +53,10 @@ std::vector<std::array<float, 4>> Triangles() {
     return vertices;
 }
 
-void Draw(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
+void Draw(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, const ShaderRecompiler::SpirvTarget& target) {
     static const auto triangles = Triangles();
     Pixels.fill(std::byte{0});
     Lanes.fill(Sentinel);
-    const auto target = device.Target();
 
     std::vector<std::uint32_t> vertexUserData(4, 0u);
     const auto vertexBuffer = BufferDescriptor(triangles.data(), 16u, static_cast<std::uint32_t>(triangles.size()));
@@ -156,8 +155,16 @@ int main() {
         }
         for (const auto waveSize : {64u, 32u}) {
             for (std::uint32_t pass = 0; pass < 4; ++pass) {
-                Draw(*device, waveSize);
+                Draw(*device, waveSize, device->Target());
                 Check(waveSize);
+            }
+        }
+        if (device->Target().subgroupSize == 32u) {
+            auto wide = device->Target();
+            wide.subgroupSize = 64u;
+            for (std::uint32_t pass = 0; pass < 4; ++pass) {
+                Draw(*device, 32u, wide);
+                Check(32u);
             }
         }
         std::puts("pixel helper lane tests passed");

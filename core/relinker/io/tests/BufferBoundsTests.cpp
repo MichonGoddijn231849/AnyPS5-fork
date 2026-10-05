@@ -1,5 +1,6 @@
 #include <io/BufferUtils.hpp>
 #include <io/ByteReader.hpp>
+#include <io/ByteWriter.hpp>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -75,9 +76,14 @@ void writeBounds(const TWrite& write, const std::string& name) {
 int main() {
     try {
         const Io::ByteReader reader;
+        const Io::ByteWriter writer;
         readBounds<std::uint16_t>([&](const Bytes& bytes, std::size_t offset) { return reader.ReadU16(bytes, offset); }, "ByteReader::ReadU16");
         readBounds<std::uint32_t>([&](const Bytes& bytes, std::size_t offset) { return reader.ReadU32(bytes, offset); }, "ByteReader::ReadU32");
         readBounds<std::uint64_t>([&](const Bytes& bytes, std::size_t offset) { return reader.ReadU64(bytes, offset); }, "ByteReader::ReadU64");
+        writeBounds<std::uint8_t>([&](Bytes& bytes, std::size_t offset, std::uint8_t value) { writer.WriteU8(bytes, offset, value); }, "ByteWriter::WriteU8");
+        writeBounds<std::uint16_t>([&](Bytes& bytes, std::size_t offset, std::uint16_t value) { writer.WriteU16(bytes, offset, value); }, "ByteWriter::WriteU16");
+        writeBounds<std::uint32_t>([&](Bytes& bytes, std::size_t offset, std::uint32_t value) { writer.WriteU32(bytes, offset, value); }, "ByteWriter::WriteU32");
+        writeBounds<std::uint64_t>([&](Bytes& bytes, std::size_t offset, std::uint64_t value) { writer.WriteU64(bytes, offset, value); }, "ByteWriter::WriteU64");
         readBounds<std::uint16_t>(Io::ReadU16, "ReadU16");
         readBounds<std::uint32_t>(Io::ReadU32, "ReadU32");
         readBounds<std::uint64_t>(Io::ReadU64, "ReadU64");

@@ -245,7 +245,9 @@ std::uint32_t SampledComponentZero(SpirvEmitterState& state, IrTextureNumericCla
 std::uint32_t TableResult(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t result) {
     if (access.table.mapped == 0) return result;
     auto& state = ctx.state;
-    return Select(state, TypeU32Vector(state, 4), access.table.mapped, result, ConstantU32CompositeZero(state, 4));
+    const auto mapped = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, TypeBoolVector(state, 4), mapped, access.table.mapped, access.table.mapped, access.table.mapped, access.table.mapped);
+    return Select(state, TypeU32Vector(state, 4), mapped, result, ConstantU32CompositeZero(state, 4));
 }
 
 std::uint32_t ResultVector(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t value, IrTextureNumericClass numericClass, bool dref, bool gather) {
@@ -448,6 +450,63 @@ std::uint32_t UnpackImageTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess
     return result;
 }
 
+SpirvBufferFormatInfo PackedTexelFormat(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
+    const auto format = access.image.packedFormat;
+    if (format == IrBufferFormat::Invalid || access.table.mapped != 0 || access.image.depthBits || access.image.conversionFormat != IrBufferFormat::Invalid) {
+        ctx.Fail(access.inst, "accesses packed texels of an image without a packed format");
+    }
+    const auto info = GetFormatInfo(format);
+    if (info.packedBitfield) {
+        ctx.Fail(access.inst, "accesses packed texels of a bitfield format");
+    }
+    return info;
+}
+
+std::uint32_t PackedImageTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t texel) {
+    auto& state = ctx.state;
+    const auto info = PackedTexelFormat(ctx, access);
+    std::uint32_t texelBits = 0;
+    for (std::uint32_t component = 0; component < info.componentCount; component++) {
+        const auto bits = info.componentBits[component];
+        const bool exact = info.type == SpirvFormatComponentType::Uint || info.type == SpirvFormatComponentType::Sint || (info.type == SpirvFormatComponentType::Unorm && bits <= 16u) || (info.type == SpirvFormatComponentType::Float && bits == 32u);
+        if (!exact) {
+            ctx.Fail(access.inst, "reads packed texels of a format whose bits are not recoverable from the view");
+        }
+        texelBits += bits;
+    }
+    const auto numericClass = access.image.numericClass;
+    std::uint32_t words[4] = {ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0)};
+    std::uint32_t position = 0;
+    for (std::uint32_t component = 0; component < info.componentCount; component++) {
+        const auto bits = info.componentBits[component];
+        const auto scalar = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, ImageScalarType(state, numericClass), scalar, texel, component);
+        std::uint32_t value;
+        if (info.type == SpirvFormatComponentType::Unorm) {
+            const auto scaled = Binary(state, spv::OpFMul, TypeF32(state), scalar, ConstantF32Value(state, static_cast<float>((1u << bits) - 1u)));
+            value = Unary(state, spv::OpConvertFToU, TypeU32(state), Binary(state, spv::OpFAdd, TypeF32(state), scaled, ConstantF32Value(state, 0.5f)));
+        } else {
+            value = SampledComponentBits(ctx, scalar, numericClass);
+        }
+        if (bits < 32u) {
+            value = Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, ConstantU32(state, (1u << bits) - 1u));
+        }
+        const auto word = position / 32u;
+        if (position % 32u != 0u) {
+            value = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), value, ConstantU32(state, position % 32u));
+        }
+        words[word] = Binary(state, spv::OpBitwiseOr, TypeU32(state), words[word], value);
+        position += bits;
+    }
+    if (access.mem.dataSigned && texelBits < 32u) {
+        const auto shift = ConstantU32(state, 32u - texelBits);
+        words[0] = Binary(state, spv::OpShiftRightArithmetic, TypeU32(state), Binary(state, spv::OpShiftLeftLogical, TypeU32(state), words[0], shift), shift);
+    }
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), result, words[0], words[1], words[2], words[3]);
+    return result;
+}
+
 std::uint32_t UnpackImageGather(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t gathered) {
     auto& state = ctx.state;
     const auto info = ImageConversionFormat(access.image);
@@ -550,6 +609,48 @@ std::uint32_t StoreTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess& acce
     return PackImageTexel(ctx, access, texel);
 }
 
+std::uint32_t PackedStoreTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t data) {
+    auto& state = ctx.state;
+    const auto info = PackedTexelFormat(ctx, access);
+    const auto numericClass = access.image.numericClass;
+    if (info.byteSize == 12u) {
+        ctx.Fail(access.inst, "stores packed texels of a format the hardware does not write");
+    }
+    std::uint32_t words[4] = {};
+    for (std::uint32_t word = 0; word < 4u; word++) {
+        if (((access.mem.dmask >> word) & 1u) == 0u) {
+            words[word] = ConstantU32(state, 0u);
+            continue;
+        }
+        words[word] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), words[word], data, DmaskComponentIndex(access.mem.dmask, word));
+    }
+    std::uint32_t values[4] = {};
+    for (std::uint32_t component = 0; component < 4u; component++) {
+        if (component >= info.componentCount) {
+            values[component] = numericClass == IrTextureNumericClass::Float ? ZeroF32(state) : ConstantU32(state, 0u);
+            continue;
+        }
+        const auto bits = info.componentBits[component];
+        const auto offset = info.componentBitOffset[component];
+        const bool exact = (info.type == SpirvFormatComponentType::Uint && numericClass == IrTextureNumericClass::Uint) || (bits == 32u && ((info.type == SpirvFormatComponentType::Sint && numericClass == IrTextureNumericClass::Uint) || (info.type == SpirvFormatComponentType::Float && numericClass == IrTextureNumericClass::Float)));
+        if (!exact || offset % 32u + bits > 32u) {
+            ctx.Fail(access.inst, "stores packed texels of a format whose bits are not reproducible through the view");
+        }
+        auto value = words[offset / 32u];
+        if (offset % 32u != 0u) {
+            value = Binary(state, spv::OpShiftRightLogical, TypeU32(state), value, ConstantU32(state, offset % 32u));
+        }
+        if (bits < 32u) {
+            value = Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, ConstantU32(state, (1u << bits) - 1u));
+        }
+        values[component] = numericClass == IrTextureNumericClass::Float ? Unary(state, spv::OpBitcast, TypeF32(state), value) : value;
+    }
+    const auto texel = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, numericClass == IrTextureNumericClass::Float ? TypeF32Vector(state, 4) : TypeU32Vector(state, 4), texel, values[0], values[1], values[2], values[3]);
+    return texel;
+}
+
 std::uint32_t ImageAtomicOpcode(IrOpcode opcode) {
     switch (opcode) {
         case IrOpcode::ImageAtomicSwap32:
@@ -621,6 +722,9 @@ void EmitReadOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
         } else {
             state.module.AddFunction(spv::OpImageFetch, ImageVectorType(state, numericClass, 4), color, descriptor, coord, spv::ImageOperandsLodMask, LodU32(ctx, access));
         }
+        if (access.mem.imagePacked) {
+            return PackedImageTexel(ctx, access, color);
+        }
         return TableResult(ctx, access, ResultVector(ctx, access, UnpackImageTexel(ctx, access, color), numericClass, false, false));
     }));
 }
@@ -634,7 +738,7 @@ void EmitWriteOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     EmitIfCondition(state, ctx.Arg(access.inst, 3), [&]() {
         const auto mipLod = access.image.mipMode == ImageMipMode::DynamicStorage ? LodU32(ctx, access) : 0u;
         const auto coord = CoordU32(ctx, access);
-        const auto texel = StoreTexel(ctx, access, ctx.Arg(access.inst, 2), uintImage);
+        const auto texel = access.mem.imagePacked ? PackedStoreTexel(ctx, access, ctx.Arg(access.inst, 2)) : StoreTexel(ctx, access, ctx.Arg(access.inst, 2), uintImage);
         EmitStorageImageWrite(state, access.mem.resource, mipLod, coord, texel);
     });
 }
@@ -653,6 +757,17 @@ void EmitAtomicOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
         if (opcode == IrOpcode::ImageAtomicInc32 || opcode == IrOpcode::ImageAtomicDec32) {
             return AtomicUpdate(state, pointer, ResourceKind::Image, [&](std::uint32_t current) {
                 return opcode == IrOpcode::ImageAtomicInc32 ? AtomicIncrement(state, current, value) : AtomicDecrement(state, current, value);
+            });
+        }
+        if (opcode == IrOpcode::ImageAtomicFMin32 || opcode == IrOpcode::ImageAtomicFMax32) {
+            return AtomicUpdate(state, pointer, ResourceKind::Image, [&](std::uint32_t current) {
+                return AtomicFloatMinMax(state, current, value, opcode == IrOpcode::ImageAtomicFMax32);
+            });
+        }
+        if (opcode == IrOpcode::ImageAtomicFCmpSwap32) {
+            const auto comparator = ctx.Arg(access.inst, 3);
+            return AtomicUpdate(state, pointer, ResourceKind::Image, [&](std::uint32_t current) {
+                return AtomicFloatCompareSwap(state, current, value, comparator);
             });
         }
         const auto old = state.module.AllocateId();
@@ -949,6 +1064,9 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::ImageAtomicSMax32:
         case IrOpcode::ImageAtomicInc32:
         case IrOpcode::ImageAtomicDec32:
+        case IrOpcode::ImageAtomicFCmpSwap32:
+        case IrOpcode::ImageAtomicFMin32:
+        case IrOpcode::ImageAtomicFMax32:
             EmitAtomicOp(ctx, access);
             return;
         default:
@@ -1044,6 +1162,18 @@ void EmitImageAtomicDec32(SpirvValueEmitContext& ctx, const IrValue& inst) {
     EmitImage(ctx, inst);
 }
 
+void EmitImageAtomicFCmpSwap32(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    EmitImage(ctx, inst);
+}
+
+void EmitImageAtomicFMin32(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    EmitImage(ctx, inst);
+}
+
+void EmitImageAtomicFMax32(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    EmitImage(ctx, inst);
+}
+
 void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const auto u32 = TypeU32(state);
@@ -1080,35 +1210,41 @@ void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
         const IrValue* address = ctx.ImageAddress(inst.Argument(1));
         const auto component = [&](std::uint32_t index) { return ctx.Arg(*address, index); };
         const bool a16 = (ctx.Memory(inst).imageSampleFlags & RdnaImageSampleFlagA16) != 0u;
+        const bool node64 = ctx.Memory(inst).addressIsFull;
+        const std::uint32_t ray = node64 ? 2u : 1u;
 
-        const auto node = component(0);
-        const auto type = op(spv::OpBitwiseAnd, u32, node, uint(7u));
-        const auto nodeIndex = op(spv::OpShiftRightLogical, u64, widen(node), BdaConstant(state, 3u));
+        const auto nodeLow = component(0);
+        const auto node = node64 ? pair(nodeLow, component(1)) : widen(nodeLow);
+        const auto type = op(spv::OpBitwiseAnd, u32, nodeLow, uint(7u));
+        const auto nodeIndex = op(spv::OpShiftRightLogical, u64, node, BdaConstant(state, 3u));
         const auto baseUnits = pair(word[0], op(spv::OpBitwiseAnd, u32, word[1], uint(0xffu)));
         const auto lastNode = pair(word[2], op(spv::OpBitwiseAnd, u32, word[3], uint(0x3ffu)));
         const auto boxGrow = op(spv::OpBitwiseAnd, u32, op(spv::OpShiftRightLogical, u32, word[1], uint(23u)), uint(0xffu));
         const auto boxSort = op(spv::OpINotEqual, boolean, op(spv::OpBitwiseAnd, u32, word[1], uint(0x80000000u)), uint(0u));
         const auto barycentrics = op(spv::OpINotEqual, boolean, op(spv::OpBitwiseAnd, u32, word[3], uint(1u << 24u)), uint(0u));
-        const auto nodeAddress = op(spv::OpIAdd, u64, op(spv::OpShiftLeftLogical, u64, baseUnits, BdaConstant(state, 8u)), op(spv::OpShiftLeftLogical, u64, widen(op(spv::OpBitwiseAnd, u32, node, uint(~7u))), BdaConstant(state, 3u)));
-        const auto present = op(spv::OpINotEqual, boolean, baseUnits, BdaConstant(state, 0u));
-        const auto valid = both(present, op(spv::OpULessThanEqual, boolean, nodeIndex, lastNode));
+        const auto nodeAddress = op(spv::OpIAdd, u64, op(spv::OpShiftLeftLogical, u64, baseUnits, BdaConstant(state, 8u)), op(spv::OpShiftLeftLogical, u64, op(spv::OpBitwiseAnd, u64, node, BdaConstant(state, ~std::uint64_t{7u})), BdaConstant(state, 3u)));
+        const auto within = [&](spv::Op compare) {
+            const auto inRange = op(compare, boolean, nodeIndex, lastNode);
+            return node64 ? inRange : both(op(spv::OpINotEqual, boolean, baseUnits, BdaConstant(state, 0u)), inRange);
+        };
+        const auto valid = within(spv::OpULessThanEqual);
         const auto isTriangle = both(valid, op(spv::OpULessThanEqual, boolean, type, uint(1u)));
         const auto isBox16 = both(valid, op(spv::OpIEqual, boolean, type, uint(4u)));
-        const auto isBox32 = both(both(present, op(spv::OpULessThan, boolean, nodeIndex, lastNode)), op(spv::OpIEqual, boolean, type, uint(5u)));
+        const auto isBox32 = both(within(spv::OpULessThan), op(spv::OpIEqual, boolean, type, uint(5u)));
 
-        const auto extent = asFloat(component(1));
+        const auto extent = asFloat(component(ray));
         std::array<std::uint32_t, 3> origin{};
         std::array<std::uint32_t, 3> direction{};
         std::array<std::uint32_t, 3> inverse{};
         for (std::uint32_t axis = 0; axis < 3u; ++axis) {
-            origin[axis] = asFloat(component(2u + axis));
+            origin[axis] = asFloat(component(ray + 1u + axis));
             if (!a16) {
-                direction[axis] = asFloat(component(5u + axis));
-                inverse[axis] = asFloat(component(8u + axis));
+                direction[axis] = asFloat(component(ray + 4u + axis));
+                inverse[axis] = asFloat(component(ray + 7u + axis));
                 continue;
             }
             const auto half = [&](std::uint32_t index) {
-                const auto packed = component(5u + index / 2u);
+                const auto packed = component(ray + 4u + index / 2u);
                 return EmitF16BitsToF32(state, index % 2u == 0u ? op(spv::OpBitwiseAnd, u32, packed, uint(0xffffu)) : op(spv::OpShiftRightLogical, u32, packed, uint(16u)));
             };
             direction[axis] = half(axis);

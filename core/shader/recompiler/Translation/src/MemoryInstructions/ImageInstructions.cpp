@@ -34,7 +34,9 @@ MemoryInfo imageMemoryInfoFromInstruction(const RdnaInstruction& inst) {
     memory.imageSampleFlags = inst.imageSampleFlags;
     memory.imageDimension = inst.imageDimension;
     memory.imageAddressComponents = inst.imageAddressComponents;
-    memory.imageHasMip = inst.op == RdnaOpcode::ImageLoadMip || inst.op == RdnaOpcode::ImageStoreMip;
+    memory.imageHasMip = inst.op == RdnaOpcode::ImageLoadMip || inst.op == RdnaOpcode::ImageStoreMip || inst.op == RdnaOpcode::ImageLoadMipPck || inst.op == RdnaOpcode::ImageLoadMipPckSgn || inst.op == RdnaOpcode::ImageStoreMipPck;
+    memory.imagePacked = inst.op == RdnaOpcode::ImageLoadPck || inst.op == RdnaOpcode::ImageLoadPckSgn || inst.op == RdnaOpcode::ImageLoadMipPck || inst.op == RdnaOpcode::ImageLoadMipPckSgn || inst.op == RdnaOpcode::ImageStorePck || inst.op == RdnaOpcode::ImageStoreMipPck;
+    memory.dataSigned = inst.op == RdnaOpcode::ImageLoadPckSgn || inst.op == RdnaOpcode::ImageLoadMipPckSgn;
     memory.imageR128 = inst.imageR128;
     return memory;
 }
@@ -59,6 +61,7 @@ bool TranslationContext::imageBvhIntersectRay(const RdnaInstruction& inst) {
     memory.kind = ResourceKind::Global;
     memory.dataDwords = 4u;
     memory.imageSampleFlags = inst.imageA16 ? RdnaImageSampleFlagA16 : 0u;
+    memory.addressIsFull = inst.op == RdnaOpcode::ImageBvh64IntersectRay;
     IrValue* descriptor = constructU32x4(inst.source1, 4u);
     IrValue* address = makeImageAddress(inst, inst.source0);
     IrValue& result = ir.Emit(IrOpcode::ImageBvhIntersectRay, IrOpcodeType(IrOpcode::ImageBvhIntersectRay), {descriptor, address, &ir.GetExec()}, addMemoryInfo(memory, inst.programCounter));
@@ -76,7 +79,7 @@ bool TranslationContext::imageAtomic(const RdnaInstruction& inst, IrOpcode opcod
     const IrU32 value = readU32(inst.destination);
     IrValue& exec = ir.GetExec();
     IrValue* result;
-    if (opcode == IrOpcode::ImageAtomicCmpSwap32) {
+    if (opcode == IrOpcode::ImageAtomicCmpSwap32 || opcode == IrOpcode::ImageAtomicFCmpSwap32) {
         const IrU32 comparator = readU32(offsetOperand(inst.destination, 1u));
         result = &ir.Emit(opcode, IrOpcodeType(opcode), {resource, address, &value.Value(), &comparator.Value(), &exec}, flags);
     } else {

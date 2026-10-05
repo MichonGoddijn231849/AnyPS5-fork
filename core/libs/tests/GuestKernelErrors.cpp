@@ -14,6 +14,13 @@ int APS5_VABI sceKernelDeleteEqueue(KernelEqueue eq);
 int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out, const KernelUseconds* timo);
 int APS5_VABI sceKernelDeleteUserEvent(KernelEqueue eq, int id);
 int APS5_VABI scePthreadMutexattrInit(PthreadMutexattr* attr);
+int APS5_VABI pthread_mutexattr_init_nid_postfix(PthreadMutexattr* attr);
+int APS5_VABI pthread_mutexattr_settype_nid_postfix(PthreadMutexattr* attr, int type);
+int APS5_VABI pthread_mutexattr_destroy_nid_postfix(PthreadMutexattr* attr);
+int APS5_VABI pthread_mutex_init_nid_postfix(PthreadMutex* mutex, const PthreadMutexattr* attr);
+int APS5_VABI pthread_mutex_lock_nid_postfix(PthreadMutex* mutex);
+int APS5_VABI pthread_mutex_unlock_nid_postfix(PthreadMutex* mutex);
+int APS5_VABI pthread_mutex_destroy_nid_postfix(PthreadMutex* mutex);
 int APS5_VABI scePthreadMutexattrDestroy(PthreadMutexattr* attr);
 int APS5_VABI scePthreadMutexattrSettype(PthreadMutexattr* attr, int type);
 int APS5_VABI scePthreadMutexattrSetprotocol(PthreadMutexattr* attr, int protocol);
@@ -34,6 +41,8 @@ static constexpr int MUTEX_TYPE_ERRORCHECK = 1;
 static constexpr int PRIO_NONE = 0;
 static constexpr int PRIO_INHERIT = 1;
 static constexpr int PRIO_PROTECT = 2;
+static constexpr int MUTEX_TYPE_ADAPTIVE = 4;
+static constexpr int POSIX_EDEADLK = 11;
 
 static void Require(bool value) { if (!value) std::abort(); }
 
@@ -88,4 +97,46 @@ int main() {
     Require(scePthreadMutexLock(&mutex) == SCE_KERNEL_ERROR_EDEADLK);
     Require(scePthreadMutexUnlock(&mutex) == SCE_OK);
     Require(scePthreadMutexDestroy(&mutex) == SCE_OK);
+
+    Require(scePthreadMutexattrInit(&attr) == SCE_OK);
+    Require(scePthreadMutexattrSettype(&attr, MUTEX_TYPE_ADAPTIVE) == SCE_OK);
+    PthreadMutex adaptive = nullptr;
+    Require(scePthreadMutexInit(&adaptive, &attr, nullptr) == SCE_OK);
+    Require(scePthreadMutexattrDestroy(&attr) == SCE_OK);
+    Require(scePthreadMutexLock(&adaptive) == SCE_OK);
+    Require(scePthreadMutexLock(&adaptive) == SCE_KERNEL_ERROR_EDEADLK);
+    Require(scePthreadMutexUnlock(&adaptive) == SCE_OK);
+    Require(scePthreadMutexDestroy(&adaptive) == SCE_OK);
+
+    Require(scePthreadMutexattrInit(&attr) == SCE_OK);
+    PthreadMutex defaulted = nullptr;
+    Require(scePthreadMutexInit(&defaulted, &attr, nullptr) == SCE_OK);
+    Require(scePthreadMutexattrDestroy(&attr) == SCE_OK);
+    Require(scePthreadMutexLock(&defaulted) == SCE_OK);
+    Require(scePthreadMutexLock(&defaulted) == SCE_KERNEL_ERROR_EDEADLK);
+    Require(scePthreadMutexUnlock(&defaulted) == SCE_OK);
+    Require(scePthreadMutexDestroy(&defaulted) == SCE_OK);
+
+    PthreadMutex unattributed = nullptr;
+    Require(scePthreadMutexInit(&unattributed, nullptr, nullptr) == SCE_OK);
+    Require(scePthreadMutexLock(&unattributed) == SCE_OK);
+    Require(scePthreadMutexLock(&unattributed) == SCE_KERNEL_ERROR_EDEADLK);
+    Require(scePthreadMutexUnlock(&unattributed) == SCE_OK);
+    Require(scePthreadMutexDestroy(&unattributed) == SCE_OK);
+
+    Require(pthread_mutexattr_init_nid_postfix(&attr) == 0);
+    Require(pthread_mutexattr_settype_nid_postfix(&attr, MUTEX_TYPE_ADAPTIVE) == 0);
+    PthreadMutex posixAdaptive = nullptr;
+    Require(pthread_mutex_init_nid_postfix(&posixAdaptive, &attr) == 0);
+    Require(pthread_mutexattr_destroy_nid_postfix(&attr) == 0);
+    Require(pthread_mutex_lock_nid_postfix(&posixAdaptive) == 0);
+    Require(pthread_mutex_lock_nid_postfix(&posixAdaptive) == POSIX_EDEADLK);
+    Require(pthread_mutex_unlock_nid_postfix(&posixAdaptive) == 0);
+    Require(pthread_mutex_destroy_nid_postfix(&posixAdaptive) == 0);
+
+    auto staticAdaptive = reinterpret_cast<PthreadMutex>(std::uintptr_t{1});
+    Require(pthread_mutex_lock_nid_postfix(&staticAdaptive) == 0);
+    Require(pthread_mutex_lock_nid_postfix(&staticAdaptive) == POSIX_EDEADLK);
+    Require(pthread_mutex_unlock_nid_postfix(&staticAdaptive) == 0);
+    Require(pthread_mutex_destroy_nid_postfix(&staticAdaptive) == 0);
 }

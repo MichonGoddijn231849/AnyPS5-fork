@@ -1,12 +1,15 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 extern "C" {
 double APS5_VABI atof_nid_postfix(const char*);
 float APS5_VABI strtof_nid_postfix(const char*, char**);
 long double APS5_VABI strtold_nid_postfix(const char*, char**);
+std::int64_t APS5_VABI strtol_nid_postfix(const char*, char**, int);
+std::uint64_t APS5_VABI strtoul_nid_postfix(const char*, char**, int);
 int* APS5_VABI __error_nid_postfix();
 float APS5_VABI fmodf_nid_postfix(float, float);
 float APS5_VABI asinf_nid_postfix(float);
@@ -29,7 +32,89 @@ int APS5_VABI __isnormalf_nid_postfix(float);
 int APS5_VABI __isinff_nid_postfix(float);
 }
 static void Require(bool value) { if (!value) std::abort(); }
+
+static void CheckIntegerConversions() {
+    struct SignedCase {
+        const char* text;
+        int base;
+        std::int64_t value;
+        std::size_t consumed;
+        int error;
+    };
+    const SignedCase signedCases[] = {
+        {"-42tail", 10, -42, 3, 0},
+        {"2147483648!", 10, INT64_C(2147483648), 10, 0},
+        {"-2147483649!", 10, -INT64_C(2147483649), 11, 0},
+        {"4294967296!", 10, INT64_C(4294967296), 10, 0},
+        {"9223372036854775807!", 10, INT64_MAX, 19, 0},
+        {"-9223372036854775808!", 10, INT64_MIN, 20, 0},
+        {"9223372036854775808!", 10, INT64_MAX, 19, 34},
+        {"-9223372036854775809!", 10, INT64_MIN, 20, 34},
+        {"18446744073709551616000!", 10, INT64_MAX, 23, 34},
+        {" \t+0x100000000z", 0, INT64_C(4294967296), 14, 0},
+        {"-0x8000000000000000!", 0, INT64_MIN, 19, 0},
+        {"0x8000000000000000!", 16, INT64_MAX, 18, 34},
+        {"0100000000000!", 0, INT64_C(8589934592), 13, 0},
+        {"100000000000000000000000000000000!", 2, INT64_C(4294967296), 33, 0},
+        {"z!", 36, 35, 1, 0},
+        {"", 10, 0, 0, 0},
+        {" \t+!", 10, 0, 0, 0},
+        {"123!", 10, 123, 3, 0}
+    };
+    for (const auto& test : signedCases) {
+        char* end = nullptr;
+        *__error_nid_postfix() = 0;
+        const auto value = strtol_nid_postfix(test.text, &end, test.base);
+        if (value != test.value || end != test.text + test.consumed || *__error_nid_postfix() != test.error) {
+            std::fprintf(stderr, "Guest strtol failed for '%s' in base %d\n", test.text, test.base);
+            std::abort();
+        }
+    }
+    struct UnsignedCase {
+        const char* text;
+        int base;
+        std::uint64_t value;
+        std::size_t consumed;
+        int error;
+    };
+    const UnsignedCase unsignedCases[] = {
+        {"4294967296!", 10, UINT64_C(4294967296), 10, 0},
+        {"9223372036854775808!", 10, UINT64_C(9223372036854775808), 19, 0},
+        {"18446744073709551615!", 10, UINT64_MAX, 20, 0},
+        {"18446744073709551616!", 10, UINT64_MAX, 20, 34},
+        {"18446744073709551616000!", 10, UINT64_MAX, 23, 34},
+        {"-1!", 10, UINT64_MAX, 2, 0},
+        {"-4294967296!", 10, UINT64_MAX - UINT64_C(4294967295), 11, 0},
+        {"-18446744073709551615!", 10, 1, 21, 0},
+        {"-18446744073709551616!", 10, UINT64_MAX, 21, 34},
+        {" \t+0xffffffffffffffffz", 0, UINT64_MAX, 21, 0},
+        {"0x10000000000000000!", 16, UINT64_MAX, 19, 34},
+        {"0100000000000!", 0, UINT64_C(8589934592), 13, 0},
+        {"100000000000000000000000000000000!", 2, UINT64_C(4294967296), 33, 0},
+        {"z!", 36, 35, 1, 0},
+        {"", 10, 0, 0, 0},
+        {" \t-!", 10, 0, 0, 0},
+        {"123!", 10, 123, 3, 0}
+    };
+    for (const auto& test : unsignedCases) {
+        char* end = nullptr;
+        *__error_nid_postfix() = 0;
+        const auto value = strtoul_nid_postfix(test.text, &end, test.base);
+        if (value != test.value || end != test.text + test.consumed || *__error_nid_postfix() != test.error) {
+            std::fprintf(stderr, "Guest strtoul failed for '%s' in base %d\n", test.text, test.base);
+            std::abort();
+        }
+    }
+    *__error_nid_postfix() = 13;
+    Require(strtol_nid_postfix("-4294967296", nullptr, 10) == -INT64_C(4294967296));
+    Require(*__error_nid_postfix() == 13);
+    Require(strtoul_nid_postfix("4294967296", nullptr, 10) == UINT64_C(4294967296));
+    Require(*__error_nid_postfix() == 13);
+    *__error_nid_postfix() = 0;
+}
+
 int main() {
+    CheckIntegerConversions();
     Require(atof_nid_postfix(" -12.5tail") == -12.5);
     char* end = nullptr;
     const char input[] = "0x1.8p+2 remainder";

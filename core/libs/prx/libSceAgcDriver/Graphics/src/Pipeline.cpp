@@ -14,6 +14,51 @@
 
 namespace AgcDriver::Graphics {
 
+void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline) {
+    if (!context.pipelineExecutableInfo) return;
+    const auto getProperties = context.Function<PFN_vkGetPipelineExecutablePropertiesKHR>("vkGetPipelineExecutablePropertiesKHR");
+    const auto getStatistics = context.Function<PFN_vkGetPipelineExecutableStatisticsKHR>("vkGetPipelineExecutableStatisticsKHR");
+    VkPipelineInfoKHR pipelineInfo{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+    pipelineInfo.pipeline = pipeline;
+    std::uint32_t count = 0;
+    Check(getProperties(context.device, &pipelineInfo, &count, nullptr), "vkGetPipelineExecutablePropertiesKHR count");
+    std::vector<VkPipelineExecutablePropertiesKHR> properties(count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+    Check(getProperties(context.device, &pipelineInfo, &count, properties.data()), "vkGetPipelineExecutablePropertiesKHR");
+    properties.resize(count);
+    for (std::uint32_t index = 0; index < properties.size(); ++index) {
+        VkPipelineExecutableInfoKHR executable{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+        executable.pipeline = pipeline;
+        executable.executableIndex = index;
+        count = 0;
+        Check(getStatistics(context.device, &executable, &count, nullptr), "vkGetPipelineExecutableStatisticsKHR count");
+        std::vector<VkPipelineExecutableStatisticKHR> statistics(count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+        Check(getStatistics(context.device, &executable, &count, statistics.data()), "vkGetPipelineExecutableStatisticsKHR");
+        statistics.resize(count);
+        const auto& property = properties[index];
+        std::fprintf(stderr, "[pipeline-stats] executable=%u stages=0x%x subgroup=%u name=%s\n", index, property.stages, property.subgroupSize, property.name);
+        for (const auto& statistic : statistics) {
+            std::fprintf(stderr, "[pipeline-stats] executable=%u %s=", index, statistic.name);
+            switch (statistic.format) {
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+                std::fprintf(stderr, "%s", statistic.value.b32 ? "true" : "false");
+                break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+                std::fprintf(stderr, "%lld", static_cast<long long>(statistic.value.i64));
+                break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+                std::fprintf(stderr, "%llu", static_cast<unsigned long long>(statistic.value.u64));
+                break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
+                std::fprintf(stderr, "%.17g", statistic.value.f64);
+                break;
+            default:
+                throw std::runtime_error("unsupported pipeline statistic format");
+            }
+            std::fprintf(stderr, " (%s)\n", statistic.description);
+        }
+    }
+}
+
 Framebuffer::Framebuffer(const Context& context, VkRenderPass renderPass, std::span<const VkImageView> targets, VkExtent2D extent) : context(context) {
     // Cached objects outlive their device's teardown; they must not keep its buffer pool alive past it.
     this->context.bufferPool.reset();
@@ -49,7 +94,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
     // A cached pipeline may outlive its device's teardown (see ClearCachedPipelines); it must not keep
     // the buffer pool, which is reset with the device, alive past it.
     this->context.bufferPool.reset();
-    Require(state.blends.size() == (state.colors.empty() ? 0u : state.colors.back().slot + 1u) && state.colors.size() <= state.blends.size(), "blend states do not match decoded color state");
+    Require(state.blends.size() == (state.colors.empty() ? 0u : state.colors.back().exportIndex + 1u) && state.colors.size() <= state.blends.size(), "blend states do not match decoded color state");
     Require(state.blends.size() <= context.limits.maxColorAttachments, "color targets exceed device attachment limits");
     Require(state.hasColorTarget || (context.limits.framebufferNoAttachmentsSampleCounts & static_cast<VkSampleCountFlagBits>(state.samples)) != 0, "device does not support rendering without attachments at the draw's sample count");
     Require(state.samples == 1 || !state.depth.has_value() || (context.limits.framebufferDepthSampleCounts & static_cast<VkSampleCountFlagBits>(state.samples)) != 0, "device does not support depth targets with the draw's sample count");
@@ -107,7 +152,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             color.initialLayout = attachmentLayout;
             color.finalLayout = attachmentLayout;
             colors.push_back(color);
-            references.at(state.colors[index].slot) = {index, attachmentLayout};
+            references.at(state.colors[index].exportIndex) = {index, attachmentLayout};
         }
         VkSubpassDescription subpass{};
         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
@@ -178,6 +223,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         blend.pAttachments = state.blends.empty() ? nullptr : state.blends.data();
         std::copy(state.blendConstants.begin(), state.blendConstants.end(), blend.blendConstants);
         VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        pipelineInfo.flags = context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0;
         pipelineInfo.stageCount = static_cast<std::uint32_t>(stages.size());
         pipelineInfo.pStages = stages.data();
         VkPipelineTessellationStateCreateInfo tessellation{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
@@ -196,6 +242,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         pipelineInfo.layout = layout;
         pipelineInfo.renderPass = renderPass;
         Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+        LogPipelineStatistics_nid_no_patch(context, pipeline);
     } catch (...) {
         release();
         throw;
@@ -363,7 +410,7 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
     append(key, state.colors.size());
     for (const auto& color : state.colors) append(key, color.format);
     if (state.blends.size() != state.colors.size()) {
-        for (const auto& color : state.colors) append(key, color.slot);
+        for (const auto& color : state.colors) append(key, color.exportIndex);
     }
     append(key, state.depth.has_value());
     if (state.depth) {

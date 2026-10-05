@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -765,7 +766,8 @@ void refreshMirror(ImageMirror& mirror, std::uint64_t address, std::uint64_t byt
 void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshBlock>& blocks) {
     constexpr std::uint64_t block = 65536;
     std::sort(mirrors.begin(), mirrors.end(), [](const ImageMirror* left, const ImageMirror* right) { return left->base < right->base; });
-    thread_local std::vector<std::uint8_t> changed;
+    thread_local std::vector<std::uint8_t>* changedSlot = nullptr;
+    auto& changed = ShaderRecompiler::ThreadOwned(changedSlot);
     for (std::size_t first = 0; first < mirrors.size();) {
         auto last = first + 1;
         while (last < mirrors.size() && mirrors[last]->base == mirrors[last - 1]->base + mirrors[last - 1]->bytes) ++last;

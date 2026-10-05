@@ -122,7 +122,7 @@ int APS5_VABI sceAudioInInput(int handle, void* dest) {
     if (device != 0) {
         captured = capture(device, out, bytes, deadline);
     } else {
-        std::this_thread::sleep_until(wake);
+        while (Clock::now() < wake) std::this_thread::sleep_until(wake);
     }
     std::memset(out + captured, 0, bytes - captured);
     lock.lock();

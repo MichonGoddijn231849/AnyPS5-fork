@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -34,10 +35,15 @@ std::array<std::uint32_t, 3> ThickBlockExtent(TextureTileMode tileMode, std::uin
 // (the detiler's blockExtent). A mip's tiled bytes are its blocks in row-major order, blocksPerRow per
 // row (TileMipLayout), except the tail mips, which share one block. Throws for linear tiling.
 std::array<std::uint32_t, 3> ThinBlockLayout(TextureTileMode tileMode, std::uint32_t bytesPerElement);
+// The bytes of a thin mip (mip-relative [begin, end), ascending and merged) that hold one of its
+// elements each: its whole tile blocks (every element of the block inside the mip), or its rows
+// without the pitch padding when linear. A tail mip has none (its block also holds the other tail
+// levels and their padding). A retile of the mip writes every byte of these and no other.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> CoveredMipBytes(TextureTileMode tileMode, std::uint32_t bytesPerElement, const TileMipLayout& mip);
 
-// 3D surface. Each slab holds the whole mip chain, smallest level first. Depth slice z of a level is detiled
-// from slab z / blockDepth (slabBytes apart) with the swizzle's slice input set to z, into linear
-// slices sliceLinearBytes apart.
+// 3D surface. Each slab holds the whole mip chain: the mip tail block, if any, then the other levels from the
+// smallest to level 0. Depth slice z of a level is detiled from slab z / blockDepth (slabBytes apart) with the
+// swizzle's slice input set to z, into linear slices sliceLinearBytes apart.
 struct ThickLayout {
     std::vector<TileMipLayout> mips;
     std::uint32_t depth;
@@ -68,6 +74,7 @@ struct SurfaceGeometry {
     bool HasLayer(std::uint32_t level, std::uint32_t layer) const { return imageDepth <= 1 || layer < std::max(imageDepth >> level, 1u); }
 };
 SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor);
+bool LevelsFitAllocation(const GuestTextureResource& surface, std::uint32_t levels);
 
 }
 

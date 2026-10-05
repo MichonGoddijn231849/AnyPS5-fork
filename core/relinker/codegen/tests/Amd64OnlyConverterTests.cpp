@@ -221,9 +221,26 @@ void sha1Operands() {
     check({0x44, 0x0F, 0x38, 0xC8, 0xC0}, Codegen::Sha1Operation::Nexte, 8, 0, 0);
     check({0x0F, 0x38, 0xC9, 0xD5}, Codegen::Sha1Operation::Msg1, 2, 5, 0);
     check({0x2E, 0x41, 0x0F, 0x38, 0xCA, 0xCA}, Codegen::Sha1Operation::Msg2, 1, 10, 0);
-    requireFailure([] { const Bytes bytes = {0x0F, 0x38, 0xC9, 0x08}; (void)Codegen::DecodeSha1(bytes.data(), bytes.size()); }, "SHA-1 memory operand was accepted");
-    requireFailure([] { const Bytes bytes = {0x0F, 0x3A, 0xCC, 0x08, 0x00}; (void)Codegen::DecodeSha1(bytes.data(), bytes.size()); }, "SHA1RNDS4 memory operand was accepted");
+    const Bytes memory = {0x65, 0x67, 0x44, 0x0F, 0x3A, 0xCC, 0x54, 0x8C, 0xF0, 0xFE};
+    const auto decoded = Codegen::DecodeSha1(memory.data(), memory.size());
+    require(decoded.Operation == Codegen::Sha1Operation::Rnds4 && decoded.Destination == 10 && decoded.Function == 2 && decoded.Memory && decoded.Memory->Prefixes == Bytes{0x65, 0x67} && decoded.Memory->Mod == 1 && decoded.Memory->Rm == 4 && decoded.Memory->Sib == 0x8C && decoded.Memory->Displacement == -16 && decoded.Memory->StackBase, "SHA-1 memory operand was decoded incorrectly");
+    const auto memoryFunction = [](const Bytes& site, const int dst, const std::int32_t displacement, const int function) {
+        const auto operands = Codegen::DecodeSha1(site.data(), site.size());
+        require(operands.Operation == Codegen::Sha1Operation::Rnds4 && operands.Destination == dst && operands.Memory && !operands.Memory->StackBase && operands.Memory->Displacement == displacement && operands.Function == function, "SHA1RNDS4 immediate was not read after its memory operand");
+    };
+    memoryFunction({0x0F, 0x3A, 0xCC, 0x08, 0x03}, 1, 0, 3);
+    memoryFunction({0x0F, 0x3A, 0xCC, 0x50, 0x02, 0x01}, 2, 2, 1);
+    memoryFunction({0x0F, 0x3A, 0xCC, 0x91, 0x78, 0x56, 0x34, 0x12, 0x01}, 2, 0x12345678, 1);
+    memoryFunction({0x41, 0x0F, 0x3A, 0xCC, 0x14, 0x24, 0x02}, 2, 0, 2);
+    memoryFunction({0x0F, 0x3A, 0xCC, 0x14, 0x25, 0x78, 0x56, 0x34, 0x12, 0x03}, 2, 0x12345678, 3);
+    const Bytes message = {0x0F, 0x38, 0xC9, 0x08};
+    const auto decodedMessage = Codegen::DecodeSha1(message.data(), message.size());
+    require(decodedMessage.Operation == Codegen::Sha1Operation::Msg1 && decodedMessage.Destination == 1 && decodedMessage.Memory && decodedMessage.Memory->Mod == 0 && decodedMessage.Memory->Rm == 0, "SHA1MSG1 memory operand was decoded incorrectly");
+    requireFailure([] { const Bytes bytes = {0x0F, 0x38, 0xC9, 0x15, 0, 0, 0, 0}; (void)Codegen::DecodeSha1(bytes.data(), bytes.size()); }, "SHA-1 RIP-relative operand was accepted");
+    requireFailure([] { const Bytes bytes = {0x0F, 0x3A, 0xCC, 0x15, 0, 0, 0, 0, 0x00}; (void)Codegen::DecodeSha1(bytes.data(), bytes.size()); }, "SHA1RNDS4 RIP-relative operand was accepted");
+    requireFailure([] { const Bytes bytes = {0x0F, 0x38, 0xC9, 0x54, 0x24}; (void)Codegen::DecodeSha1(bytes.data(), bytes.size()); }, "Truncated SHA-1 memory operand was accepted");
     requireFailure([] { const Bytes bytes = {0x0F, 0x3A, 0xCC, 0xCA}; (void)Codegen::DecodeSha1(bytes.data(), bytes.size()); }, "SHA1RNDS4 without its immediate was accepted");
+    requireFailure([] { const Bytes bytes = {0x0F, 0x3A, 0xCC, 0x50, 0x02}; (void)Codegen::DecodeSha1(bytes.data(), bytes.size()); }, "SHA1RNDS4 memory form without its immediate was accepted");
     requireFailure([] { const Bytes bytes = {0x66, 0x0F, 0x38, 0xC8, 0xCA}; (void)Codegen::DecodeSha1(bytes.data(), bytes.size()); }, "Prefixed 0F 38 C8 was decoded as SHA-1");
     requireFailure([] { const Bytes bytes = {0x0F, 0x38, 0xCC, 0xCA}; (void)Codegen::DecodeSha1(bytes.data(), bytes.size()); }, "SHA-256 was decoded as SHA-1");
     const Bytes prefixedRounds = {0x66, 0x0F, 0x3A, 0xCC, 0xCA, 0x00};
@@ -293,6 +310,12 @@ void matcherSubstitutions() {
         const auto sha1 = match(bytes);
         require(sha1 && sha1->Lowering == Codegen::Amd64OnlyLowering::Trampoline && sha1->InstructionName == name, "SHA-1 instruction was not lowered through a stub");
     }
+    for (const auto& [bytes, name] : {std::pair{Bytes{0x0F, 0x3A, 0xCC, 0x08, 0x01}, "SHA1RNDS4"}, {Bytes{0x0F, 0x38, 0xC8, 0x48, 0x10}, "SHA1NEXTE"}, {Bytes{0x0F, 0x38, 0xC9, 0x4C, 0x24, 0x18}, "SHA1MSG1"}, {Bytes{0x45, 0x0F, 0x38, 0xCA, 0x21}, "SHA1MSG2"}}) {
+        const auto sha1 = match(bytes);
+        require(sha1 && sha1->Lowering == Codegen::Amd64OnlyLowering::Trampoline && sha1->InstructionName == name, "SHA-1 memory form was not lowered through a stub");
+    }
+    const auto stackMessage = match({0x0F, 0x38, 0xC9, 0x4C, 0x24, 0x18});
+    require(stackMessage && stackMessage->StubBody.size() > 22 && Bytes(stackMessage->StubBody.begin() + 13, stackMessage->StubBody.begin() + 22) == Bytes{0xF3, 0x0F, 0x6F, 0x84, 0x24, 0xA8, 0x00, 0x00, 0x00}, "SHA-1 stack operand was not loaded past the spilled scratch register");
     const auto stub = match(kInsertqHighSite);
     require(stub && stub->Lowering == Codegen::Amd64OnlyLowering::Trampoline && stub->StubBody == kInsertqHighBody && stub->ReturnBranchOffset == 15 && stub->InstructionName == "INSERTQ", "INSERTQ was not lowered through a stub");
     const auto topAligned = match({0x66, 0x0F, 0x78, 0xC3, 0x18, 0x28});
@@ -466,7 +489,12 @@ void converterSha1() {
     requireFailure([&] { (void)converter->Convert(beforeReturn, {segmentHeader(text.size())}); }, "Short SHA-1 instruction followed by a return was relocated");
     auto memoryForm = file;
     memoryForm[0x214] = 0x28;
-    require(failureOffset([&] { (void)converter->Convert(memoryForm, {segmentHeader(text.size())}); }, "SHA-1 memory form was accepted") == 0x211, "SHA-1 operand failure does not carry the file offset");
+    const auto memoryResult = converter->Convert(memoryForm, {segmentHeader(text.size())});
+    require(memoryResult.Trampolines.size() == 3 && memoryResult.Reports[2].InstructionName == "SHA1MSG2", "SHA-1 memory form was not lowered through a stub");
+    auto ripRelative = file;
+    const Bytes ripMessage = {0x0F, 0x38, 0xCA, 0x2D, 0x00, 0x00, 0x00, 0x00, 0xC3};
+    std::copy(ripMessage.begin(), ripMessage.end(), ripRelative.begin() + 0x211);
+    require(failureOffset([&] { (void)converter->Convert(ripRelative, {segmentHeader(text.size() + 3)}); }, "SHA-1 RIP-relative form was accepted") == 0x211, "SHA-1 operand failure does not carry the file offset");
 }
 
 void converterMonitorWait() {
@@ -1030,7 +1058,9 @@ void sha1Execution() {
         {0x0F, 0x3A, 0xCC, 0xD2, 0x02}, {0x45, 0x0F, 0x3A, 0xCC, 0xCE, 0x00}, {0x41, 0x0F, 0x3A, 0xCC, 0xC0, 0x01},
         {0x0F, 0x38, 0xC8, 0xD5}, {0x0F, 0x38, 0xC8, 0xD2}, {0x44, 0x0F, 0x38, 0xC8, 0xC7},
         {0x0F, 0x38, 0xC9, 0xD5}, {0x0F, 0x38, 0xC9, 0xD2}, {0x41, 0x0F, 0x38, 0xC9, 0xC7},
-        {0x0F, 0x38, 0xCA, 0xD5}, {0x0F, 0x38, 0xCA, 0xD2}, {0x45, 0x0F, 0x38, 0xCA, 0xFF}};
+        {0x0F, 0x38, 0xCA, 0xD5}, {0x0F, 0x38, 0xCA, 0xD2}, {0x45, 0x0F, 0x38, 0xCA, 0xFF},
+        {0x0F, 0x3A, 0xCC, 0x10, 0x02}, {0x44, 0x0F, 0x3A, 0xCC, 0x40, 0x10, 0x01}, {0x0F, 0x3A, 0xCC, 0x80, 0x10, 0x00, 0x00, 0x00, 0x00}, {0x0F, 0x3A, 0xCC, 0x44, 0x20, 0x10, 0xFF},
+        {0x0F, 0x38, 0xC8, 0x00}, {0x0F, 0x38, 0xC9, 0x48, 0x10}, {0x44, 0x0F, 0x38, 0xCA, 0xB8, 0x10, 0x00, 0x00, 0x00}};
     for (const auto& site : sites) {
         const auto operands = Codegen::DecodeSha1(site.data(), site.size());
         const auto match = matcher->Match(site.data(), site.size());
@@ -1041,19 +1071,24 @@ void sha1Execution() {
                 reg[0] = random();
                 reg[1] = random();
             }
+            alignas(16) const std::uint64_t memory[4] = {random(), random(), random(), random()};
+            const auto rax = operands.Memory ? reinterpret_cast<std::uint64_t>(memory) : 0x5A5A5A5A5A5A5A5Aull;
             std::uint32_t x[4];
             std::uint32_t y[4];
             std::memcpy(x, xmmIn[operands.Destination], sizeof(x));
-            std::memcpy(y, xmmIn[operands.Source], sizeof(y));
+            if (operands.Memory)
+                std::memcpy(y, reinterpret_cast<const std::uint8_t*>(memory) + operands.Memory->Displacement, sizeof(y));
+            else
+                std::memcpy(y, xmmIn[operands.Source], sizeof(y));
             const auto expected = sha1Reference(operands, x, y);
-            const auto run = runStubBody(*match, 0x5A5A5A5A5A5A5A5Aull, xmmIn);
+            const auto run = runStubBody(*match, rax, xmmIn);
             for (unsigned reg = 0; reg < 16; ++reg) {
                 if (reg == operands.Destination)
                     require(std::memcmp(run.Xmm[reg], expected.data(), 16) == 0, "SHA-1 stub computed the wrong result");
                 else
                     require(run.Xmm[reg][0] == xmmIn[reg][0] && run.Xmm[reg][1] == xmmIn[reg][1], "SHA-1 stub clobbered an xmm register");
             }
-            require(run.Rax == 0x5A5A5A5A5A5A5A5Aull && run.Rcx == 0x1122334455667788ull && (run.Flags & 0x8D5) == (0x8D7 & 0x8D5), "SHA-1 stub changed a general register or RFLAGS");
+            require(run.Rax == rax && run.Rcx == 0x1122334455667788ull && (run.Flags & 0x8D5) == (0x8D7 & 0x8D5), "SHA-1 stub changed a general register or RFLAGS");
         }
     }
 }

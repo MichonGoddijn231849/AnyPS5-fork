@@ -58,7 +58,7 @@ MemoryOperand DecodeMemoryOperand(const std::uint8_t* data, const std::size_t le
     if (modRmOffset >= length)
         throw CodegenException("Memory operand truncated before its ModRM byte");
     const auto modrm = data[modRmOffset];
-    MemoryOperand operand{std::move(prefixes), static_cast<std::uint8_t>(rex & (kRexX | kRexB)), static_cast<std::uint8_t>((modrm >> ModRmModShift) & ModRmModMask), static_cast<std::uint8_t>(modrm & ModRmRmMask), 0, 0, false};
+    MemoryOperand operand{std::move(prefixes), static_cast<std::uint8_t>(rex & (kRexX | kRexB)), static_cast<std::uint8_t>((modrm >> ModRmModShift) & ModRmModMask), static_cast<std::uint8_t>(modrm & ModRmRmMask), 0, 0, false, 0};
     if (operand.Mod == ModRmModRegister)
         throw CodegenException("Register operand where a memory operand was expected");
     if (operand.Mod == ModRmModIndirect && operand.Rm == ModRmRmRipRelative)
@@ -73,6 +73,7 @@ MemoryOperand DecodeMemoryOperand(const std::uint8_t* data, const std::size_t le
     const auto size = _displacementSize(operand.Mod, operand.Rm, operand.Sib);
     if (pos + size > length)
         throw CodegenException("Memory operand truncated in its displacement");
+    operand.EncodedSize = pos + size - modRmOffset;
     if (size == Disp8Size)
         operand.Displacement = static_cast<std::int8_t>(data[pos]);
     for (std::size_t index = 0; size == Disp32Size && index < size; ++index)

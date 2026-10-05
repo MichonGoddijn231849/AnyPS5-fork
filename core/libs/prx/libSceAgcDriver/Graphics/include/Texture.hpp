@@ -311,6 +311,27 @@ private:
     // The windows moving the surface-relative runs: whole tile blocks of thin tiled mips, a tail
     // mip whole (its block holds every tail level), in slice order.
     std::vector<SliceWindow> sliceWindows(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) const;
+    // The bytes of the surface-relative runs no element of the surface holds (the padding of partly
+    // covered tile blocks and of linear rows, tail blocks, the bytes between mips; every byte of a
+    // thick surface), ascending: a write-back keeps the guest's bytes there.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> uncoveredBytes(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) const;
+    // The seed of a write-back's tiled scratch where its copies would carry bytes no element holds:
+    // those bytes' current contents (a fresh unit shadow's, else the import's), copied into the
+    // scratch before the retile, so the copies out of the scratch store them unchanged. `copied`
+    // lists the surface-relative [begin, end) ranges the write-back copies out of the scratch, each
+    // with the scratch offset of its begin.
+    struct CopiedBytes {
+        std::uint64_t begin;
+        std::uint64_t end;
+        std::uint64_t scratch;
+    };
+    struct PaddingSeeds {
+        std::vector<std::pair<VkBuffer, std::vector<VkBufferCopy>>> copies;
+        std::vector<std::shared_ptr<ShadowSlab>> slabs;
+        // Guest ranges read from the import.
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> importReads;
+    };
+    PaddingSeeds paddingSeeds(const HostImport& import, std::vector<CopiedBytes> copied) const;
     // The direct upload and GPU-direct write-back of the runs through their windows (block units);
     // both return the bytes moved. The upload reads each unit from its unit shadow while fresh,
     // else from the import (`discard`: the image has no layout yet, a whole-surface first upload).

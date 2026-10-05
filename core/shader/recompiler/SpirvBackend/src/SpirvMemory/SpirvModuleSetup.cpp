@@ -123,6 +123,9 @@ void DefineModule(SpirvEmitterState& state) {
         state.module.EmitCapability(spv::CapabilityInt64);
         state.module.EmitCapability(spv::CapabilityInt64Atomics);
     }
+    if (state.requirements.sharedInt64Atomics) {
+        state.module.EmitCapability(spv::CapabilityInt64);
+    }
     if (state.clipDistanceVariable != 0) {
         state.module.EmitCapability(spv::CapabilityClipDistance);
     }

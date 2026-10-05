@@ -156,6 +156,17 @@ void _emitMessage2(StubBodyBuilder& body, const Sha1Operands& operands) {
 }
 
 void Sha1Lowering::EmitOutOfLine(StubBodyBuilder& body, const Sha1Operands& operands) const {
+    if (operands.Memory) {
+        auto loaded = operands;
+        loaded.Memory.reset();
+        loaded.Source = loaded.Destination;
+        loaded.Source = _scratch<1>(loaded)[0];
+        body.Spill(loaded.Source);
+        body.Load(loaded.Source, *operands.Memory);
+        EmitOutOfLine(body, loaded);
+        body.Restore(loaded.Source);
+        return;
+    }
     switch (operands.Operation) {
     case Sha1Operation::Rnds4:
         _emitRounds(body, operands);

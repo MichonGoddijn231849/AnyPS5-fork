@@ -170,6 +170,16 @@ if(BUILD_TESTING)
     add_test(NAME host_thread_local COMMAND host_thread_local_tests)
     set_tests_properties(host_thread_local PROPERTIES TIMEOUT 15)
 
+    add_test_executable(guest_np_cpp_web_api_intrusive_ptr_tests tests/GuestNpCppWebApiIntrusivePtr.cpp)
+    target_include_directories(guest_np_cpp_web_api_intrusive_ptr_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_np_cpp_web_api_intrusive_ptr_tests PRIVATE libSceNpCppWebApi libc)
+    configure_windows_unwind(guest_np_cpp_web_api_intrusive_ptr_tests)
+    add_test(NAME guest_np_cpp_web_api_intrusive_ptr COMMAND guest_np_cpp_web_api_intrusive_ptr_tests)
+    if(WIN32)
+        set_tests_properties(guest_np_cpp_web_api_intrusive_ptr PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceNpCppWebApi>")
+    endif()
+
     add_test_executable(savedata_core_write_replacement_tests tests/SaveDataWriteReplacement.cpp)
     target_include_directories(savedata_core_write_replacement_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(savedata_core_write_replacement_tests PRIVATE libSceSaveData)

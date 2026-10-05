@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
+#include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include "IntermediateRepresentation/IrValue.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
@@ -159,8 +160,9 @@ std::uint32_t EmitF32ToU32(SpirvEmitterState& state, std::uint32_t src, bool sig
     return Select(state, TypeU32(state), zero, ConstantU32(state, 0u), high);
 }
 
-std::uint32_t EmitDppWriteCondition(SpirvValueEmitContext& ctx, const DppMoveFlags& flags, std::uint32_t exec) {
+std::uint32_t EmitDppWriteCondition(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
+    const auto flags = inst.Flags<DppMoveFlags>();
     const auto lane = EmitSubgroupLocalInvocationId(state);
     const auto bankShift = state.module.AllocateId();
     const auto rowShift = state.module.AllocateId();
@@ -190,9 +192,13 @@ std::uint32_t EmitDppWriteCondition(SpirvValueEmitContext& ctx, const DppMoveFla
         const auto bounded = state.module.AllocateId();
         state.module.AddFunction(spv::OpLogicalAnd, TypeBool(state), bounded, writable, target.valid);
         writable = bounded;
+        if (!flags.fetchInactive && (flags.control & DppMoveFlags::Lanes8) == 0u) {
+            const auto sourceActive = EmitBallotLaneActiveBool(state, ctx.Ballot(inst.Argument(2)), target.lane);
+            writable = Binary(state, spv::OpLogicalAnd, TypeBool(state), writable, sourceActive);
+        }
     }
     const auto result = state.module.AllocateId();
-    state.module.AddFunction(spv::OpLogicalAnd, TypeBool(state), result, exec, writable);
+    state.module.AddFunction(spv::OpLogicalAnd, TypeBool(state), result, ctx.Arg(inst, 2), writable);
     return result;
 }
 
@@ -201,10 +207,11 @@ std::uint32_t EmitDsMaskedLaneRead(SpirvEmitterState& state, std::uint32_t sourc
     if (state.laneCount == 2) {
         lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, 31u));
     }
+    const auto physicalLane = EmitHostSubgroupLane(state, lane);
     const auto shuffled = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), shuffled, ConstantU32(state, spv::ScopeSubgroup), source, lane);
+    state.module.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), shuffled, ConstantU32(state, spv::ScopeSubgroup), source, physicalLane);
     const auto sourceExec = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformShuffle, TypeBool(state), sourceExec, ConstantU32(state, spv::ScopeSubgroup), exec, lane);
+    state.module.AddFunction(spv::OpGroupNonUniformShuffle, TypeBool(state), sourceExec, ConstantU32(state, spv::ScopeSubgroup), exec, physicalLane);
     const auto sourceActive = Binary(state, spv::OpLogicalAnd, TypeBool(state), sourceExec, EmitSubgroupLaneActiveBool(state, lane));
     return Select(state, TypeU32(state), sourceActive, shuffled, ConstantU32(state, 0u));
 }
@@ -249,7 +256,10 @@ std::uint32_t EmitPackFloat2x16Rtz(SpirvEmitterState& state, std::uint32_t arg0,
 }
 
 std::uint32_t EmitFPSaturate32(SpirvEmitterState& state, std::uint32_t arg0) {
-    return EmitExt(state, TypeF32(state), GLSLstd450FClamp, {arg0, ConstantF32(state, 0u), ConstantF32(state, 0x3f800000u)});
+    const auto bits = Unary(state, spv::OpBitcast, TypeU32(state), arg0);
+    const auto positive = Binary(state, spv::OpULessThan, TypeBool(state), Binary(state, spv::OpISub, TypeU32(state), bits, ConstantU32(state, 1u)), ConstantU32(state, 0x7f800000u));
+    const auto upper = EmitExt(state, TypeU32(state), GLSLstd450UMin, {bits, ConstantU32(state, 0x3f800000u)});
+    return Unary(state, spv::OpBitcast, TypeF32(state), Select(state, TypeU32(state), positive, upper, ConstantU32(state, 0u)));
 }
 
 std::uint32_t EmitIAdd64(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
@@ -458,11 +468,6 @@ std::uint32_t EmitFPLog2(SpirvEmitterState& state, std::uint32_t arg0) {
     return EmitExt(state, TypeF32(state), GLSLstd450Log2, {EmitFlushF32DenormToSignedZero(state, arg0)});
 }
 
-std::uint32_t EmitFPLdexp(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
-    const auto exponent = Unary(state, spv::OpBitcast, TypeI32(state), arg1);
-    return EmitExt(state, TypeF32(state), GLSLstd450Ldexp, {arg0, exponent});
-}
-
 std::uint32_t EmitFPSin(SpirvEmitterState& state, std::uint32_t arg0) {
     const auto cycle = EmitTrigCycleF32(state, arg0, true);
     const auto source = Binary(state, spv::OpFMul, TypeF32(state), cycle, ConstantF32(state, 0x40c90fdbu));
@@ -491,7 +496,7 @@ std::uint32_t EmitDppMoveU32(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const auto target = EmitDppTargetLane(state, flags.control);
     const auto shuffled = ctx.Shuffle(inst, 0, target.lane);
     if (flags.fetchInactive) {
-        return shuffled;
+        return EmitNative<spv::OpSelect, IrType::U32>(state, target.valid, shuffled, ConstantU32(state, 0u));
     }
     const auto ballot = ctx.Ballot(inst.Argument(1));
     const auto sourceActive = EmitBallotLaneActiveBool(state, ballot, target.lane);
@@ -501,8 +506,7 @@ std::uint32_t EmitDppMoveU32(SpirvValueEmitContext& ctx, const IrValue& inst) {
 }
 
 std::uint32_t EmitDppUpdateU32(SpirvValueEmitContext& ctx, const IrValue& inst) {
-    const auto flags = inst.Flags<DppMoveFlags>();
-    const auto write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
+    const auto write = EmitDppWriteCondition(ctx, inst);
     return EmitNative<spv::OpSelect, IrType::U32>(ctx.state, write, ctx.Arg(inst, 0), ctx.Arg(inst, 1));
 }
 
@@ -589,7 +593,7 @@ std::uint32_t EmitPermlane16U32(SpirvValueEmitContext& ctx, const IrValue& inst)
     }
     const auto sourceExec = ctx.Shuffle(inst, 3, target);
     const auto result = state.module.AllocateId();
-    state.module.AddFunction(spv::OpSelect, TypeU32(state), result, sourceExec, shuffled, ConstantU32(state, 0u));
+    state.module.AddFunction(spv::OpSelect, TypeU32(state), result, sourceExec, shuffled, flags.boundControl ? ConstantU32(state, 0u) : ctx.Arg(inst, 4));
     return result;
 }
 
@@ -948,14 +952,6 @@ std::uint32_t EmitPackHalf2x16(SpirvEmitterState& state, std::uint32_t arg0) {
     };
     const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), component(1u), ConstantU32(state, 16u));
     return Binary(state, spv::OpBitwiseOr, TypeU32(state), component(0u), high);
-}
-
-std::uint32_t EmitPackSnorm2x16(SpirvEmitterState& state, std::uint32_t arg0) {
-    return EmitGlsl<GLSLstd450PackSnorm2x16, IrType::U32>(state, arg0);
-}
-
-std::uint32_t EmitPackUnorm2x16(SpirvEmitterState& state, std::uint32_t arg0) {
-    return EmitGlsl<GLSLstd450PackUnorm2x16, IrType::U32>(state, arg0);
 }
 
 std::uint32_t EmitFPFma32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {

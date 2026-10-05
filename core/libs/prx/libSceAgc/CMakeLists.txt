@@ -72,6 +72,7 @@ configure_windows_unwind(libSceAgc)
 add_test_executable(agc_register_command_tests EXCLUDE_FROM_ALL
         tests/RegisterCommands.cpp
         Command/src/Packet.cpp
+        Cb/src/Registers.cpp
         DcbState/src/Registers.cpp
         Patch/src/IndirectRegisters.cpp
 )
@@ -83,6 +84,24 @@ if(BUILD_TESTING)
     add_test(NAME agc_register_command_tests COMMAND agc_register_command_tests)
     if(WIN32)
         set_tests_properties(agc_register_command_tests PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_branch_patch_tests EXCLUDE_FROM_ALL
+        tests/BranchPatch.cpp
+        Command/src/Packet.cpp
+        Cb/src/Branch.cpp
+        Patch/src/Branch.cpp
+)
+target_include_directories(agc_branch_patch_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_branch_patch_tests PRIVATE libc)
+configure_windows_unwind(agc_branch_patch_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_branch_patch_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_branch_patch_tests COMMAND agc_branch_patch_tests)
+    if(WIN32)
+        set_tests_properties(agc_branch_patch_tests PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -110,6 +129,45 @@ if(BUILD_TESTING)
     add_test(NAME guest_shader_link COMMAND guest_shader_link_tests)
     if(WIN32)
         set_tests_properties(guest_shader_link PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_dma_data_tests EXCLUDE_FROM_ALL
+        tests/DmaData.cpp
+        Command/src/Packet.cpp
+        Command/src/Memory.cpp
+        Acb/src/Memory.cpp
+        DcbFlow/src/Memory.cpp
+)
+target_include_directories(agc_dma_data_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_dma_data_tests PRIVATE libc)
+configure_windows_unwind(agc_dma_data_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_dma_data_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_dma_data_tests COMMAND agc_dma_data_tests)
+    if(WIN32)
+        set_tests_properties(agc_dma_data_tests PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_prime_utcl2_tests EXCLUDE_FROM_ALL
+        tests/PrimeUtcl2.cpp
+        Command/src/Packet.cpp
+        Command/src/Memory.cpp
+        Acb/src/Memory.cpp
+        DcbFlow/src/Memory.cpp
+        DcbState/src/Display.cpp
+)
+target_include_directories(agc_prime_utcl2_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_prime_utcl2_tests PRIVATE libc)
+configure_windows_unwind(agc_prime_utcl2_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_prime_utcl2_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_prime_utcl2_tests COMMAND agc_prime_utcl2_tests)
+    if(WIN32)
+        set_tests_properties(agc_prime_utcl2_tests PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

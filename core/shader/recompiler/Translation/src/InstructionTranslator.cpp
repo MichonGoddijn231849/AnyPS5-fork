@@ -153,6 +153,10 @@ void includeInstructionVectorRegisters(const RdnaInstruction& instruction, std::
     includeVector(instruction.source1);
     includeVector(instruction.source2);
     includeVector(instruction.source3);
+    if (instruction.family == RdnaInstructionFamily::FLAT) {
+        const bool compare = instruction.op == RdnaOpcode::FlatAtomicCmpswap || instruction.op == RdnaOpcode::FlatAtomicCmpswapX2 || instruction.op == RdnaOpcode::FlatAtomicFcmpswap || instruction.op == RdnaOpcode::FlatAtomicFcmpswapX2;
+        includeVector(instruction.source2, std::max(instruction.dataDwordCount, 1u) * (compare ? 2u : 1u));
+    }
     if (instruction.family == RdnaInstructionFamily::DS) {
         switch (instruction.op) {
         case RdnaOpcode::DsWriteB64:

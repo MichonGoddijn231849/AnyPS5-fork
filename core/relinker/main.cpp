@@ -80,8 +80,8 @@ int main(const int argc, char* argv[]) {
         );
 
         std::cout << "System: " << (args.toWindows ? "Windows" : "Linux") << "; unused-filter=" << args.unusedFilterLevel << "\n";
-        std::cout << "sce_module/sce_modules processing: " << (args.skipSceModule ? "disabled (--skip-sce-module)" : "enabled") << '\n';
-        for (const auto& name : args.excludedSceModules) std::cout << "sce_module excluded: " << name << '\n';
+        std::cout << "sce_module/sce_modules/prx processing: " << (args.skipSceModule ? "disabled (--skip-sce-module)" : "enabled") << '\n';
+        for (const auto& name : args.excludedSceModules) std::cout << "Guest module excluded: " << name << '\n';
         auto result = pipeline->Relink(sourceBytes);
         for (const auto& patch : result.Patches) {
             if (patch.Offset > sourceBytes.size() || patch.Bytes.size() > sourceBytes.size() - patch.Offset)
@@ -117,7 +117,13 @@ int main(const int argc, char* argv[]) {
             );
         }
 
-        const auto executableBytes = patcher->Patch(sourceBytes, result.OriginalHeaders, result.DynamicSection, result.OriginalPltGotVaddr, args.runPath, args.lazyBinding, args.windowsDiagnostics, trampolines);
+        std::vector<std::uint8_t> executableBytes;
+        try {
+            executableBytes = patcher->Patch(sourceBytes, result.OriginalHeaders, result.DynamicSection, result.OriginalPltGotVaddr, args.runPath, args.lazyBinding, args.windowsDiagnostics, trampolines);
+        } catch (Domain::RelinkerException& error) {
+            error.InputPath = args.inputPath;
+            throw;
+        }
         for (const auto& artifact : guestArtifacts) {
             std::filesystem::create_directories(artifact.Path.parent_path());
             fileWriter.Write(artifact.Path.string(), artifact.Bytes);
@@ -128,10 +134,8 @@ int main(const int argc, char* argv[]) {
         std::cout << "Expected runtime layout (relative to the output executable):\n"
                   << std::filesystem::path(absPath).filename().string() << "\n"
                   << "libs/\n    *.prx\napp0/\n    <game resources>\n";
-        if (!guestArtifacts.empty()) {
-            std::cout << "    " << guestArtifacts.front().Path.parent_path().filename().string() << "/\n";
-            for (const auto& artifact : guestArtifacts) std::cout << "        " << artifact.Path.filename().string() << '\n';
-        }
+        for (const auto& artifact : guestArtifacts)
+            std::cout << "    " << artifact.Path.parent_path().filename().string() << "/" << artifact.Path.filename().string() << '\n';
         std::cout << "Game resources and system libraries must be placed in this layout separately.\n";
         if (args.runPath != "$ORIGIN/libs") std::cout << "Custom library search path (--rpath): " << args.runPath << '\n';
 
@@ -141,6 +145,7 @@ int main(const int argc, char* argv[]) {
         std::cerr << "FAIL: " << e.what();
         if (e.FailureOffset != 0) std::cerr << " (offset 0x" << std::hex << e.FailureOffset << ")";
         std::cerr << "\n";
+        if (!e.InputPath.empty()) std::cerr << "Input: " << e.InputPath << '\n';
         return 2;
     } catch (const Codegen::CodegenException& e) {
         std::cerr << "FAIL: " << e.what();

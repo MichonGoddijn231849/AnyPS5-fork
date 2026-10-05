@@ -52,6 +52,7 @@ struct ColorTarget {
     std::uint64_t cmaskAddress = 0;
     std::uint32_t depth = 1;
     std::uint32_t depthSlice = 0;
+    std::uint32_t exportIndex = 0;
 };
 
 struct DepthTarget {
@@ -117,6 +118,8 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
 // this precheck covers, evaluated without exceptions before the draw is decoded; empty when they
 // pass (DecodeState still checks everything). A register a rule needs that is absent is no verdict.
 std::string DrawRejection(const QueueState& queue, bool indexed);
+bool PixelProgramUnset(const QueueState& queue);
+std::string NullPixelProgramRejection(const QueueState& queue);
 
 // The recording facade of the draw decoders (design_cpu_final M8, step 8a): every register read
 // of DecodeShaderStages, DecodeState, DrawRejection, DecodePixelStageInfo and Driver::draw's
