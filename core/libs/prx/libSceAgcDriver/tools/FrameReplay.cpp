@@ -63,6 +63,8 @@ struct Options {
     bool pngAllLoops = false;
     bool deltaMerge = true;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> dumpRanges;
+    // --dump-bvh DIR: every PSR_BVHL blob in guest memory at the end of the first loop.
+    std::optional<std::filesystem::path> dumpBvh;
     std::optional<std::filesystem::path> compare;
     bool pacing = true;
     bool settle = false;
@@ -706,6 +708,10 @@ public:
                 ReplaySettle();
                 dumpRanges("end");
             }
+            if (options.dumpBvh.has_value() && loop == 0) {
+                ReplaySettle();
+                dumpBvhs();
+            }
             const auto replayMs = std::chrono::duration<double, std::milli>(Clock::now() - replayStarted).count();
             const auto setupMs = std::chrono::duration<double, std::milli>(replayStarted - started).count();
             const auto frames = presenter->Presented() - presentedBefore;
@@ -1022,6 +1028,62 @@ private:
         }
     }
 
+    // --dump-bvh: scans the committed readable pages of every registered range for the RDNA BVH
+    // header ("PSR_BVHL" at a 256-byte boundary, size at +0x10) and writes each blob whole into
+    // DIR/bvh_<address>_<bytes>.bin, with an index (blobs.txt) of address, size and header words.
+    static bool committedReadable(std::uint64_t address, std::uint64_t bytes) {
+        for (auto cursor = address; cursor < address + bytes;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), &info, sizeof(info)) == 0) return false;
+            if (info.State != MEM_COMMIT || (info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) == 0 || (info.Protect & PAGE_GUARD) != 0) return false;
+            cursor = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        }
+        return true;
+    }
+
+    void dumpBvhs() {
+        std::filesystem::create_directories(*options.dumpBvh);
+        std::ofstream index(*options.dumpBvh / "blobs.txt");
+        std::size_t count = 0;
+        std::uint64_t total = 0;
+        for (const auto& range : space.Registry()) {
+            if (!range.readable) continue;
+            std::uint64_t cursor = range.address;
+            const auto end = range.address + range.bytes;
+            while (cursor < end) {
+                MEMORY_BASIC_INFORMATION info{};
+                if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), &info, sizeof(info)) == 0) break;
+                const auto regionEnd = std::min<std::uint64_t>(end, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize);
+                const bool readable = info.State == MEM_COMMIT && (info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0 && (info.Protect & PAGE_GUARD) == 0;
+                if (readable) {
+                    for (auto at = (cursor + 255u) & ~std::uint64_t{255u}; at + 0x80 <= regionEnd; at += 256u) {
+                        const auto* bytes = reinterpret_cast<const char*>(static_cast<std::uintptr_t>(at));
+                        if (std::memcmp(bytes, "PSR_BVHL", 8) != 0) continue;
+                        std::uint64_t size = 0;
+                        std::memcpy(&size, bytes + 0x10, sizeof(size));
+                        if (size < 0x80 || size > (1ull << 30u) || at + size > end || !committedReadable(at, size)) continue;
+                        AgcDriver::GuestMemory::FlushGpuWrites(at, static_cast<std::size_t>(size));
+                        char name[96];
+                        std::snprintf(name, sizeof(name), "bvh_%llx_%llx.bin", static_cast<unsigned long long>(at), static_cast<unsigned long long>(size));
+                        std::ofstream(*options.dumpBvh / name, std::ios::binary).write(bytes, static_cast<std::streamsize>(size));
+                        index << std::hex << "0x" << at << " 0x" << size;
+                        for (std::uint32_t word = 0; word < 0x80; word += 8) {
+                            std::uint64_t value = 0;
+                            std::memcpy(&value, bytes + word, sizeof(value));
+                            index << " " << value;
+                        }
+                        index << "\n";
+                        ++count;
+                        total += size;
+                        at += (size - 1u) & ~std::uint64_t{255u};
+                    }
+                }
+                cursor = regionEnd;
+            }
+        }
+        std::fprintf(stderr, "[replay] --dump-bvh: %zu blobs (%.1f MiB) into %s\n", count, total / 1048576.0, options.dumpBvh->string().c_str());
+    }
+
     bool drain() {
         std::optional<Clock::time_point> stalledAt;
         for (;;) {
@@ -1220,6 +1282,7 @@ Options ParseOptions(int argc, char** argv) {
             if (colon == std::string::npos) Fail("--dump-range takes <hex address>:<hex bytes>");
             options.dumpRanges.emplace_back(std::stoull(text.substr(0, colon), nullptr, 16), std::stoull(text.substr(colon + 1), nullptr, 16));
         }
+        else if (argument == "--dump-bvh") options.dumpBvh = std::filesystem::path(value());
         else if (argument == "--settle") options.settle = true;
         else if (argument == "--hidden") options.hidden = true;
         else if (argument == "--shader-cache") options.shaderCache = value();
