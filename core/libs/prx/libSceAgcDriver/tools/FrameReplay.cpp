@@ -9,7 +9,7 @@
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <SDL_vulkan.h>
-#include <windows.h>
+#include "ReplayPlatform.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -73,6 +73,8 @@ struct Options {
     bool restoreCollect = true;
     std::optional<std::filesystem::path> shaderCache;
     std::uint32_t cold = 0;
+    // --summary: list what the capture holds and exit, without a device or guest memory.
+    bool summary = false;
 };
 
 struct Event {
@@ -105,24 +107,9 @@ public:
             cursor += static_cast<std::size_t>(header.bytes);
         }
         if (events.empty() || events.back().type != EventType::End) Fail("the capture has no End event: it failed or did not finish (see capture.txt)");
-        const auto pagesPath = (directory / "pages.bin").wstring();
-        file = CreateFileW(pagesPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file == INVALID_HANDLE_VALUE) Fail("cannot open pages.bin");
-        LARGE_INTEGER size{};
-        if (!GetFileSizeEx(file, &size)) Fail("cannot size pages.bin");
-        pageCount = static_cast<std::uint64_t>(size.QuadPart) / PageBytes;
-        if (pageCount != 0) {
-            mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
-            if (mapping == nullptr) Fail("cannot map pages.bin");
-            pages = static_cast<const std::byte*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
-            if (pages == nullptr) Fail("cannot map a view of pages.bin");
-        }
-    }
-
-    ~CaptureFile() {
-        if (pages != nullptr) UnmapViewOfFile(pages);
-        if (mapping != nullptr) CloseHandle(mapping);
-        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        pagesFile.emplace(directory / "pages.bin");
+        pageCount = pagesFile->Size() / PageBytes;
+        pages = pagesFile->Data();
     }
 
     CaptureFile(const CaptureFile&) = delete;
@@ -134,20 +121,21 @@ public:
         return pages + static_cast<std::uint64_t>(index) * PageBytes;
     }
 
+    std::uint64_t PageCount() const { return pageCount; }
+
     std::vector<Event> events;
 
 private:
     std::vector<std::byte> bytes;
-    HANDLE file = INVALID_HANDLE_VALUE;
-    HANDLE mapping = nullptr;
+    std::optional<ReplayPlatform::MappedFile> pagesFile;
     const std::byte* pages = nullptr;
     std::uint64_t pageCount = 0;
 };
 
-DWORD Protection(const Piece& piece) {
-    if (piece.readable && piece.writable) return PAGE_READWRITE;
-    if (piece.readable) return PAGE_READONLY;
-    return PAGE_NOACCESS;
+ReplayPlatform::Protection Protection(const Piece& piece) {
+    if (piece.readable && piece.writable) return ReplayPlatform::ReadWrite();
+    if (piece.readable) return ReplayPlatform::ReadOnly();
+    return ReplayPlatform::NoAccess();
 }
 
 bool PieceLess(const Piece& a, const Piece& b) {
@@ -161,13 +149,13 @@ bool RegistryLess(const RegistryRange& a, const RegistryRange& b) {
 class GuestSpace {
 public:
     ~GuestSpace() {
-        for (const auto& [id, section] : sections) CloseHandle(section);
+        for (const auto& [id, section] : sections) ReplayPlatform::CloseSection(section);
     }
 
     void Apply(std::span<const Backing> backings, std::span<const Piece> removed, std::span<const Piece> added, std::span<const RegistryRange> registryRemoved, std::span<const RegistryRange> registryAdded) {
         for (const auto& backing : backings) {
             if (sections.contains(backing.id)) continue;
-            const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, static_cast<DWORD>(backing.bytes >> 32u), static_cast<DWORD>(backing.bytes), nullptr);
+            const auto section = ReplayPlatform::CreateSection(backing.bytes);
             if (section == nullptr) Fail("cannot create a direct memory section of " + Hex(backing.bytes) + " bytes");
             sections.emplace(backing.id, section);
         }
@@ -183,7 +171,7 @@ public:
         reserveExternal(external);
         for (const auto& piece : added) {
             map(piece);
-            if (Protection(piece) != PAGE_READWRITE) pendingProtections.push_back(piece);
+            if (Protection(piece) != ReplayPlatform::ReadWrite()) pendingProtections.push_back(piece);
         }
         {
             GuestAllocations::Mutation mutation;
@@ -230,10 +218,10 @@ public:
             return;
         }
         const auto page = address & ~(ViewBytes - 1);
-        DWORD protection;
-        if (!VirtualProtect(reinterpret_cast<void*>(page), ViewBytes, PAGE_READWRITE, &protection)) Fail("cannot open read-only guest page " + Hex(page) + " for a capture write");
+        ReplayPlatform::Protection protection;
+        if (!ReplayPlatform::Protect(reinterpret_cast<void*>(page), ViewBytes, ReplayPlatform::ReadWrite(), &protection)) Fail("cannot open read-only guest page " + Hex(page) + " for a capture write");
         store();
-        if (!VirtualProtect(reinterpret_cast<void*>(page), ViewBytes, protection, &protection)) Fail("cannot restore guest page protection at " + Hex(page));
+        if (!ReplayPlatform::Protect(reinterpret_cast<void*>(page), ViewBytes, protection, &protection)) Fail("cannot restore guest page protection at " + Hex(page));
     }
 
     const std::vector<Piece>& Pieces() const { return pieces; }
@@ -287,15 +275,15 @@ private:
         }
         for (const auto& [begin, end] : merged) {
             for (auto cursor = begin; cursor < end;) {
-                MEMORY_BASIC_INFORMATION memory{};
-                if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) Fail("cannot query the replay address space at " + Hex(cursor));
-                const auto stop = std::min<std::uint64_t>(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
-                if (memory.State == MEM_FREE) {
-                    if (VirtualAlloc(reinterpret_cast<void*>(cursor), static_cast<SIZE_T>(stop - cursor), MEM_RESERVE, PAGE_NOACCESS) == nullptr) Fail("cannot reserve the captured image range " + Hex(cursor) + "-" + Hex(stop) + " (the replay process already uses it)");
-                } else if (memory.Type != MEM_PRIVATE || externalReserved.find(reinterpret_cast<std::uintptr_t>(memory.AllocationBase)) == externalReserved.end()) {
+                ReplayPlatform::Region memory;
+                if (!ReplayPlatform::Query(reinterpret_cast<const void*>(cursor), memory)) Fail("cannot query the replay address space at " + Hex(cursor));
+                const auto stop = std::min<std::uint64_t>(end, memory.base + memory.bytes);
+                if (memory.free) {
+                    if (!ReplayPlatform::Reserve(reinterpret_cast<void*>(cursor), static_cast<std::size_t>(stop - cursor))) Fail("cannot reserve the captured image range " + Hex(cursor) + "-" + Hex(stop) + " (the replay process already uses it)");
+                } else if (!memory.privateMemory || externalReserved.find(memory.allocationBase) == externalReserved.end()) {
                     Fail("captured image range " + Hex(cursor) + "-" + Hex(stop) + " collides with memory of the replay process (a DLL?)");
                 }
-                externalReserved.insert(reinterpret_cast<std::uintptr_t>(memory.State == MEM_FREE ? reinterpret_cast<void*>(cursor) : memory.AllocationBase));
+                externalReserved.insert(memory.free ? static_cast<std::uintptr_t>(cursor) : memory.allocationBase);
                 cursor = stop;
             }
         }
@@ -305,16 +293,16 @@ private:
         auto* pointer = reinterpret_cast<void*>(piece.address);
         const auto bytes = static_cast<std::size_t>(piece.bytes);
         if (piece.kind == PieceKind::External) {
-            if (VirtualAlloc(pointer, bytes, MEM_COMMIT, PAGE_READWRITE) == nullptr) Fail("cannot commit the captured image range " + Hex(piece.address));
+            if (!ReplayPlatform::Commit(pointer, bytes)) Fail("cannot commit the captured image range " + Hex(piece.address));
             return;
         }
         GuestArena::GuestArenaMarkUsed_nid_postfix(pointer, bytes);
         if (piece.kind == PieceKind::Direct) {
             const auto section = sections.find(piece.backing);
             if (section == sections.end()) Fail("capture maps an unknown direct memory backing");
-            GuestArena::GuestArenaMap_nid_postfix(pointer, bytes, section->second, piece.backingOffset, PAGE_READWRITE);
+            ReplayPlatform::ArenaMap(pointer, bytes, section->second, piece.backingOffset);
         } else if (piece.readable || piece.writable) {
-            GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, PAGE_READWRITE, ViewBytes);
+            ReplayPlatform::ArenaCommit(pointer, bytes, ViewBytes);
         }
     }
 
@@ -323,25 +311,25 @@ private:
         const auto bytes = static_cast<std::size_t>(piece.bytes);
         std::erase(pendingProtections, piece);
         if (piece.kind == PieceKind::External) {
-            if (!VirtualFree(pointer, bytes, MEM_DECOMMIT)) Fail("cannot decommit the captured image range " + Hex(piece.address));
+            if (!ReplayPlatform::Decommit(pointer, bytes)) Fail("cannot decommit the captured image range " + Hex(piece.address));
             return;
         }
-        GuestArena::GuestArenaReset_nid_postfix(pointer, bytes);
+        ReplayPlatform::ArenaReset(pointer, bytes);
         GuestArena::GuestArenaRelease_nid_postfix(pointer, bytes);
     }
 
-    void protect(const Piece& piece, DWORD protection) {
+    void protect(const Piece& piece, ReplayPlatform::Protection protection) {
         if (piece.kind == PieceKind::Private && !piece.readable && !piece.writable) return;
         const auto step = piece.kind == PieceKind::External ? piece.bytes : ViewBytes;
         for (auto cursor = piece.address; cursor < piece.address + piece.bytes; cursor += step) {
-            DWORD previous;
+            ReplayPlatform::Protection previous;
             const auto bytes = std::min<std::uint64_t>(step, piece.address + piece.bytes - cursor);
-            if (!VirtualProtect(reinterpret_cast<void*>(cursor), static_cast<SIZE_T>(bytes), protection, &previous)) Fail("cannot protect guest memory at " + Hex(cursor));
+            if (!ReplayPlatform::Protect(reinterpret_cast<void*>(cursor), static_cast<std::size_t>(bytes), protection, &previous)) Fail("cannot protect guest memory at " + Hex(cursor));
         }
-        if (piece.kind == PieceKind::Direct) GuestArena::GuestArenaSetProtection_nid_postfix(piece.address, static_cast<std::size_t>(piece.bytes), protection);
+        if (piece.kind == PieceKind::Direct) ReplayPlatform::ArenaSetProtection(piece.address, static_cast<std::size_t>(piece.bytes), protection);
     }
 
-    std::map<std::uint32_t, HANDLE> sections;
+    std::map<std::uint32_t, ReplayPlatform::Section> sections;
     std::vector<Piece> pieces;
     std::vector<RegistryRange> registry;
     std::vector<Piece> pendingProtections;
@@ -1035,10 +1023,10 @@ private:
     // DIR/bvh_<address>_<bytes>.bin, with an index (blobs.txt) of address, size and header words.
     static bool committedReadable(std::uint64_t address, std::uint64_t bytes) {
         for (auto cursor = address; cursor < address + bytes;) {
-            MEMORY_BASIC_INFORMATION info{};
-            if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), &info, sizeof(info)) == 0) return false;
-            if (info.State != MEM_COMMIT || (info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) == 0 || (info.Protect & PAGE_GUARD) != 0) return false;
-            cursor = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+            ReplayPlatform::Region info;
+            if (!ReplayPlatform::Query(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), info)) return false;
+            if (!info.readable) return false;
+            cursor = info.base + info.bytes;
         }
         return true;
     }
@@ -1053,10 +1041,10 @@ private:
             std::uint64_t cursor = range.address;
             const auto end = range.address + range.bytes;
             while (cursor < end) {
-                MEMORY_BASIC_INFORMATION info{};
-                if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), &info, sizeof(info)) == 0) break;
-                const auto regionEnd = std::min<std::uint64_t>(end, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize);
-                const bool readable = info.State == MEM_COMMIT && (info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0 && (info.Protect & PAGE_GUARD) == 0;
+                ReplayPlatform::Region info;
+                if (!ReplayPlatform::Query(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), info)) break;
+                const auto regionEnd = std::min<std::uint64_t>(end, info.base + info.bytes);
+                const bool readable = info.readable;
                 if (readable) {
                     for (auto at = (cursor + 255u) & ~std::uint64_t{255u}; at + 0x80 <= regionEnd; at += 256u) {
                         const auto* bytes = reinterpret_cast<const char*>(static_cast<std::uintptr_t>(at));
@@ -1261,7 +1249,7 @@ std::uint32_t ParseCacheClasses(const std::string& list) {
 Options ParseOptions(int argc, char** argv) {
     Options options;
     const auto usage = [] {
-        Fail("usage: agc_frame_replay <capture dir> [--loop N] [--png DIR] [--png-scale N] [--png-all-loops] [--compare DIR] [--no-pacing] [--settle] [--hidden] [--shader-cache DIR] [--cold[=live|all|dispatch,draw,resources,textures,tables,space]]");
+        Fail("usage: agc_frame_replay <capture dir> [--loop N] [--png DIR] [--png-scale N] [--png-all-loops] [--compare DIR] [--no-pacing] [--settle] [--hidden] [--summary] [--shader-cache DIR] [--cold[=live|all|dispatch,draw,resources,textures,tables,space]]");
     };
     if (argc < 2) usage();
     for (int i = 1; i < argc; ++i) {
@@ -1288,6 +1276,7 @@ Options ParseOptions(int argc, char** argv) {
         else if (argument == "--dump-bvh") options.dumpBvh = std::filesystem::path(value());
         else if (argument == "--settle") options.settle = true;
         else if (argument == "--hidden") options.hidden = true;
+        else if (argument == "--summary") options.summary = true;
         else if (argument == "--shader-cache") options.shaderCache = value();
         else if (argument == "--cold") options.cold = CacheLive;
         else if (argument.starts_with("--cold=")) options.cold = ParseCacheClasses(argument.substr(7));
@@ -1301,30 +1290,33 @@ Options ParseOptions(int argc, char** argv) {
 
 }
 
-void DisablePowerThrottling() {
-    constexpr ULONG executionSpeed = 0x1;
-    constexpr ULONG ignoreTimerResolution = 0x4;
-    PROCESS_POWER_THROTTLING_STATE state{};
-    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-    state.ControlMask = executionSpeed | ignoreTimerResolution;
-    state.StateMask = 0;
-    if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state))) std::fprintf(stderr, "[replay] could not opt out of power throttling (error %lu); timings may vary\n", GetLastError());
+int Summarize(const CaptureFile& capture) {
+    static constexpr std::array<const char*, 14> Names{"?", "Begin", "AddressSpace", "Memory", "Progress", "Submit", "Suspend", "Shader", "QueueState", "DriverState", "VideoOutput", "Present", "End", "RewindTail"};
+    std::map<std::uint32_t, std::pair<std::size_t, std::uint64_t>> counts;
+    for (const auto& event : capture.events) {
+        auto& [count, bytes] = counts[static_cast<std::uint32_t>(event.type)];
+        ++count;
+        bytes += event.payload.size();
+    }
+    std::printf("%zu events, %llu pages in pages.bin\n", capture.events.size(), static_cast<unsigned long long>(capture.PageCount()));
+    for (const auto& [type, entry] : counts) std::printf("  %-12s %8zu events %12llu bytes\n", type < Names.size() ? Names[type] : "unknown", entry.first, static_cast<unsigned long long>(entry.second));
+    return 0;
 }
 
 int main(int argc, char** argv) {
     try {
-        DisablePowerThrottling();
+        ReplayPlatform::DisablePowerThrottling();
         const auto options = ParseOptions(argc, argv);
-        if (options.shaderCache && _wputenv_s(L"ANYPS5_SHADER_CACHE_DIR", options.shaderCache->wstring().c_str()) != 0) Fail("cannot set ANYPS5_SHADER_CACHE_DIR");
+        if (options.shaderCache && !ReplayPlatform::SetEnvironment("ANYPS5_SHADER_CACHE_DIR", *options.shaderCache)) Fail("cannot set ANYPS5_SHADER_CACHE_DIR");
         CaptureFile capture(options.capture);
+        if (options.summary) return Summarize(capture);
         Replayer replayer(options, capture);
         replayer.Run();
         int status = replayer.Stuck() || ReplayCommandMismatches() != 0 ? 2 : 0;
         if (options.png && options.compare) status = std::max(status, Compare(*options.png, *options.compare, replayer.Presents()));
         std::fflush(stdout);
         std::fflush(stderr);
-        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(status));
-        return status;
+        ReplayPlatform::Exit(status);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
         return 1;
