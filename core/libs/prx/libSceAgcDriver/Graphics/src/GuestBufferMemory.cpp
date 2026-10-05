@@ -1225,6 +1225,42 @@ void DropAddressSpaceCache() {
     Spaces().current.store(nullptr);
 }
 
+namespace {
+
+struct WatchedRanges {
+    std::mutex mutex;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::atomic<bool> any{false};
+};
+
+WatchedRanges& Watched() {
+    static WatchedRanges watched;
+    return watched;
+}
+
+void reportWatchedOverlap(const std::string& what, std::uint64_t begin, std::uint64_t end) {
+    auto& watched = Watched();
+    if (!watched.any.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(watched.mutex);
+    for (const auto& [from, to] : watched.ranges) {
+        if (begin < to && from < end) {
+            std::fprintf(stderr, "[bvh-copy] %s 0x%llx-0x%llx (%llu bytes) overlaps watched 0x%llx-0x%llx\n", what.c_str(), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(from), static_cast<unsigned long long>(to));
+        }
+    }
+}
+
+}
+
+void DebugWatchRange(std::uint64_t begin, std::uint64_t end) {
+    auto& watched = Watched();
+    std::lock_guard lock(watched.mutex);
+    for (const auto& range : watched.ranges) {
+        if (range.first == begin && range.second == end) return;
+    }
+    watched.ranges.emplace_back(begin, end);
+    watched.any.store(true, std::memory_order_release);
+}
+
 std::uint64_t RelieveGpuMemory(const Context& context) {
     if (GuestMemory::GpuMutex().HeldByThisThread()) return 0;
     const auto before = LiveGpuMemory();
@@ -2397,6 +2433,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             }
             // Exactly the sub-range the shader may write, in place in the import: what the shader
             // would have stored there itself had the range been bindable.
+            reportWatchedOverlap("copy-back (region 0x" + [&] { char t[112]; std::snprintf(t, sizeof(t), "%llx+0x%llx, staged %d, atomic %d, %llu past alignment", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end - region.begin), region.deviceLocal ? 1 : 0, region.atomic ? 1 : 0, static_cast<unsigned long long>((region.begin - region.copySourceBase) % context.limits.minStorageBufferOffsetAlignment)); return std::string(t); }() + ")", from, to);
             CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
             copiedBytes += to - from;
             recorder.Keep(region.buffer);

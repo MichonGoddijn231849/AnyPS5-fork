@@ -111,6 +111,7 @@ std::uint32_t EmitD16FormatComponent(SpirvEmitterState& state, const SpirvBuffer
 std::uint32_t EmitFormatStoreComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t data);
 std::uint32_t EmitD16StoreComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t half);
 void EmitDeviceAtomicMemoryBarrier(SpirvEmitterState& state);
+void EmitDeviceAtomicReleaseBarrier(SpirvEmitterState& state);
 std::uint32_t EmitDsSwizzleTargetLane(SpirvEmitterState& state, std::uint32_t subid, std::uint32_t control);
 std::uint32_t EmitAndConstant(SpirvEmitterState& state, std::uint32_t value, std::uint32_t mask);
 std::uint32_t EmitShiftRightConstant(SpirvEmitterState& state, std::uint32_t value, std::uint32_t shift);

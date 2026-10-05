@@ -771,6 +771,7 @@ void EmitAtomicOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
             });
         }
         const auto old = state.module.AllocateId();
+        EmitDeviceAtomicReleaseBarrier(state);
         if (opcode == IrOpcode::ImageAtomicCmpSwap32) {
             state.module.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), old, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, spv::MemorySemanticsMaskNone), value, ctx.Arg(access.inst, 3));
         } else {

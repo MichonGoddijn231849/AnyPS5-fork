@@ -48,6 +48,8 @@ ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);
 
 std::uint64_t RelieveGpuMemory(const Context& context);
+// Debug aid (APS5_CHECK_BVH): ranges whose GPU copy-backs and copy-outs are logged ([bvh-copy]).
+void DebugWatchRange(std::uint64_t begin, std::uint64_t end);
 void DropAddressSpaceCache();
 std::uint64_t HostImportLimit();
 

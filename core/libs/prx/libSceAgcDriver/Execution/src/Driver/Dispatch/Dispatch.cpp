@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
@@ -45,8 +46,8 @@ BvhCheck& Bvh() {
     return check;
 }
 
-void NoteDispatchForBvh(std::uint64_t program, std::span<const std::uint32_t> userData) {
-    std::string text = std::to_string(TraceMs()) + " ms program 0x";
+void NoteDispatchForBvh(std::uint32_t queue, std::uint64_t serial, std::uint64_t program, std::span<const std::uint32_t> userData) {
+    std::string text = std::to_string(TraceMs()) + " ms queue 0x" + [&] { char q[16]; std::snprintf(q, sizeof(q), "%x", queue); return std::string(q); }() + " submission " + std::to_string(serial) + " program 0x";
     char item[24];
     std::snprintf(item, sizeof(item), "%llx", static_cast<unsigned long long>(program));
     text += item;
@@ -83,6 +84,7 @@ void CheckBvh(std::uint64_t pointer) {
     const auto nodes = dword(0x50);
     const auto entries = dword(0x58);
     const auto threads = dword(0x60);
+    Graphics::DebugWatchRange(pointer, pointer + bytes);
     if (aOffset + 4ull * ((threads + 3) / 4) > bytes || 64ull * nodes > bytes || 8ull * entries > bytes) return;
     std::size_t bad = 0;
     std::string first;
@@ -236,7 +238,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (checkBvh) {
         // The blob a refit just used is checked again at the next dispatch, after the refit ran.
         if (const auto refitted = checkAfterRefit.exchange(0, std::memory_order_acq_rel); refitted != 0) CheckBvh(refitted);
-        NoteDispatchForBvh(address, userData);
+        NoteDispatchForBvh(submission.queue, submission.serial, address, userData);
         static constexpr std::array<std::uint32_t, 6> RefitStart{0xbfa00003u, 0xd7460001u, 0x04010c06u, 0xf4041a82u, 0xfa000040u, 0xbf8cc07fu};
         const auto word = (address - snapshot.codeAddress) / sizeof(std::uint32_t);
         const auto pointer = userData.size() >= 6 ? (userData[4] | (static_cast<std::uint64_t>(userData[5]) << 32u)) & 0xffffffffffffull : 0;
@@ -252,6 +254,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         // (APS5_CAPTURE_TRIGGER's), so a frame capture holds the builds of the following frames.
         static constexpr std::array<std::uint32_t, 6> BuildStart{0xbfa00003u, 0xd7460003u, 0x04010c0fu, 0x7d06060eu, 0xbeea086au, 0xbefe046au};
         static std::atomic<bool> buildTriggered{false};
+        if (userData.size() >= 2 && word + BuildStart.size() <= snapshot.code.size() && std::equal(BuildStart.begin(), BuildStart.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(word))) {
+            const auto blob = (userData[0] | (static_cast<std::uint64_t>(userData[1]) << 32u)) & 0xffffffffffffull;
+            GuestMemory::FlushGpuWrites(blob, 0x80);
+            const auto* header = reinterpret_cast<const char*>(static_cast<std::uintptr_t>(blob));
+            std::uint64_t bytes = 0;
+            if (std::memcmp(header, "PSR_BVHL", 8) == 0) std::memcpy(&bytes, header + 0x10, sizeof(bytes));
+            std::fprintf(stderr, "[bvh] %.1f ms queue 0x%x: build of blob 0x%llx (%llu bytes)\n", TraceMs(), submission.queue, static_cast<unsigned long long>(blob), static_cast<unsigned long long>(bytes));
+            if (bytes != 0 && bytes < (1ull << 30u)) Graphics::DebugWatchRange(blob, blob + bytes);
+        }
         if (word + BuildStart.size() <= snapshot.code.size() && std::equal(BuildStart.begin(), BuildStart.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(word)) && !buildTriggered.exchange(true)) {
             if (const char* trigger = std::getenv("APS5_CHECK_BVH_BUILD_TRIGGER"); trigger != nullptr && *trigger != '\0') {
                 if (FILE* file = std::fopen(trigger, "wb")) std::fclose(file);

@@ -336,6 +336,17 @@ void EmitDeviceAtomicMemoryBarrier(SpirvEmitterState& state) {
     state.module.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, semantics));
 }
 
+void EmitDeviceAtomicReleaseBarrier(SpirvEmitterState& state) {
+    // The release side: a wave's stores before a device atomic (s_waitcnt vmcnt(0) on the hardware)
+    // are visible to a wave that observes the atomic's result, as the bottom-up passes of a BVH build
+    // and refit rely on (store a node's bounds, then flag the parent). Experiment switch:
+    // APS5_NO_ATOMIC_RELEASE=1 drops it.
+    static const bool disabled = std::getenv("APS5_NO_ATOMIC_RELEASE") != nullptr;
+    if (disabled) return;
+    const auto semantics = spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsUniformMemoryMask;
+    state.module.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, semantics));
+}
+
 std::uint32_t EmitDsSwizzleTargetLane(SpirvEmitterState& state, std::uint32_t subid, std::uint32_t control) {
     if ((control & 0xc000u) == 0xc000u) {
         const std::uint32_t mask = control & 0x1fu;

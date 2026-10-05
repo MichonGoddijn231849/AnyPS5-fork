@@ -1130,6 +1130,7 @@ std::uint32_t Atomic32(SpirvValueEmitContext& ctx, const IrValue& inst, const Me
             });
             return EmitValueOrZeroIfCondition(state, inBounds, [&] {
                 return EmitBdaAtomic(ctx, inst, guest, 4u, [&](std::uint32_t pointer) {
+                    EmitDeviceAtomicReleaseBarrier(state);
                     const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
                     EmitDeviceAtomicMemoryBarrier(state);
                     return old;
@@ -1160,6 +1161,7 @@ std::uint32_t Atomic32(SpirvValueEmitContext& ctx, const IrValue& inst, const Me
         return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, access.resource, access.index), [&]() {
             const auto pointer = EmitMemoryElementPointer(state, access.resource, access.index);
             const auto operation = [&]() {
+                if (!lds) EmitDeviceAtomicReleaseBarrier(state);
                 const auto old = EmitAtomicOperation(ctx, inst, pointer, scope);
                 if (lds) {
                     const std::uint32_t semantics = spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask;
@@ -1192,6 +1194,7 @@ std::uint32_t BufferAtomic64(SpirvValueEmitContext& ctx, const IrValue& inst) {
             const auto value = Unary(state, spv::OpBitcast, TypeScalarU64(state), ctx.Arg(inst, inst.ArgumentCount() - 2u));
             const auto old = state.module.AllocateId();
             const auto pointer = EmitStorageBufferElementPointer(state, resource, index, TypeStorageBufferU64ElementPointer(state));
+            EmitDeviceAtomicReleaseBarrier(state);
             if (inst.Opcode() == IrOpcode::BufferAtomicCmpSwap64) {
                 const auto desired = Unary(state, spv::OpBitcast, TypeScalarU64(state), ctx.Arg(inst, inst.ArgumentCount() - 3u));
                 state.module.AddFunction(spv::OpAtomicCompareExchange, TypeScalarU64(state), old, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, spv::MemorySemanticsMaskNone), desired, value);
@@ -1395,6 +1398,7 @@ std::uint32_t AddressAtomic(SpirvValueEmitContext& ctx, const IrValue& inst) {
             const auto semantics = ConstantU32(state, spv::MemorySemanticsMaskNone);
             const auto opcode = AddressAtomicOpcode(inst.Opcode());
             const auto result = state.module.AllocateId();
+            EmitDeviceAtomicReleaseBarrier(state);
             if (opcode == spv::OpAtomicCompareExchange) {
                 state.module.AddFunction(opcode, scalarType, result, pointer, scope, semantics, semantics, value, scalar(ctx.Arg(inst, 4)));
             } else {
