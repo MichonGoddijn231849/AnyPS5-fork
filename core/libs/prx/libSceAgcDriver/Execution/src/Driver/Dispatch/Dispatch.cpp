@@ -62,6 +62,7 @@ void NoteDispatchForBvh(std::uint32_t queue, std::uint64_t serial, std::uint64_t
 }
 
 std::atomic<std::uint64_t> checkAfterRefit{0};
+std::atomic<std::uint64_t> checkAfterBuild{0};
 
 bool KnownBvh(std::uint64_t pointer) {
     auto& check = Bvh();
@@ -69,7 +70,7 @@ bool KnownBvh(std::uint64_t pointer) {
     return check.badLeaves.contains(pointer);
 }
 
-void CheckBvh(std::uint64_t pointer) {
+void CheckBvh(std::uint64_t pointer, bool linksOnly = false) {
     const auto* blob = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(pointer));
     const auto dword = [&](std::uint64_t offset) {
         std::uint32_t value;
@@ -88,7 +89,7 @@ void CheckBvh(std::uint64_t pointer) {
     if (aOffset + 4ull * ((threads + 3) / 4) > bytes || 64ull * nodes > bytes || 8ull * entries > bytes) return;
     std::size_t bad = 0;
     std::string first;
-    for (std::uint32_t t = 0; t < threads; ++t) {
+    for (std::uint32_t t = 0; t < threads && !linksOnly; ++t) {
         const auto node = dword(aOffset + 4ull * (t >> 2u));
         if (node >= nodes) continue;
         const auto child = dword(64ull * node + 4ull * (t & 3u));
@@ -107,6 +108,28 @@ void CheckBvh(std::uint64_t pointer) {
             first += item;
         }
     }
+    // The per-node words at header 0x30 (slot << 30 | parent << 3 | count): the parent's child word in
+    // that slot must name the node, as the refit's walk to the root relies on.
+    const auto links = dword(0x30) | (static_cast<std::uint64_t>(dword(0x34)) << 32u);
+    std::size_t badLinks = 0;
+    if (links < bytes) {
+        for (std::uint32_t t = 0; t < threads; t += 4) {
+            const auto node = dword(aOffset + 4ull * (t >> 2u));
+            if (node >= nodes || links + 4ull * node + 4 > bytes) continue;
+            const auto word = dword(links + 4ull * node);
+            const auto parent = (word >> 3u) & 0x7ffffffu;
+            const auto slot = word >> 30u;
+            if (word == 0 || parent == 0 || parent >= nodes) continue;
+            const auto child = dword(64ull * parent + 4ull * slot);
+            if ((child >> 3u) == node && (child & 7u) != 0) continue;
+            if (badLinks++ < 4) {
+                char item[112];
+                std::snprintf(item, sizeof(item), " link of node %u: 0x%08x, parent slot 0x%08x;", node, word, child);
+                first += item;
+            }
+        }
+    }
+    bad += badLinks;
     auto& check = Bvh();
     std::lock_guard lock(check.mutex);
     // APS5_CHECK_BVH_TRIGGER=<file>: the first check creates that file (APS5_CAPTURE_TRIGGER's), so a frame
@@ -123,8 +146,13 @@ void CheckBvh(std::uint64_t pointer) {
         std::fprintf(stderr, "[bvh] %.0f ms: %llu checks of %zu blobs so far, %llu with bad leaves\n", now, static_cast<unsigned long long>(check.checks), check.badLeaves.size() + (check.badLeaves.contains(pointer) ? 0 : 1), static_cast<unsigned long long>(check.badChecks));
         check.reportedAt = now;
     }
-    auto& known = check.badLeaves[pointer];
-    auto& checkedAt = check.checkedAt[pointer];
+    const auto key = linksOnly ? pointer | 1u : pointer;
+    if (linksOnly) {
+        if (bad != 0) std::fprintf(stderr, "[bvh] %.1f ms blob 0x%llx right after its build kernel: %zu bad parent links:%s\n", TraceMs(), static_cast<unsigned long long>(pointer), bad, first.c_str());
+        return;
+    }
+    auto& known = check.badLeaves[key];
+    auto& checkedAt = check.checkedAt[key];
     const auto since = checkedAt;
     // The dispatch being checked was noted already: the next check covers it.
     checkedAt = check.sequence - 1;
@@ -238,6 +266,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (checkBvh) {
         // The blob a refit just used is checked again at the next dispatch, after the refit ran.
         if (const auto refitted = checkAfterRefit.exchange(0, std::memory_order_acq_rel); refitted != 0) CheckBvh(refitted);
+        if (const auto built = checkAfterBuild.exchange(0, std::memory_order_acq_rel); built != 0) CheckBvh(built, true);
         NoteDispatchForBvh(submission.queue, submission.serial, address, userData);
         static constexpr std::array<std::uint32_t, 6> RefitStart{0xbfa00003u, 0xd7460001u, 0x04010c06u, 0xf4041a82u, 0xfa000040u, 0xbf8cc07fu};
         const auto word = (address - snapshot.codeAddress) / sizeof(std::uint32_t);
@@ -262,6 +291,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (std::memcmp(header, "PSR_BVHL", 8) == 0) std::memcpy(&bytes, header + 0x10, sizeof(bytes));
             std::fprintf(stderr, "[bvh] %.1f ms queue 0x%x: build of blob 0x%llx (%llu bytes)\n", TraceMs(), submission.queue, static_cast<unsigned long long>(blob), static_cast<unsigned long long>(bytes));
             if (bytes != 0 && bytes < (1ull << 30u)) Graphics::DebugWatchRange(blob, blob + bytes);
+            if (bytes != 0) checkAfterBuild.store(blob, std::memory_order_release);
         }
         if (word + BuildStart.size() <= snapshot.code.size() && std::equal(BuildStart.begin(), BuildStart.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(word)) && !buildTriggered.exchange(true)) {
             if (const char* trigger = std::getenv("APS5_CHECK_BVH_BUILD_TRIGGER"); trigger != nullptr && *trigger != '\0') {
