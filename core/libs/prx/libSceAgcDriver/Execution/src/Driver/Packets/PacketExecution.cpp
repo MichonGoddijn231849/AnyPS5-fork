@@ -171,7 +171,18 @@ void Driver::execute(const Submission& submission) {
     auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);
     ++packetProfile.submissions;
 
-    bumpEpoch(&EpochBumps::submissions);
+    // A submission sees the CPU writes made before it was submitted. When that was before this
+    // worker's current collect epoch began, every walk of the epoch already covers them (each walk
+    // happened after the bump), so the epoch goes on: a worker behind a queue of submissions walks
+    // a surface once per catch-up instead of once per submission. APS5_SUBMISSION_EPOCH_EACH=1
+    // starts an epoch at every submission as before.
+    // A REWIND tail counts as submitted when the CPU released it: noteReleasedTails reads, before the
+    // bump, which tails of the chain are released already (executeRewindTail dates those before it).
+    static const bool epochEach = std::getenv("APS5_SUBMISSION_EPOCH_EACH") != nullptr;
+    if (epochEach || submission.enqueuedAt == std::chrono::steady_clock::time_point{} || submission.enqueuedAt > lastEpochBump()) {
+        if (!epochEach) noteReleasedTails(submission);
+        bumpEpoch(&EpochBumps::submissions);
+    }
     // A frame capture can start while this submission is unfinished: publish where it is.
     const bool publishInFlight = submission.source != nullptr && submission.queue < inFlightSource.size() && Capture::FrameCapture::Get().Active();
     struct InFlight {

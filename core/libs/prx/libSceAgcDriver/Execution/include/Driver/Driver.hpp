@@ -225,6 +225,9 @@ private:
     static Graphics::Recorder::LateStatistics& lateCountsSeen();
     static EpochBumps& epochBumps();
     static void bumpEpoch(std::uint64_t EpochBumps::*counter);
+    static std::chrono::steady_clock::time_point& lastEpochBump();
+    static std::deque<const std::uint32_t*>& releasedTails();
+    void noteReleasedTails(const Submission& submission);
     static bool packetEpoch();
     static bool labelTryEachPacket();
     static std::chrono::microseconds labelFlushDeadline();

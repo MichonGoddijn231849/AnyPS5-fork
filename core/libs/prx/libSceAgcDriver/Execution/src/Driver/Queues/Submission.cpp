@@ -6,10 +6,38 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Capture/Replay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Capture/FrameCapture.hpp"
+#include "ThreadOwned.hpp"
 #include <bit>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
+
+std::deque<const std::uint32_t*>& Driver::releasedTails() {
+    static thread_local std::deque<const std::uint32_t*> released;
+    return released;
+}
+
+void Driver::noteReleasedTails(const Submission& submission) {
+    auto& released = releasedTails();
+    released.clear();
+    thread_local Submission* scratchSlot = nullptr;
+    auto& scratch = ShaderRecompiler::ThreadOwned(scratchSlot);
+    const std::uint32_t* tail = submission.rewindTail;
+    std::size_t words = submission.rewindWords;
+    for (std::size_t chunk = 0; chunk < 256 && tail != nullptr; ++chunk) {
+        if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(tail - 1)).load(std::memory_order_acquire) & 0x80000000u) == 0) break;
+        released.push_back(tail - 1);
+        scratch.rewindTail = nullptr;
+        scratch.rewindWords = 0;
+        try {
+            copyCommands(scratch, tail, words);
+        } catch (const std::exception&) {
+            break;
+        }
+        tail = scratch.rewindTail;
+        words = scratch.rewindWords;
+    }
+}
 
 void Driver::copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words) {
     submission.commands.clear();
@@ -108,6 +136,14 @@ void Driver::executeRewindTail(const Submission& stalled) {
     }
     Submission tail{};
     tail.queue = stalled.queue;
+    auto& released = releasedTails();
+    if (!released.empty() && released.front() == stalled.rewindTail - 1) {
+        released.pop_front();
+        tail.enqueuedAt = lastEpochBump();
+    } else {
+        released.clear();
+        tail.enqueuedAt = std::chrono::steady_clock::now();
+    }
     // A replay runs the words the game's driver copied at this release (its memory deltas are coarser
     // than the game's hand-off, so the chunk in guest memory may already hold later commands).
     std::uint64_t nextTail = 0;
@@ -190,9 +226,9 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         submission.serial = accepted + 1;
 
         submission.received = ++eventSerial;
+        const auto now = std::chrono::steady_clock::now();
+        submission.enqueuedAt = now;
         if (profile) {
-            const auto now = std::chrono::steady_clock::now();
-            submission.enqueuedAt = now;
             ++costs.submissions;
             costs.validateNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(validated - copied).count());
             costs.copyNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>((copied - start) + (now - validated)).count());
