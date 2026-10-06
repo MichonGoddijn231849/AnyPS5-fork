@@ -2841,7 +2841,59 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
     return moved;
 }
 
+namespace {
+
+// APS5_PROFILE_DRAW: what PrepareDrawBindings spends, in the 10 s [draw-bindings] line.
+struct DrawBindingsProfile {
+    std::mutex mutex;
+    std::uint64_t calls = 0, prepared = 0, snapshots = 0, reused = 0, copiedBindings = 0, written = 0;
+    double selectUs = 0, allocateUs = 0, copyUs = 0, writeUs = 0, collectUs = 0, reuseUs = 0, createUs = 0, fillUs = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+struct DrawBindingsSample {
+    bool profile = BuildProfiled();
+    std::chrono::steady_clock::time_point last = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    double us[8]{};
+    std::uint64_t snapshots = 0, reused = 0, copiedBindings = 0, written = 0;
+    bool prepared = false;
+    void mark(std::size_t part) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        us[part] += std::chrono::duration<double, std::micro>(now - last).count();
+        last = now;
+    }
+    ~DrawBindingsSample() {
+        if (!profile) return;
+        static DrawBindingsProfile totals;
+        std::lock_guard lock(totals.mutex);
+        ++totals.calls;
+        totals.prepared += prepared ? 1 : 0;
+        totals.snapshots += snapshots;
+        totals.reused += reused;
+        totals.copiedBindings += copiedBindings;
+        totals.written += written;
+        totals.selectUs += us[0];
+        totals.allocateUs += us[1];
+        totals.copyUs += us[2];
+        totals.writeUs += us[3];
+        totals.collectUs += us[4];
+        totals.reuseUs += us[5];
+        totals.createUs += us[6];
+        totals.fillUs += us[7];
+        const auto now = std::chrono::steady_clock::now();
+        if (now - totals.lastReport < std::chrono::seconds(10)) return;
+        totals.lastReport = now;
+        std::fprintf(stderr, "[draw-bindings] %llu calls (10 s), %llu with snapshots: %llu snapshots (%llu reused), %llu bindings copied, %llu written; time: select %.1f ms (collect %.1f, reuse %.1f, create %.1f, fill %.1f), allocate %.1f ms, copy %.1f ms, write %.1f ms\n", static_cast<unsigned long long>(totals.calls), static_cast<unsigned long long>(totals.prepared), static_cast<unsigned long long>(totals.snapshots), static_cast<unsigned long long>(totals.reused), static_cast<unsigned long long>(totals.copiedBindings), static_cast<unsigned long long>(totals.written), totals.selectUs / 1000.0, totals.collectUs / 1000.0, totals.reuseUs / 1000.0, totals.createUs / 1000.0, totals.fillUs / 1000.0, totals.allocateUs / 1000.0, totals.copyUs / 1000.0, totals.writeUs / 1000.0);
+        totals.calls = totals.prepared = totals.snapshots = totals.reused = totals.copiedBindings = totals.written = 0;
+        totals.selectUs = totals.allocateUs = totals.copyUs = totals.writeUs = totals.collectUs = totals.reuseUs = totals.createUs = totals.fillUs = 0;
+    }
+};
+
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
+    DrawBindingsSample sample;
     if (_set == VK_NULL_HANDLE || usesBda) return {};
     const auto reads = guestMemory.InPlaceReads();
     auto result = std::make_shared<DrawBindings>();
@@ -2872,18 +2924,27 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto begin = address - item.adjustment;
         const auto bytes = size + item.adjustment;
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        sample.mark(0);
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
+        sample.mark(4);
         auto buffer = recorder.ReusableDrawSnapshot(begin, bytes);
+        sample.mark(5);
+        ++sample.snapshots;
+        if (buffer != nullptr) ++sample.reused;
         if (buffer == nullptr) {
             buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            sample.mark(6);
             std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
             recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+            sample.mark(7);
         }
         selected.push_back(index);
         result->snapshots.push_back({begin, std::move(buffer)});
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
+    sample.mark(0);
     if (selected.empty()) return {};
+    sample.prepared = true;
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::map<VkDescriptorType, std::uint32_t> counts;
     for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
@@ -2892,6 +2953,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     result->cache = context.descriptorCache;
     result->allocation = result->cache->Allocate(_layout, sizes);
     Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+    sample.mark(1);
     std::vector<VkCopyDescriptorSet> copies;
     for (const auto& binding : bindings) {
         VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
@@ -2904,6 +2966,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
     update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
+    sample.copiedBindings = copies.size();
+    sample.mark(2);
     std::vector<VkDescriptorBufferInfo> infos;
     infos.reserve(selected.size());
     for (const auto& snapshot : result->snapshots) infos.push_back({snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()});
@@ -2923,7 +2987,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     }
     update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    sample.written = writes.size();
     recorder.Keep(result);
+    sample.mark(3);
     return result;
 }
 

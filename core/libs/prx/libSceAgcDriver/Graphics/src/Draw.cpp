@@ -162,6 +162,9 @@ TileMipLayout ColorTargetMip(const ColorTarget& color, const ColorTargetLayout& 
 // the millisecond the old print rounded to), totalled over 10 s in the [draws] line.
 enum DrawPhase : std::size_t { PhaseValidate, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseCount };
 constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
+// Parts of the lookup and record phases (DrawTimer::split), in the [draws] split line.
+enum DrawSplit : std::size_t { SplitLookupKey, SplitLookupFind, SplitLookupRevalidate, SplitLookupMoved, SplitLookupAliases, SplitRecordPass, SplitRecordStores, SplitRecordBindings, SplitRecordBegin, SplitRecordDescriptors, SplitRecordPush, SplitRecordCommands, SplitRecordLeave, SplitCount };
+constexpr std::array<const char*, SplitCount> DrawSplitNames{"lookup.key", "lookup.find", "lookup.revalidate", "lookup.moved", "lookup.aliases", "record.pass", "record.stores", "record.bindings", "record.begin", "record.descriptors", "record.push", "record.commands", "record.leave"};
 
 // Why a draw did not go into the recorder without a wait (counted in the [draws] line): its targets
 // are not all resident, no recorder is active, a switch (APS5_SYNC_DRAWS, APS5_DUMP_TARGETS,
@@ -227,6 +230,7 @@ struct DrawProfile {
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
     std::array<double, PhaseCount> totalsUs{};
+    std::array<double, SplitCount> splitUs{};
     // The longest single draw's time per phase, and the longest draw: the [lock] line's 'draw'
     // hold max (tens of ms against an average well under a millisecond) needs a phase name.
     std::array<double, PhaseCount> maxUs{};
@@ -294,9 +298,10 @@ DrawProfile& Profile() {
 }
 
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
-void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
+void reportDraw(const std::array<double, PhaseCount>& us, const std::array<double, SplitCount>& split, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
     auto& profile = Profile();
     std::lock_guard lock(profile.mutex);
+    for (std::size_t i = 0; i < SplitCount; ++i) profile.splitUs[i] += split[i];
     double drawUs = 0;
     for (std::size_t i = 0; i < PhaseCount; ++i) {
         profile.totalsUs[i] += us[i];
@@ -385,6 +390,10 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
+    n = std::snprintf(line, sizeof(line), "[draws] split (us per draw):");
+    for (std::size_t i = 0; i < SplitCount && room(); ++i) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.2f", DrawSplitNames[i], average(profile.splitUs[i], profile.draws));
+    std::fprintf(stderr, "%s\n", line);
+    profile.splitUs.fill(0);
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
@@ -678,12 +687,21 @@ struct DrawTimer {
     bool profile;
     std::chrono::steady_clock::time_point phaseStart;
     std::array<double, PhaseCount> us{};
-    explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
+    // Parts of a phase: each charges the time since the last phase or split mark.
+    std::chrono::steady_clock::time_point splitStart;
+    std::array<double, SplitCount> split{};
+    explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()), splitStart(phaseStart) {}
     void phase(DrawPhase which) {
         if (!profile) return;
         const auto now = std::chrono::steady_clock::now();
         us[which] += std::chrono::duration<double, std::micro>(now - phaseStart).count();
-        phaseStart = now;
+        phaseStart = splitStart = now;
+    }
+    void part(DrawSplit which) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        split[which] += std::chrono::duration<double, std::micro>(now - splitStart).count();
+        splitStart = now;
     }
 };
 
@@ -704,7 +722,7 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
         }
         std::fprintf(stderr, "%s\n", line);
     }
-    reportDraw(timer.us, built, outcome);
+    reportDraw(timer.us, timer.split, built, outcome);
 }
 
 }
@@ -940,13 +958,19 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->variantId != 0; });
     if (resolved.cacheable) {
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        timer.part(SplitLookupKey);
+        auto cached = SharedResourceCache().Find(resolved.contentKey);
+        timer.part(SplitLookupFind);
+        if (cached) {
             const bool valid = cached->Revalidate(shaders);
+            timer.part(SplitLookupRevalidate);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            timer.part(SplitLookupMoved);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                timer.part(SplitLookupAliases);
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
@@ -1320,6 +1344,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     mix(state.renderExtent.width);
     mix(state.renderExtent.height);
     const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
+    timer.part(SplitRecordPass);
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
     // address-based build), or over its GPU-side records, lands before it, as before a dispatch
     // (VulkanDevice::dispatch); the flush ends an open pass, so it comes before the decision.
@@ -1332,7 +1357,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    timer.part(SplitRecordStores);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    timer.part(SplitRecordBindings);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool continued = !capture && !readsTarget && !gpuIndirect && !meshIndirect && recorder->ContinuesRenderPass(passKey);
@@ -1379,6 +1406,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
+    timer.part(SplitRecordBegin);
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
         context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
@@ -1386,9 +1414,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
+    timer.part(SplitRecordDescriptors);
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    timer.part(SplitRecordPush);
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
+    timer.part(SplitRecordCommands);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
@@ -1397,6 +1428,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // draw class range) before anything else is recorded. A draw that wrote memory owes the next
     // one a barrier, so its pass cannot be continued.
     recorder->LeaveRenderPassOpen(passKey, drawTiming, !resources.WritesMemory());
+    timer.part(SplitRecordLeave);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);
