@@ -55,6 +55,9 @@ public:
     using WaitedMsProvider = double (*)();
     static void SetWaitedMsProvider(WaitedMsProvider provider);
     explicit ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> initial, PendingWriteQuery pendingWrite = nullptr, PendingWriteObserver observe = nullptr, HookWaitCounter hookWaits = nullptr);
+    ~ShaderMemory();
+    ShaderMemory(const ShaderMemory&) = delete;
+    ShaderMemory& operator=(const ShaderMemory&) = delete;
     // Returns what the capture resolved (plan, snapshot, specialization) for
     // ShaderRecompiler::Recompile(request, capture), which then skips its own materialization. One
     // result per call: the draw path captures several stages on one ShaderMemory. With `handle`
@@ -79,6 +82,8 @@ private:
         [[nodiscard]] bool Test(std::size_t index) const { return (bits[index / 64u] >> (index % 64u) & 1u) != 0u; }
         void Set(std::size_t index) { bits[index / 64u] |= std::uint64_t{1} << (index % 64u); }
         void SetAll() { bits.fill(~std::uint64_t{0}); }
+        // Sets the BlockWords bits of the block holding `index`.
+        void SetBlock(std::size_t index) { bits[index / 64u] |= ((std::uint64_t{1} << BlockWords) - 1u) << (index % 64u / BlockWords * BlockWords); }
         void Reset() { bits.fill(0u); }
         [[nodiscard]] bool None() const;
         // Calls `run(first, end)` for each maximal run of set bits, in index order.
@@ -89,12 +94,18 @@ private:
         std::array<std::uint64_t, PageWords / 64u> bits{};
     };
 
+    // A page whose guest bytes no recorded GPU work writes is copied a 64-byte block at a time, as
+    // the capture first reads a word of the block (`lazy`), instead of whole. Pages come from the
+    // calling thread's pool, so their words are left as the last capture wrote them: only words
+    // marked valid are ever read.
+    static constexpr std::size_t BlockWords = 16;
     struct Page {
-        std::array<std::uint32_t, PageWords> words{};
+        std::array<std::uint32_t, PageWords> words;
         WordMask valid;
         WordMask read;
         WordMask recent;
         bool wordwise = false;
+        bool lazy = false;
     };
 
     static bool read(void* context, std::uint64_t address, std::uint32_t* value);
@@ -103,7 +114,10 @@ private:
     // Regions given at construction (the registered shader's code and header), referenced as given:
     // the caller keeps them alive for as long as the capture is used.
     std::map<std::uint64_t, std::span<const std::byte>> initial;
-    std::map<std::uint64_t, Page> pages;
+    // Ordered by base address; a capture touches a few pages, so a scan beats a tree.
+    std::vector<std::pair<std::uint64_t, Page*>> pages;
+    std::uint64_t lastBase = ~std::uint64_t{0};
+    Page* lastPage = nullptr;
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;

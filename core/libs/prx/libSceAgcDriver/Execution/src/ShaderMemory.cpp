@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -81,6 +83,15 @@ double WaitedMs() {
     return provider != nullptr ? provider() : 0.0;
 }
 
+// The calling thread's pages not in use by a ShaderMemory, kept warm for the next capture.
+template<typename TPage>
+std::vector<std::unique_ptr<TPage>>& pagePool() {
+    struct PagePoolStorage {};
+    return HostThreadLocal<std::vector<std::unique_ptr<TPage>>, PagePoolStorage>();
+}
+
+constexpr std::size_t PagePoolLimit = 64;
+
 }
 
 void ShaderMemory::SetWaitedMsProvider(WaitedMsProvider provider) {
@@ -91,6 +102,14 @@ ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regio
     const ShaderRecompiler::RequestMemoryView validated(regions);
     for (const auto& region : regions) {
         initial.emplace(region.guestAddress, region.bytes);
+    }
+}
+
+ShaderMemory::~ShaderMemory() {
+    auto& pool = pagePool<Page>();
+    for (const auto& [base, page] : pages) {
+        if (pool.size() < PagePoolLimit) pool.emplace_back(page);
+        else delete page;
     }
 }
 
@@ -119,9 +138,31 @@ void ShaderMemory::WordMask::ForEachRun(TRun&& run) const {
 }
 
 ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
-    const auto found = pages.find(base);
-    if (found != pages.end()) return found->second;
-    auto& page = pages[base];
+    if (base == lastBase) return *lastPage;
+    auto position = pages.begin();
+    while (position != pages.end() && position->first < base) ++position;
+    if (position != pages.end() && position->first == base) {
+        lastBase = base;
+        lastPage = position->second;
+        return *lastPage;
+    }
+    auto& pool = pagePool<Page>();
+    std::unique_ptr<Page> owned;
+    if (pool.empty()) {
+        owned = std::make_unique<Page>();
+    } else {
+        owned = std::move(pool.back());
+        pool.pop_back();
+    }
+    owned->valid.Reset();
+    owned->read.Reset();
+    owned->recent.Reset();
+    owned->wordwise = false;
+    owned->lazy = false;
+    auto& page = *owned;
+    pages.insert(position, {base, owned.release()});
+    lastBase = base;
+    lastPage = &page;
     ++CaptureTotals().pages;
     // A page is either mapped whole or read word by word where the guest mapped less than a page,
     // or where recorded GPU work writes into it (a whole-page read would wait for that work).
@@ -131,10 +172,11 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
             ++CaptureTotals().pagesWordwise;
             return page;
         }
+        // The hook a whole-page read would make; the blocks are then copied as they are read.
         const auto started = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        GuestMemory::Read(base, std::as_writable_bytes(std::span(page.words)), sizeof(std::uint32_t));
+        GuestMemory::FlushGpuWrites(base, PageBytes);
         if (CaptureProfiled()) CaptureTotals().pageReadNanoseconds += NanosecondsSince(started);
-        page.valid.SetAll();
+        page.lazy = true;
     }
     return page;
 }
@@ -160,6 +202,11 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     }
     auto& page = self.page(address & ~static_cast<std::uint64_t>(PageBytes - 1));
     const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(*value));
+    if (!page.valid.Test(index) && page.lazy) {
+        const auto first = index / BlockWords * BlockWords;
+        std::memcpy(&page.words[first], reinterpret_cast<const void*>((address & ~static_cast<std::uint64_t>(PageBytes - 1)) + first * sizeof(std::uint32_t)), BlockWords * sizeof(std::uint32_t));
+        page.valid.SetBlock(index);
+    }
     if (!page.valid.Test(index)) {
         std::uint32_t word = 0;
         auto policy = PendingWrite::Sync;
@@ -278,7 +325,8 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
     result.reserve(initial.size() + pages.size());
     auto next = initial.begin();
     // Both maps are ordered by address and never overlap, so a merge keeps the result sorted.
-    for (const auto& [base, page] : pages) {
+    for (const auto& [base, pagePointer] : pages) {
+        const auto& page = *pagePointer;
         while (next != initial.end() && next->first < base) {
             result.push_back({next->first, next->second});
             ++next;
@@ -291,7 +339,8 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
 
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::TakeRecentRegions() {
     std::vector<ShaderRecompiler::MemoryRegion> result;
-    for (auto& [base, page] : pages) {
+    for (auto& [base, pagePointer] : pages) {
+        auto& page = *pagePointer;
         if (page.recent.None()) continue;
         page.recent.ForEachRun([&](std::size_t first, std::size_t end) { result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, end - first))}); });
         page.recent.Reset();
