@@ -988,6 +988,59 @@ void ownPlanValues(IrResourcePlan& plan) {
     plan.denseValueIds = true;
 }
 
+// IrResourcePlan::compact from the plan's dense values; left empty when a value or root the walk
+// would reach is missing or malformed, so the walk reads the IR (and reports the error) instead.
+void buildCompactPlan(IrResourcePlan& plan) {
+    if (!plan.denseValueIds || plan.valueStorage.size() >= CompactResourcePlan::NoValue) return;
+    CompactResourcePlan compact;
+    const auto idOf = [&](const IrValue* value, std::uint32_t& id) {
+        if (value == nullptr) return false;
+        const auto* resolved = value->Resolve();
+        id = resolved->Id();
+        return id < plan.valueStorage.size() && plan.valueStorage[id].get() == resolved;
+    };
+    try {
+        compact.values.reserve(plan.valueStorage.size());
+        for (const auto& value : plan.valueStorage) {
+            if (value->ArgumentCount() > 0xffu) return;
+            CompactPlanValue entry;
+            entry.immediate = value->ImmediateU64();
+            entry.flags = value->Flags<std::uint64_t>();
+            entry.firstArgument = static_cast<std::uint32_t>(compact.arguments.size());
+            entry.registerIndex = value->Register().index;
+            entry.type = value->Type();
+            entry.opcode = value->Opcode();
+            entry.argumentCount = static_cast<std::uint8_t>(value->ArgumentCount());
+            entry.hasImmediate = value->HasImmediate();
+            for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
+                std::uint32_t id = 0;
+                if (!idOf(value->Argument(index), id)) return;
+                compact.arguments.push_back(id);
+            }
+            compact.values.push_back(entry);
+        }
+        compact.sourceDwords.assign(plan.descriptorSources.size() * 8u, CompactResourcePlan::NoValue);
+        for (std::size_t source = 0; source < plan.descriptorSources.size(); source++) {
+            const auto& descriptor = plan.descriptorSources[source];
+            if (descriptor.dwordCount > 8u) return;
+            for (std::uint32_t dword = 0; dword < descriptor.dwordCount; dword++) {
+                if (!idOf(descriptor.dwords[dword], compact.sourceDwords[source * 8u + dword])) return;
+            }
+        }
+        compact.srtReads.resize(plan.srtReads.size());
+        for (std::size_t slot = 0; slot < plan.srtReads.size(); slot++) {
+            if (!idOf(plan.srtReads[slot].value, compact.srtReads[slot])) return;
+        }
+        compact.conditions.assign(plan.controlFlow.size(), CompactResourcePlan::NoValue);
+        for (std::size_t block = 0; block < plan.controlFlow.size(); block++) {
+            if (plan.controlFlow[block].condition != nullptr && !idOf(plan.controlFlow[block].condition, compact.conditions[block])) return;
+        }
+    } catch (const std::exception&) {
+        return;
+    }
+    plan.compact = std::move(compact);
+}
+
 }
 
 IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const {
@@ -1030,6 +1083,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     }
     for (const auto& sampler : plan.info.samplers) addSource(sampler.source);
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
+    buildCompactPlan(plan);
     return plan;
 }
 
