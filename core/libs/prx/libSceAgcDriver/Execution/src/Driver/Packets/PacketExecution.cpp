@@ -105,7 +105,8 @@ void Driver::execute(const Submission& submission) {
             }
         }
     } pipelineDrain{pipelined};
-    if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    static const bool orderedCompletion = std::getenv("APS5_PIPELINE_DRAIN_SUBMISSIONS") == nullptr && orderedWaits;
+    if (pipelined && (submission.suspend || !orderedCompletion)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
     if (submission.suspend) {
 
         static const bool suspendDrain = std::getenv("APS5_SUSPEND_DRAIN") != nullptr;
@@ -393,6 +394,17 @@ void Driver::execute(const Submission& submission) {
     }
 
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
+    if (pipelined && orderedCompletion && deferredLabels().labels.empty()) {
+        if (submission.rewindTail == nullptr) {
+            deferCompletion(submission);
+            return;
+        }
+        if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
+            DrawPipeline::Queue0().Enqueue([this] { submitOpenWork(); }, {});
+            executeRewindTail(submission);
+            return;
+        }
+    }
     if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
     if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {
         auto& costs = submissionCosts(submission.queue);

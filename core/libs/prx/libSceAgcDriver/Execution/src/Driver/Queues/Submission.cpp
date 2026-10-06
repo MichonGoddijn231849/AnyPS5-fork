@@ -245,6 +245,7 @@ bool Driver::waitFree(const Submission& submission) {
 
 bool Driver::queue0Before(std::uint64_t received) const {
     if (queue0Executing != 0 && queue0Executing < received) return true;
+    if (!queue0Uncommitted.empty() && queue0Uncommitted.front() < received) return true;
     const auto worker = workers.find(0);
     if (worker == workers.end()) return false;
     for (const auto& pending : worker->second.pending) {
@@ -313,7 +314,11 @@ void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {
 }
 
 void Driver::forgetUnfinishedWrites(QueueWorker& worker, const Submission& submission) {
-    for (const auto dword : submission.labelWrites) {
+    forgetUnfinishedWrites(worker, submission.labelWrites);
+}
+
+void Driver::forgetUnfinishedWrites(QueueWorker& worker, std::span<const std::uint64_t> labelWrites) {
+    for (const auto dword : labelWrites) {
         const auto found = worker.unfinishedWrites.find(dword);
         if (found == worker.unfinishedWrites.end()) continue;
         if (--found->second == 0) worker.unfinishedWrites.erase(found);
