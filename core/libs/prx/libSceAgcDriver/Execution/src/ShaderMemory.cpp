@@ -303,7 +303,13 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
         totals.hookWaitNanoseconds += static_cast<std::uint64_t>((WaitedMs() - waitedBefore) * 1e6);
         std::uint64_t initialBytes = 0;
         for (const auto& [address, bytes] : initial) initialBytes += bytes.size();
-        if (++totals.captures % 500 == 0) {
+        ++totals.captures;
+        // One line per 10 s: stderr writes it a character at a time, and every 500 captures
+        // that cost the capture phase about 2 us per capture.
+        static std::atomic<std::chrono::steady_clock::rep> nextReport{0};
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto due = nextReport.load(std::memory_order_relaxed);
+        if (now >= due && nextReport.compare_exchange_strong(due, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count(), std::memory_order_relaxed)) {
             const auto captures = static_cast<double>(totals.captures.load());
             const auto captureNs = totals.captureNanoseconds.load();
             const auto resolveNs = totals.resolveNanoseconds.load();
