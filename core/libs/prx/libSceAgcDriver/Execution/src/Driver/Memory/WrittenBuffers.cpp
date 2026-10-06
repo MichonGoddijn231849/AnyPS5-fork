@@ -42,6 +42,37 @@ void Driver::noteDrawWriters(std::span<const Graphics::CompiledShader> stages, s
     }
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
+    constexpr std::uint64_t Slack = 64 * 1024;
+    constexpr std::uint64_t UnknownBytes = 64ull * 1024 * 1024;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
+        if (begin != 0) ranges.emplace_back(begin, begin + bytes);
+    };
+    for (const auto& stage : stages) {
+        forEachWrittenBuffer(*stage.program, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { ranges.emplace_back(begin, end); });
+    }
+    const auto addColor = [&](const Graphics::ColorTarget& color) {
+        const std::uint64_t bytes = color.bytes != 0 ? static_cast<std::uint64_t>(color.bytes) : UnknownBytes;
+        const auto base = color.surfaceAddress != 0 ? std::min(color.surfaceAddress, color.address) : color.address;
+        if (base != 0) ranges.emplace_back(base, color.address + 2 * bytes + Slack);
+        add(color.dccAddress, bytes / 16 + Slack);
+        add(color.cmaskAddress, bytes / 16 + Slack);
+    };
+    if (graphics.hasColorTarget) addColor(graphics.color);
+    for (const auto& color : graphics.colors) addColor(color);
+    if (graphics.depth) {
+        const auto& depth = *graphics.depth;
+        const auto align = [](std::uint64_t value) { return (value + 255) & ~255ull; };
+        const auto pixels = align(depth.extent.width) * align(depth.extent.height) * std::max<std::uint64_t>(depth.samples, 1);
+        const auto bytes = pixels != 0 ? pixels * 8 + Slack : UnknownBytes;
+        add(depth.address, bytes);
+        add(depth.stencilAddress, bytes);
+        add(depth.htileAddress, pixels / 4 + Slack);
+    }
+    return ranges;
+}
+
 std::optional<WrittenBuffer> Driver::newestWriterLocked(std::uint64_t begin, std::uint64_t end) const {
     for (auto it = writtenBuffers.rbegin(); it != writtenBuffers.rend(); ++it) {
         if (begin < it->end && it->begin < end) return *it;

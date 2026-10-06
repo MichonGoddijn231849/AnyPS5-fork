@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
 
@@ -26,6 +27,7 @@ EpochBumps& Driver::epochBumps() {
 
 void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter) {
     GuestMemory::BumpCollectEpoch();
+    if (DrawPipeline::Active()) DrawPipeline::EpochToken().fetch_add(1, std::memory_order_relaxed);
     ++(epochBumps().*counter);
 }
 

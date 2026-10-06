@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -49,6 +50,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         return;
     }
     if (reap) lastReapTry = now;
+    if (DrawPipeline::Active() && (submit || record || capped || recordAtLock)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Flush);
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
 
     if (record) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
