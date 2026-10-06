@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -772,7 +773,7 @@ private:
 
 // Storage images whose results have not reached guest memory yet.
 struct PendingWrites {
-    std::mutex mutex;
+    SlimMutex mutex;
     PendingList textures;
     // Images taken out of `textures` by a FlushPending still storing them (see adjacentPendingUnchanged).
     std::vector<StorageTexture*> flushing;
