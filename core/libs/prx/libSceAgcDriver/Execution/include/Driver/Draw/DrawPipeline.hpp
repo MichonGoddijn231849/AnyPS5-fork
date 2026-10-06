@@ -11,6 +11,7 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -29,15 +30,20 @@ public:
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
 
-    void Enqueue(Commit commit, std::vector<Range> writes);
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
+    // The value the newest in-flight write of [address, address + bytes) stores, when that write is
+    // a label covering the whole range (bytes <= 8, little endian).
+    std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
 
 private:
     struct Item {
         Commit commit;
         std::vector<Range> writes;
+        std::uint64_t labelAddress = 0;
+        std::vector<std::byte> labelBytes;
     };
     DrawPipeline() = default;
     void run();

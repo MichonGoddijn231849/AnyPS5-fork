@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -237,6 +238,78 @@ void Driver::dumpSampleCounters(std::uint64_t address) {
         const std::uint64_t value = ready | (db == 0 ? samples : 0u);
         GuestMemory::Write(address + db * 16u, std::as_bytes(std::span(&value, 1)), 8);
     }
+}
+
+bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue) {
+    static const bool ordered = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
+    if (!ordered || !DeferLabels() || (opcode != 0x49 && opcode != 0x37)) return false;
+    const bool endOfPipeInterrupt = opcode == 0x49 && ((packet[2] >> 24u) & 7u) != 0;
+    const auto label = Pm4::DecodeLabelWrite(packet);
+    if (!label.has_value()) {
+        if (opcode != 0x49) return false;
+        const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
+        if (!storesNothing) return false;
+        if (!endOfPipeInterrupt) {
+            ++noOpLabels;
+            return true;
+        }
+    }
+    std::uint64_t address = 0;
+    std::vector<std::byte> bytes;
+    std::vector<DrawPipeline::Range> writes;
+    if (label.has_value()) {
+        const auto stored = label->Bytes();
+        address = label->address;
+        bytes.assign(stored.begin(), stored.end());
+        writes.emplace_back(address, address + bytes.size());
+    }
+    if (endOfPipeInterrupt) bumpEpoch(&EpochBumps::drains);
+    auto stored = bytes;
+    DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt] {
+        GuestMemory::SetCurrentPacket(opcode, queue);
+        commitLabel(queue, address, bytes, endOfPipeInterrupt);
+    }, std::move(writes), address, std::move(stored));
+    return true;
+}
+
+void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool endOfPipeInterrupt) {
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    const auto localDevice = device.Load();
+    recordDeferredLabels(localDevice.get(), queue);
+    const bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
+    int reason = localDevice != nullptr ? 0 : 1;
+    if (!bytes.empty()) {
+        const auto stamp = ++eventSerial;
+        reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
+        if (reason != 0 && reason != 5 && reason != 6) {
+            if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
+            GuestMemory::Write(address, bytes, 4);
+        }
+        noteLabelStore(address, bytes, stamp);
+        Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+        countLabelOutcome(reason);
+        ++immediateLabels;
+    } else {
+        ++noOpLabels;
+    }
+    if (endOfPipeInterrupt) {
+        bool deferred = false;
+        if (localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
+            deferred = localDevice->AfterRecordedWork([queue] { AgcDriverDeliverEopInterrupt(queue); }, queue == 0);
+            if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0);
+        }
+        if (!deferred) AgcDriverDeliverEopInterrupt(queue);
+    }
+    submitDueAfterCommit(localDevice.get());
+}
+
+void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
+    if (localDevice == nullptr) return;
+    const auto pending = Graphics::Recorder::PendingLabelSince();
+    const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
+    const bool capped = batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap();
+    if (due || capped) localDevice->SubmitRecorded(true);
 }
 
 }
