@@ -63,7 +63,9 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     rethrowFailure();
     if (items.size() >= Depth()) {
         const auto start = std::chrono::steady_clock::now();
+        ++idleWaiters;
         idle.wait(lock, [&] { return items.size() < Depth(); });
+        --idleWaiters;
         fullWaitNs += elapsedNs(start);
         rethrowFailure();
     }
@@ -72,7 +74,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes)});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) thread = std::thread([this] { run(); });
-    wake.notify_one();
+    if (committerWaiting) wake.notify_one();
     if (!profile) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
@@ -110,7 +112,9 @@ void DrawPipeline::run() {
         Commit* commit = nullptr;
         {
             std::unique_lock lock(mutex);
+            committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty(); });
+            committerWaiting = false;
             commit = &items.front().commit;
         }
         const auto start = std::chrono::steady_clock::now();
@@ -133,7 +137,7 @@ void DrawPipeline::run() {
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
-        idle.notify_all();
+        if (idleWaiters != 0) idle.notify_all();
     }
 }
 
@@ -142,7 +146,9 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
     std::unique_lock lock(mutex);
+    ++idleWaiters;
     idle.wait(lock, [&] { return items.empty(); });
+    --idleWaiters;
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
