@@ -66,6 +66,11 @@ public:
     // dedicated pool, as before).
     SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes);
     void Free(const SetAllocation& allocation) noexcept;
+    // Sets whose every binding the user rewrites (a recorded draw's snapshot set, PrepareDrawBindings)
+    // go back to a per-layout list instead of their pool, and Allocate's twin takes them from it: a
+    // set per recorded draw otherwise allocates and frees inside the driver each time.
+    SetAllocation AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes);
+    void Recycle(VkDescriptorSetLayout layout, const SetAllocation& allocation) noexcept;
     // APS5_PROFILE_DRAW counters: layouts served from the map / created, sets allocated, pools opened.
     struct Stats {
         std::uint64_t layoutHits = 0;
@@ -83,6 +88,7 @@ private:
     mutable std::mutex mutex;
     std::map<std::vector<std::uint32_t>, VkDescriptorSetLayout> layouts;
     std::vector<VkDescriptorPool> pools;
+    std::unordered_map<VkDescriptorSetLayout, std::vector<SetAllocation>> recycled;
     Stats stats;
 };
 
@@ -113,6 +119,7 @@ public:
             std::shared_ptr<Buffer> buffer;
         };
         DescriptorCache* cache = nullptr;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
         ~DrawBindings();
