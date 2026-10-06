@@ -1289,10 +1289,40 @@ std::uint64_t RelieveGpuMemory(const Context& context) {
     return before > after ? before - after : 0;
 }
 
+// Every draw asks for each color target, and a lease copies the whole registry: the readable
+// ranges (no lease kept, which would pin them against unmaps) are copied once per registry
+// generation per thread. The generation is read before the copy, so a mutation ending meanwhile
+// leaves the copy filed under a generation no later query matches.
+// APS5_NO_REGISTERED_COVER_MEMO=1 takes a lease per query as before.
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    return containingRange(lease, address, address + bytes) != nullptr;
+    static const bool memo = std::getenv("APS5_NO_REGISTERED_COVER_MEMO") == nullptr;
+    if (!memo) {
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        return containingRange(lease, address, address + bytes) != nullptr;
+    }
+    struct ReadableRanges {
+        std::uint64_t generation = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    };
+    thread_local ReadableRanges readable;
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    if (readable.generation != generation) {
+        readable.ranges.clear();
+        {
+            const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+            readable.ranges.reserve(lease.size());
+            for (const auto& range : lease) {
+                if (range->readable) readable.ranges.emplace_back(range->address, range->address + range->bytes);
+            }
+        }
+        readable.generation = generation;
+    }
+    const auto end = address + bytes;
+    const auto found = std::upper_bound(readable.ranges.begin(), readable.ranges.end(), address, [](std::uint64_t value, const auto& range) { return value < range.first; });
+    if (found == readable.ranges.begin()) return false;
+    const auto& range = *std::prev(found);
+    return address >= range.first && end <= range.second;
 }
 
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes) {
