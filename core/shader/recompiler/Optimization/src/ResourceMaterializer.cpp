@@ -952,8 +952,9 @@ void ownPlanValues(IrResourcePlan& plan) {
             if (argument != nullptr) pending.push_back(argument);
         }
     }
+    // A clone's id is its index in valueStorage (IrResourcePlan::denseValueIds).
     for (const auto* value : order) {
-        auto clone = std::make_unique<IrValue>(value->Opcode(), value->Type(), value->Id());
+        auto clone = std::make_unique<IrValue>(value->Opcode(), value->Type(), static_cast<std::uint32_t>(plan.valueStorage.size()));
         clone->SetFlags(value->Flags<std::uint64_t>());
         if (value->HasImmediate()) clone->SetImmediateU64(value->ImmediateU64());
         clone->SetRegister(value->Register());
@@ -984,6 +985,7 @@ void ownPlanValues(IrResourcePlan& plan) {
     for (auto* root : roots) {
         if (*root != nullptr) *root = clones.at(*root);
     }
+    plan.denseValueIds = true;
 }
 
 }

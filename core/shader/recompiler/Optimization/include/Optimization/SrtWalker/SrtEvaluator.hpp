@@ -66,9 +66,38 @@ private:
     std::size_t _count = 0;
 };
 
+// An evaluator's memo over a plan with dense value ids (IrResourcePlan::denseValueIds): one slot
+// per value, indexed by its id. The arrays are the calling thread's, reused by later evaluators
+// and walks: a slot belongs to this memo only while it carries this memo's stamp (Done) or the
+// stamp plus one (the value is being evaluated: reaching it again is a cycle), so a fresh memo
+// needs no clearing.
+class DenseValues {
+public:
+    struct Slot {
+        std::uint64_t stamp = 0;
+        std::uint64_t value = 0;
+    };
+    explicit DenseValues(std::size_t values);
+    ~DenseValues();
+    DenseValues(const DenseValues&) = delete;
+    DenseValues& operator=(const DenseValues&) = delete;
+    Slot& At(std::uint32_t id) { return _slots[id]; }
+    [[nodiscard]] std::size_t Size() const { return _size; }
+    [[nodiscard]] std::uint64_t Done() const { return _stamp; }
+    [[nodiscard]] std::uint64_t Visiting() const { return _stamp + 1u; }
+
+private:
+    std::vector<Slot>* _array = nullptr;
+    Slot* _slots = nullptr;
+    std::size_t _size = 0;
+    std::uint64_t _stamp = 0;
+};
+
 class Evaluator {
 public:
-    Evaluator(const IrResourcePlan& program, const SrtRuntime& runtime, std::span<const std::uint8_t> cleanFlatSlots = {}, Evaluator* cleanEvaluator = nullptr, IrValue* activeMask = nullptr) : _program(program), _runtime(runtime), _cleanFlatSlots(cleanFlatSlots), _cleanEvaluator(cleanEvaluator), _activeMask(activeMask != nullptr ? activeMask->Resolve() : nullptr) {}
+    Evaluator(const IrResourcePlan& program, const SrtRuntime& runtime, std::span<const std::uint8_t> cleanFlatSlots = {}, Evaluator* cleanEvaluator = nullptr, IrValue* activeMask = nullptr) : _program(program), _runtime(runtime), _cleanFlatSlots(cleanFlatSlots), _cleanEvaluator(cleanEvaluator), _activeMask(activeMask != nullptr ? activeMask->Resolve() : nullptr), _dense(program.denseValueIds ? program.valueStorage.size() : 0u) {}
+    Evaluator(const Evaluator&) = delete;
+    Evaluator& operator=(const Evaluator&) = delete;
 
     bool Evaluate(IrValue* value, std::uint32_t& result);
     bool EvaluateWide(IrValue* raw, std::uint64_t& result);
@@ -90,6 +119,7 @@ private:
     IrValue* _activeMask = nullptr;
     EvaluatedValues _cache;
     std::vector<IrValue*> _visiting;
+    DenseValues _dense;
 };
 
 }

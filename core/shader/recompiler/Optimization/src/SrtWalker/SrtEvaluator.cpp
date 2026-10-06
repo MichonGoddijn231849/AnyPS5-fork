@@ -2,6 +2,7 @@
 #include "Optimization/SrtWalker/SrtAddressArithmetic.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -10,8 +11,47 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <memory>
 
 namespace ShaderRecompiler::Detail {
+
+namespace {
+
+// The calling thread's memo arrays, those not in use, and the stamps handed out (two per memo).
+struct DenseValuePool {
+    std::vector<std::unique_ptr<std::vector<DenseValues::Slot>>> arrays;
+    std::vector<std::vector<DenseValues::Slot>*> free;
+    std::uint64_t stamp = 0;
+};
+
+DenseValuePool& denseValuePool() {
+    struct DenseValuePoolStorage {};
+    return HostThreadLocal<DenseValuePool, DenseValuePoolStorage>();
+}
+
+}
+
+DenseValues::DenseValues(std::size_t values) : _size(values) {
+    if (values == 0u) return;
+    auto& pool = denseValuePool();
+    if (pool.free.empty()) {
+        pool.arrays.push_back(std::make_unique<std::vector<Slot>>());
+        _array = pool.arrays.back().get();
+    } else {
+        _array = pool.free.back();
+        pool.free.pop_back();
+    }
+    // Grown slots carry stamp 0, which no memo uses.
+    if (_array->size() < values) _array->resize(values);
+    _slots = _array->data();
+    pool.stamp += 2u;
+    _stamp = pool.stamp;
+}
+
+DenseValues::~DenseValues() {
+    if (_array == nullptr) return;
+    denseValuePool().free.push_back(_array);
+}
 
 bool Evaluator::Evaluate(IrValue* value, std::uint32_t& result) {
     std::uint64_t wide = 0;
@@ -41,6 +81,28 @@ bool Evaluator::EvaluateWide(IrValue* raw, std::uint64_t& result) {
     IrValue* inst = value;
     if (_activeMask != nullptr && IsRuntimeSelect(inst->Opcode()) && inst->ArgumentCount() == 3 && inst->Argument(0)->Resolve() == _activeMask) {
         return EvaluateWide(inst->Argument(1), result);
+    }
+    if (inst->Id() < _dense.Size()) {
+        // The same steps as below on the dense memo: a failure is not memoized either.
+        auto& slot = _dense.At(inst->Id());
+        if (slot.stamp == _dense.Done()) {
+            result = slot.value;
+            return true;
+        }
+        if (slot.stamp == _dense.Visiting()) {
+            return false;
+        }
+        slot.stamp = _dense.Visiting();
+        std::uint64_t out = 0;
+        if (!EvaluateInst(*inst, out)) {
+            slot.stamp = 0;
+            static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
+            if (debug) std::fprintf(stderr, "[srt] cannot evaluate %s (%zu arguments)\n", std::string(IrOpcodeName(inst->Opcode())).c_str(), inst->ArgumentCount());
+            return false;
+        }
+        slot = {_dense.Done(), out};
+        result = out;
+        return true;
     }
     if (_cache.Find(inst, result)) {
         return true;

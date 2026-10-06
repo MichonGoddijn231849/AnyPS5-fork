@@ -66,6 +66,10 @@ struct IrResourcePlan {
     // One byte per srtReads slot, 1 when the CPU walk never consumes the slot's value (see
     // Detail::ComputePureFlatSlots): a driver may reuse a capture whose words differ only there.
     std::vector<std::uint8_t> pureFlatSlots;
+    // Set by ResourceMaterializer::ExtractPlan: every value reachable from the plan's roots is in
+    // valueStorage and its Id() is its index there, so the SRT walk memoizes per value in a flat
+    // array instead of a hash table.
+    bool denseValueIds = false;
     bool requiresSpecializationMemory = false;
     bool srtPlanComplete = false;
     bool resourceTrackingComplete = false;
