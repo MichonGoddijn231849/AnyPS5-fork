@@ -207,7 +207,12 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
 ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
-        if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        const auto seq = DrawPipeline::CurrentSeq();
+        if (seq != 0) {
+            if (pipeline.Overlaps(address, bytes, seq)) pipeline.DrainBefore(seq);
+        } else if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) {
+            pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        }
     }
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;

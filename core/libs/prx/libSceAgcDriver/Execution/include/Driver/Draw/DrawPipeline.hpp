@@ -10,6 +10,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -30,10 +31,30 @@ public:
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
 
+    // A draw whose preparation runs on a helper thread (APS5_PARALLEL_DRAWS): its place in the
+    // order is taken at the packet, its commit and writes are published when the helper finishes.
+    // The committer waits for it in order; a helper's capture waits only for earlier items.
+    struct PendingDraw {
+        bool ready = false;
+        Commit commit;
+        std::vector<Range> writes;
+    };
+    static std::size_t Helpers();
+    // The sequence number of the item the calling helper prepares (0 on the queue worker).
+    static std::uint64_t& CurrentSeq();
+    // Runs `job` on the helper pool, in submission order (FIFO).
+    void RunOnHelper(std::function<void()> job);
+
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
+    std::uint64_t EnqueuePending(std::shared_ptr<PendingDraw> pending);
+    void Publish(const std::shared_ptr<PendingDraw>& pending, Commit commit, std::vector<Range> writes);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
+    // Waits until every item before `seq` is committed.
+    void DrainBefore(std::uint64_t seq);
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
-    bool Overlaps(std::uint64_t address, std::size_t bytes);
+    // Whether an in-flight item before `before` writes the range; a pending draw among them is waited
+    // for until its writes are known.
+    bool Overlaps(std::uint64_t address, std::size_t bytes, std::uint64_t before = ~std::uint64_t{0});
     // The value the newest in-flight write of [address, address + bytes) stores, when that write is
     // a label covering the whole range (bytes <= 8, little endian).
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
@@ -44,9 +65,13 @@ private:
         std::vector<Range> writes;
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
+        std::uint64_t seq = 0;
+        std::shared_ptr<PendingDraw> pending;
     };
     DrawPipeline() = default;
     void run();
+    void helperLoop();
+    void push(Item item, std::unique_lock<std::mutex>& lock);
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
 
@@ -58,7 +83,12 @@ private:
     std::atomic<std::size_t> outstanding{0};
     std::uint32_t idleWaiters = 0;
     bool committerWaiting = false;
+    std::uint64_t nextSeq = 1;
     std::thread thread;
+    std::mutex helperMutex;
+    std::condition_variable helperWake;
+    std::deque<std::function<void()>> helperJobs;
+    std::vector<std::thread> helpers;
     std::uint64_t commits = 0;
     std::uint64_t commitNs = 0;
     std::uint64_t commitErrors = 0;
