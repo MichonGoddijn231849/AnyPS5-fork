@@ -106,6 +106,8 @@ struct SpirvEmitterState {
     // The range the lane's last read lookup found (Private begin, end and device base), which the
     // read lookups try before their table search; 0 when not defined.
     std::array<std::uint32_t, 3> bdaRangeCache{};
+    // The shared image_bvh_intersect_ray functions by variant (see DefineBvhIntersectFunctions).
+    std::array<std::uint32_t, 4> bvhIntersectFunctions{};
     std::uint32_t bdaWritePointerFunction = 0;
     std::uint32_t bdaNoteWriteFunction = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
