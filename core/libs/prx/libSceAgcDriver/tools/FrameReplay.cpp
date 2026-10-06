@@ -703,6 +703,7 @@ public:
             ReplayAbandonRewinds();
             const bool finished = drain();
             presenter->WaitDone();
+            loopFlips.push_back(nextFlip.load());
             rethrowFailure();
             if (!options.dumpRanges.empty()) {
                 ReplaySettle();
@@ -771,10 +772,11 @@ private:
     void waitForFrames() {
         const auto loops = options.pngAllLoops ? loop : std::min<std::uint32_t>(loop, 1);
         for (std::uint32_t written = 0; written < loops; ++written) {
-            for (std::size_t flip = 0; flip < presents.size(); ++flip) {
+            const auto flips = written < loopFlips.size() ? std::min<std::size_t>(presents.size(), static_cast<std::size_t>(loopFlips[written])) : presents.size();
+            for (std::size_t flip = 0; flip < flips; ++flip) {
                 if (!presents[flip] || !presents[flip]->hasBuffer) continue;
                 const auto path = FramePath(*options.png, written, flip);
-                if (!LoadPng(path, std::chrono::seconds(30))) std::fprintf(stderr, "[replay] %s was not written\n", path.string().c_str());
+                if (!LoadPng(path, std::chrono::seconds(5))) std::fprintf(stderr, "[replay] %s was not written\n", path.string().c_str());
             }
         }
     }
@@ -1157,6 +1159,7 @@ private:
     std::map<std::uint32_t, std::shared_ptr<ReplayOutput>> outputs;
     std::array<std::uint64_t, QueueCount> base{};
     std::atomic<std::uint64_t> nextFlip{0};
+    std::vector<std::uint64_t> loopFlips;
     std::mutex flipTimesMutex;
     std::vector<Clock::time_point> flipTimes;
     std::uint32_t loop = 0;
@@ -1203,7 +1206,7 @@ int Compare(const std::filesystem::path& replayed, const std::filesystem::path& 
     std::size_t missing = 0;
     for (std::size_t flip = 0; flip < presents.size(); ++flip) {
         if (!presents[flip] || !presents[flip]->hasBuffer) continue;
-        const auto ours = LoadPng(FramePath(replayed, 0, flip), std::chrono::seconds(30));
+        const auto ours = LoadPng(FramePath(replayed, 0, flip), std::chrono::seconds(2));
         const auto theirs = LoadPng(FramePath(reference, 0, flip), std::chrono::seconds(0));
         if (!ours || !theirs) {
             std::fprintf(stderr, "[compare] frame %zu: %s missing\n", flip, !ours ? "replayed frame" : "reference frame");
