@@ -105,6 +105,12 @@ ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regio
     }
 }
 
+ShaderMemory::ShaderMemory(ShaderMemory&& other) noexcept : initial(std::move(other.initial)), pages(std::move(other.pages)), lastBase(other.lastBase), lastPage(other.lastPage), pendingWrite(other.pendingWrite), observe(other.observe), hookWaits(other.hookWaits) {
+    other.pages.clear();
+    other.lastBase = ~std::uint64_t{0};
+    other.lastPage = nullptr;
+}
+
 ShaderMemory::~ShaderMemory() {
     auto& pool = pagePool<Page>();
     for (const auto& [base, page] : pages) {

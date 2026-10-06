@@ -58,6 +58,8 @@ public:
     ~ShaderMemory();
     ShaderMemory(const ShaderMemory&) = delete;
     ShaderMemory& operator=(const ShaderMemory&) = delete;
+    ShaderMemory(ShaderMemory&& other) noexcept;
+    ShaderMemory& operator=(ShaderMemory&&) = delete;
     // Returns what the capture resolved (plan, snapshot, specialization) for
     // ShaderRecompiler::Recompile(request, capture), which then skips its own materialization. One
     // result per call: the draw path captures several stages on one ShaderMemory. With `handle`
