@@ -73,11 +73,27 @@ private:
     static constexpr std::size_t PageBytes = 4096;
     static constexpr std::size_t PageWords = PageBytes / sizeof(std::uint32_t);
 
+    // One bit per page word, scanned 64 words at a time for the runs Regions() reports.
+    class WordMask {
+    public:
+        [[nodiscard]] bool Test(std::size_t index) const { return (bits[index / 64u] >> (index % 64u) & 1u) != 0u; }
+        void Set(std::size_t index) { bits[index / 64u] |= std::uint64_t{1} << (index % 64u); }
+        void SetAll() { bits.fill(~std::uint64_t{0}); }
+        void Reset() { bits.fill(0u); }
+        [[nodiscard]] bool None() const;
+        // Calls `run(first, end)` for each maximal run of set bits, in index order.
+        template<typename TRun>
+        void ForEachRun(TRun&& run) const;
+
+    private:
+        std::array<std::uint64_t, PageWords / 64u> bits{};
+    };
+
     struct Page {
         std::array<std::uint32_t, PageWords> words{};
-        std::bitset<PageWords> valid;
-        std::bitset<PageWords> read;
-        std::bitset<PageWords> recent;
+        WordMask valid;
+        WordMask read;
+        WordMask recent;
         bool wordwise = false;
     };
 
