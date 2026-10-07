@@ -4,13 +4,16 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <thread>
 
 namespace AgcDriver::DriverDetail {
 
@@ -189,7 +192,21 @@ bool Driver::captureStart() {
     // in submission order, as its first submissions.
     std::vector<BlockedWait> carried;
     std::vector<std::uint32_t> skippedPacket;
+    // Released on every return: the held waits run on once the capture recorded its start (or gave up).
+    struct HoldRelease {
+        std::atomic<bool>& hold;
+        ~HoldRelease() { hold.store(false, std::memory_order_release); }
+    } holdRelease{captureHold};
+    std::array<std::uint64_t, Capture::QueueCount> executedAtHold{};
     if (!DrainFor(drainLimit)) {
+        // No blocked queue may run on from here: a wait satisfied while the base snapshot is written
+        // (the game releasing queue 0's REWIND with the next frame's commands) would execute work the
+        // capture neither records nor keeps out of the snapshot, which the replay then runs a second
+        // time over its results. Each wait holds until this returns (holdForCapture); a wait that read
+        // the hold just before it was set is out of its wait within the pause, and the queue then
+        // shows as running, which makes this attempt retry at the next flip.
+        captureHold.store(true, std::memory_order_release);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
         std::uint64_t pending = 0;
         {
             std::lock_guard lock(mutex);
@@ -197,6 +214,10 @@ bool Driver::captureStart() {
             for (std::uint32_t queue = 0; queue < inFlightSource.size(); ++queue) {
                 const auto* source = inFlightSource[queue].load(std::memory_order_acquire);
                 if (source == nullptr) continue;
+                if (!queueBlocked[queue].load(std::memory_order_acquire)) {
+                    std::fprintf(stderr, "[frame-capture] queue 0x%x is running, not blocked in a wait, at flip %llu; retrying after the next flip\n", queue, static_cast<unsigned long long>(capture.flips));
+                    return false;
+                }
                 // The worker is blocked on the packet at the cursor (a wait the rest of the frame
                 // releases); the carried part starts after it, or is empty.
                 const auto* commands = inFlightCommands[queue].load(std::memory_order_relaxed);
@@ -232,8 +253,13 @@ bool Driver::captureStart() {
         }
     }
     Settle();
+    for (std::size_t queue = 0; queue < executedAtHold.size(); ++queue) executedAtHold[queue] = packetsExecuted[queue].load(std::memory_order_acquire);
     std::fprintf(stderr, "[frame-capture] starting after flip %llu%s\n", static_cast<unsigned long long>(capture.flips), carried.empty() ? "" : " with blocked submissions carried");
     capture.Begin(capture.flips);
+    for (std::size_t queue = 0; queue < executedAtHold.size(); ++queue) {
+        const auto executed = packetsExecuted[queue].load(std::memory_order_acquire);
+        if (executed != executedAtHold[queue]) std::fprintf(stderr, "[frame-capture] WARNING: queue 0x%zx executed %llu packets while the base snapshot was written; the capture may not be consistent\n", queue, static_cast<unsigned long long>(executed - executedAtHold[queue]));
+    }
     std::vector<std::shared_ptr<const ShaderSnapshot>> registered;
     {
         std::lock_guard lock(mutex);

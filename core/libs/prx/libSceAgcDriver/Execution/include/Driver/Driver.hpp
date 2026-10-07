@@ -96,6 +96,9 @@ private:
     bool queue0Before(std::uint64_t received) const;
     bool orderReleased(std::uint32_t queue, std::uint64_t received) const;
     void noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool blocked);
+    // While a capture starts, a queue blocked in a wait stays blocked even once the wait is satisfied
+    // (see captureStart): called by the waits before they stop counting as blocked.
+    void holdForCapture() const noexcept;
     void reportPresents(double waitedMs, std::size_t inFlight);
     static bool stampValidate();
     static bool dataHits();
@@ -382,6 +385,7 @@ private:
     std::array<std::atomic<std::size_t>, Capture::QueueCount> inFlightRewindWords{};
     std::array<std::atomic<std::uint64_t>, Capture::QueueCount> inFlightReceived{};
     std::array<std::atomic<bool>, Capture::QueueCount> queueBlocked{};
+    std::atomic<bool> captureHold{false};
     std::array<std::atomic<std::uint64_t>, Capture::QueueCount> queueAwaited{};
     std::array<std::uint64_t, Capture::QueueCount> progressBase{};
 

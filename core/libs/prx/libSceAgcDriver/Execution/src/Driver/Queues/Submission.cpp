@@ -8,7 +8,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Capture/FrameCapture.hpp"
 #include "ThreadOwned.hpp"
 #include <bit>
+#include <chrono>
 #include <cstdlib>
+#include <thread>
 
 namespace AgcDriver::DriverDetail {
 
@@ -125,7 +127,10 @@ void Driver::executeRewindTail(const Submission& stalled) {
         struct BlockedWait {
             Driver& driver;
             std::uint32_t queue;
-            ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
+            ~BlockedWait() {
+                driver.holdForCapture();
+                driver.noteWaitBlocked(queue, 0, false);
+            }
         } blocked{*this, stalled.queue};
         while ((control.load(std::memory_order_acquire) & 0x80000000u) == 0) {
             CheckFailure();
@@ -297,6 +302,10 @@ bool Driver::orderReleased(std::uint32_t queue, std::uint64_t received) const {
     if (awaited == 0) return false;
     if (workers.at(queue).unfinishedWrites.contains(awaited & ~std::uint64_t{3})) return true;
     return runningWorkers.load(std::memory_order_acquire) == 0 && !completionsPending() && !Graphics::Recorder::SnapshotWriteOverlaps(awaited, 4);
+}
+
+void Driver::holdForCapture() const noexcept {
+    while (captureHold.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::microseconds(200));
 }
 
 void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool blocked) {

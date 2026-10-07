@@ -7,6 +7,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <intrin.h>
 #else
 #include <pthread.h>
 #include <time.h>
@@ -32,6 +33,25 @@ Registered& Threads() {
     static auto* registered = new Registered();
     return *registered;
 }
+
+#ifdef _WIN32
+// QueryThreadCycleTime counts time stamp counter cycles, which run at a constant rate: calibrated once against the
+// performance counter over 20 ms (the first read pays it; only the replay tool reads the clocks).
+double NsPerCycle() {
+    static const double ratio = [] {
+        LARGE_INTEGER frequency{}, start{}, stop{};
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&start);
+        const auto cyclesStart = __rdtsc();
+        Sleep(20);
+        QueryPerformanceCounter(&stop);
+        const auto cycles = __rdtsc() - cyclesStart;
+        const double ns = static_cast<double>(stop.QuadPart - start.QuadPart) * 1e9 / static_cast<double>(frequency.QuadPart);
+        return cycles != 0 ? ns / static_cast<double>(cycles) : 0.0;
+    }();
+    return ratio;
+}
+#endif
 
 }
 
@@ -61,10 +81,10 @@ std::int64_t DriverThreadCpuNs(DriverThread role) noexcept {
     std::lock_guard lock(registered.mutex);
 #ifdef _WIN32
     if (registered.threads[index] == nullptr) return -1;
-    FILETIME creation{}, exited{}, kernel{}, user{};
-    if (!GetThreadTimes(registered.threads[index], &creation, &exited, &kernel, &user)) return -1;
-    const auto ticks = [](const FILETIME& time) { return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32u) | time.dwLowDateTime; };
-    return static_cast<std::int64_t>((ticks(kernel) + ticks(user)) * 100u);
+    // GetThreadTimes advances in scheduler ticks (15.6 ms), coarser than a frame; the thread's cycle count is exact.
+    ULONG64 cycles = 0;
+    if (!QueryThreadCycleTime(registered.threads[index], &cycles)) return -1;
+    return static_cast<std::int64_t>(static_cast<double>(cycles) * NsPerCycle());
 #else
     if (!registered.known[index]) return -1;
     timespec now{};

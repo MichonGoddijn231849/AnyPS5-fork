@@ -70,6 +70,13 @@ struct Options {
     std::optional<std::filesystem::path> compare;
     bool pacing = true;
     bool settle = false;
+    // --hash-check: hash guest memory (64 KiB blocks, GPU results flushed) at the loop's start, after every
+    // pacing point under --settle, and at its end; later loops report the blocks that differ from loop 0.
+    bool hashCheck = false;
+    // --hash-check=N: only the first N pacing points are hashed (the start and the end always are).
+    std::size_t hashPointLimit = ~std::size_t{0};
+    // --flush-check: at each loop's end, the blocks a texture write-back changes after the access hook's flush.
+    bool flushCheck = false;
     bool hidden = false;
     // Collect the restore's writes before the loop starts (see restore()).
     bool restoreCollect = true;
@@ -664,6 +671,16 @@ public:
             if (prologueEnd == 0 && (event.type == EventType::Progress || event.type == EventType::Submit)) prologueEnd = i;
         }
         if (prologueEnd == 0) Fail("the capture has no submissions");
+        // The game presents behind its flips: a present recorded while the capture finished can name a flip past
+        // the captured ones, which the replay never makes.
+        if (!capture.events.empty() && capture.events.back().type == EventType::End) {
+            Reader reader(capture.events.back().payload);
+            const auto end = reader.Get<EndEvent>();
+            if (presents.size() > end.flips) {
+                std::fprintf(stderr, "[replay] %zu presents name flips past the %llu captured; not replayed\n", static_cast<std::size_t>(std::count_if(presents.begin() + static_cast<std::ptrdiff_t>(end.flips), presents.end(), [](const auto& present) { return present.has_value(); })), static_cast<unsigned long long>(end.flips));
+                presents.resize(static_cast<std::size_t>(end.flips));
+            }
+        }
         if (shifted != 0) std::fprintf(stderr, "[replay] %zu presents placed by their flip serial differ from their Present count (APS5_REPLAY_FLIP_SERIALS)\n", shifted);
     }
 
@@ -699,6 +716,9 @@ public:
                 restore();
             }
             dumpRanges("start");
+            hashPoints = 0;
+            hashDifferingPoints = 0;
+            if (options.hashCheck) hashPoint("start");
             for (std::size_t queue = 0; queue < QueueCount; ++queue) base[queue] = ReplayPacketsExecuted(static_cast<std::uint32_t>(queue));
             nextFlip.store(0);
             const auto presentedBefore = presenter->Presented();
@@ -726,6 +746,11 @@ public:
                 ReplaySettle();
                 dumpRanges("end");
             }
+            if (options.hashCheck) {
+                ReplaySettle();
+                hashPoint("end");
+            }
+            if (options.flushCheck) flushCheck();
             if (options.dumpBvh.has_value() && loop == 0) {
                 ReplaySettle();
                 dumpBvhs();
@@ -1047,6 +1072,7 @@ private:
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
         if (options.settle) ReplaySettle();
+        if (options.settle && options.hashCheck && hashPoints <= options.hashPointLimit) hashPoint("pacing point");
         const auto waitedMs = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
         pacingMs += waitedMs;
         const double traceMs = TracePacingMs();
@@ -1067,6 +1093,102 @@ private:
     }
 
     // --dump-range: the range's guest bytes (GPU writes flushed) into range_<address>_loop<n>_<when>.bin.
+    // --hash-check: one hash per committed readable 64 KiB block of every registered range, GPU results
+    // flushed first. Loop 0 keeps each point's hashes; a later loop reports the blocks that differ at the
+    // same point (the first points in full, later ones as a count).
+    static constexpr std::uint64_t HashBlockBytes = 64 * 1024;
+
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> blockHashes() {
+        constexpr std::uint64_t BlockBytes = HashBlockBytes;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> hashes;
+        for (const auto& range : space.Registry()) {
+            if (!range.readable) continue;
+            const auto end = range.address + range.bytes;
+            for (auto cursor = range.address; cursor < end;) {
+                ReplayPlatform::Region info;
+                if (!ReplayPlatform::Query(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), info)) break;
+                const auto regionEnd = std::min<std::uint64_t>(end, info.base + info.bytes);
+                if (info.readable) {
+                    AgcDriver::GuestMemory::FlushGpuWrites(cursor, static_cast<std::size_t>(regionEnd - cursor));
+                    for (auto block = cursor; block < regionEnd; block = std::min(regionEnd, (block & ~(BlockBytes - 1)) + BlockBytes)) {
+                        const auto stop = std::min(regionEnd, (block & ~(BlockBytes - 1)) + BlockBytes);
+                        std::uint64_t hash = 0x9e3779b97f4a7c15ull;
+                        const auto* bytes = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(block));
+                        for (std::uint64_t at = 0; at + 8 <= stop - block; at += 8) {
+                            std::uint64_t word;
+                            std::memcpy(&word, bytes + at, sizeof(word));
+                            hash = (hash ^ word) * 0x100000001b3ull;
+                            hash ^= hash >> 29u;
+                        }
+                        hashes.emplace_back(block, hash);
+                    }
+                }
+                cursor = regionEnd;
+            }
+        }
+        return hashes;
+    }
+
+    // The blocks whose hashes differ between two block-hash lists, merged into ranges; `blocks` counts them.
+    static std::vector<std::pair<std::uint64_t, std::uint64_t>> differingRanges(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& reference, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& hashes, std::size_t& blocks) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> differing;
+        blocks = 0;
+        std::size_t r = 0;
+        for (const auto& [block, hash] : hashes) {
+            while (r < reference.size() && reference[r].first < block) ++r;
+            if (r < reference.size() && reference[r].first == block && reference[r].second == hash) continue;
+            ++blocks;
+            const auto blockEnd = (block & ~(HashBlockBytes - 1)) + HashBlockBytes;
+            if (!differing.empty() && differing.back().second >= block) differing.back().second = blockEnd;
+            else differing.emplace_back(block, blockEnd);
+        }
+        return differing;
+    }
+
+    static std::string rangeList(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::size_t limit) {
+        std::string text;
+        for (std::size_t i = 0; i < ranges.size() && i < limit; ++i) {
+            char item[64];
+            std::snprintf(item, sizeof(item), " %llx+%llx", static_cast<unsigned long long>(ranges[i].first), static_cast<unsigned long long>(ranges[i].second - ranges[i].first));
+            text += item;
+        }
+        if (ranges.size() > limit) text += " ...";
+        return text;
+    }
+
+    void hashPoint(const char* what) {
+        auto hashes = blockHashes();
+        const auto point = hashPoints++;
+        if (loop == 0) {
+            if (hashReference.size() <= point) hashReference.resize(point + 1);
+            hashReference[point] = std::move(hashes);
+            return;
+        }
+        if (point >= hashReference.size()) {
+            std::fprintf(stderr, "[hash] loop %u point %zu (%s): loop 0 has no such point\n", loop, point, what);
+            return;
+        }
+        std::size_t blocks = 0;
+        const auto differing = differingRanges(hashReference[point], hashes, blocks);
+        if (blocks == 0) return;
+        ++hashDifferingPoints;
+        const auto text = hashDifferingPoints <= 4 ? rangeList(differing, 24) : std::string();
+        std::fprintf(stderr, "[hash] loop %u point %zu (%s): %zu blocks differ from loop 0 in %zu ranges%s\n", loop, point, what, blocks, differing.size(), text.c_str());
+    }
+
+    // --flush-check: what a capture's base snapshot would miss. The memory as the access hook leaves it
+    // (every pending GPU result an access stores) against the memory after every cached texture is
+    // written back and dropped; a block that differs holds results the hook keeps on the GPU.
+    void flushCheck() {
+        ReplaySettle();
+        const auto hooked = blockHashes();
+        ReplayClearCaches(CacheTextures);
+        ReplaySettle();
+        std::size_t blocks = 0;
+        const auto differing = differingRanges(hooked, blockHashes(), blocks);
+        std::fprintf(stderr, "[flush-check] loop %u: %zu blocks change when every texture is written back, in %zu ranges%s\n", loop, blocks, differing.size(), rangeList(differing, 48).c_str());
+    }
+
     void dumpRanges(const char* when) {
         for (const auto& [address, bytes] : options.dumpRanges) {
             AgcDriver::GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
@@ -1221,6 +1343,10 @@ private:
         return {AgcDriver::DriverThreadCpuNs(AgcDriver::DriverThread::Queue0Worker), AgcDriver::DriverThreadCpuNs(AgcDriver::DriverThread::Committer)};
     }
     std::uint32_t loop = 0;
+    // --hash-check: loop 0's block hashes per point, the point counter of the running loop, and how many points differed.
+    std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> hashReference;
+    std::size_t hashPoints = 0;
+    std::size_t hashDifferingPoints = 0;
     double pacingMs = 0;
     static constexpr std::size_t ParallelWritePages = 256;
     static constexpr std::size_t WriteChunkPages = 64;
@@ -1262,23 +1388,30 @@ void ReplayOutput::Fail(std::exception_ptr error) noexcept {
     owner.NoteFailure(error);
 }
 
-int Compare(const std::filesystem::path& replayed, const std::filesystem::path& reference, const std::vector<std::optional<PresentEvent>>& presents) {
+// Loop 0's frames decide the result; with --png-all-loops the later loops' frames are compared with the same
+// reference too ("loop N frame M"), for runs whose loops should repeat the capture.
+int Compare(const std::filesystem::path& replayed, const std::filesystem::path& reference, const std::vector<std::optional<PresentEvent>>& presents, std::uint32_t loops) {
     std::fprintf(stderr, "[compare] %s against %s\n", replayed.string().c_str(), reference.string().c_str());
     double worst = std::numeric_limits<double>::infinity();
     std::size_t compared = 0;
     std::size_t missing = 0;
+    for (std::uint32_t loop = 0; loop < loops; ++loop) {
+    char label[32];
+    if (loop == 0) label[0] = '\0';
+    else std::snprintf(label, sizeof(label), "loop %u ", loop);
     for (std::size_t flip = 0; flip < presents.size(); ++flip) {
         if (!presents[flip] || !presents[flip]->hasBuffer) continue;
-        const auto ours = LoadPng(FramePath(replayed, 0, flip), std::chrono::seconds(2));
+        if (loop != 0 && !std::filesystem::exists(FramePath(replayed, loop, flip))) continue;
+        const auto ours = LoadPng(FramePath(replayed, loop, flip), std::chrono::seconds(2));
         const auto theirs = LoadPng(FramePath(reference, 0, flip), std::chrono::seconds(0));
         if (!ours || !theirs) {
-            std::fprintf(stderr, "[compare] frame %zu: %s missing\n", flip, !ours ? "replayed frame" : "reference frame");
-            ++missing;
+            std::fprintf(stderr, "[compare] %sframe %zu: %s missing\n", label, flip, !ours ? "replayed frame" : "reference frame");
+            if (loop == 0) ++missing;
             continue;
         }
         if (ours->width != theirs->width || ours->height != theirs->height) {
-            std::fprintf(stderr, "[compare] frame %zu: size %dx%d differs from the reference %dx%d\n", flip, ours->width, ours->height, theirs->width, theirs->height);
-            ++missing;
+            std::fprintf(stderr, "[compare] %sframe %zu: size %dx%d differs from the reference %dx%d\n", label, flip, ours->width, ours->height, theirs->width, theirs->height);
+            if (loop == 0) ++missing;
             continue;
         }
         std::uint32_t maximum = 0;
@@ -1296,12 +1429,34 @@ int Compare(const std::filesystem::path& replayed, const std::filesystem::path& 
             maximum = std::max(maximum, pixelMax);
             if (pixelMax > 8) ++differing;
         }
+        // APS5_REPLAY_COMPARE_CURVE=1: the mean replayed channel value per 16-value band of the reference's, which
+        // tells a tone or transfer-function difference (a smooth curve) from content differences (noise).
+        static const bool curve = std::getenv("APS5_REPLAY_COMPARE_CURVE") != nullptr;
+        if (curve) {
+            std::array<double, 16> sums{};
+            std::array<std::uint64_t, 16> counts{};
+            for (std::size_t sample = 0; sample < ours->pixels.size(); ++sample) {
+                if (sample % 4 == 3) continue;
+                const auto band = theirs->pixels[sample] / 16u;
+                sums[band] += ours->pixels[sample];
+                ++counts[band];
+            }
+            std::string text;
+            for (std::size_t band = 0; band < 16; ++band) {
+                char item[32];
+                std::snprintf(item, sizeof(item), " %zu:%.0f", band * 16 + 8, counts[band] != 0 ? sums[band] / static_cast<double>(counts[band]) : -1.0);
+                text += item;
+            }
+            std::fprintf(stderr, "[compare] %sframe %zu curve (reference band centre: mean replayed):%s\n", label, flip, text.c_str());
+        }
         const auto samples = static_cast<double>(ours->pixels.size() / 4 * 3);
         const auto mse = squared / samples;
         const auto psnr = mse == 0 ? std::numeric_limits<double>::infinity() : 10.0 * std::log10(255.0 * 255.0 / mse);
+        std::fprintf(stderr, "[compare] %sframe %zu: PSNR %.1f dB, mean |diff| %.2f, max %u, %.2f%% of pixels differ by more than 8\n", label, flip, psnr, absolute / samples, maximum, 100.0 * static_cast<double>(differing) / static_cast<double>(ours->pixels.size() / 4));
+        if (loop != 0) continue;
         worst = std::min(worst, psnr);
         ++compared;
-        std::fprintf(stderr, "[compare] frame %zu: PSNR %.1f dB, mean |diff| %.2f, max %u, %.2f%% of pixels differ by more than 8\n", flip, psnr, absolute / samples, maximum, 100.0 * static_cast<double>(differing) / static_cast<double>(ours->pixels.size() / 4));
+    }
     }
     std::fprintf(stderr, "[compare] %zu frames compared, %zu missing; worst PSNR %.1f dB\n", compared, missing, worst);
     return missing == 0 ? 0 : 1;
@@ -1324,7 +1479,7 @@ std::uint32_t ParseCacheClasses(const std::string& list) {
 Options ParseOptions(int argc, char** argv) {
     Options options;
     const auto usage = [] {
-        Fail("usage: agc_frame_replay <capture dir> [--loop N] [--png DIR] [--png-scale N] [--png-all-loops] [--compare DIR] [--no-pacing] [--settle] [--hidden] [--summary] [--shader-cache DIR] [--cold[=live|all|dispatch,draw,resources,textures,tables,space]]");
+        Fail("usage: agc_frame_replay <capture dir> [--loop N] [--png DIR] [--png-scale N] [--png-all-loops] [--compare DIR] [--no-pacing] [--settle] [--hash-check[=N]] [--flush-check] [--hidden] [--summary] [--shader-cache DIR] [--cold[=live|all|dispatch,draw,resources,textures,tables,space]]");
     };
     if (argc < 2) usage();
     for (int i = 1; i < argc; ++i) {
@@ -1350,6 +1505,12 @@ Options ParseOptions(int argc, char** argv) {
         }
         else if (argument == "--dump-bvh") options.dumpBvh = std::filesystem::path(value());
         else if (argument == "--settle") options.settle = true;
+        else if (argument == "--hash-check") options.hashCheck = true;
+        else if (argument == "--flush-check") options.flushCheck = true;
+        else if (argument.rfind("--hash-check=", 0) == 0) {
+            options.hashCheck = true;
+            options.hashPointLimit = std::stoull(argument.substr(13));
+        }
         else if (argument == "--hidden") options.hidden = true;
         else if (argument == "--summary") options.summary = true;
         else if (argument == "--shader-cache") options.shaderCache = value();
@@ -1405,7 +1566,7 @@ int main(int argc, char** argv) {
         Replayer replayer(options, capture);
         replayer.Run();
         int status = replayer.Stuck() || ReplayCommandMismatches() != 0 ? 2 : 0;
-        if (options.png && options.compare) status = std::max(status, Compare(*options.png, *options.compare, replayer.Presents()));
+        if (options.png && options.compare) status = std::max(status, Compare(*options.png, *options.compare, replayer.Presents(), options.pngAllLoops ? options.loops : 1));
         std::fflush(stdout);
         std::fflush(stderr);
         ReplayPlatform::Exit(status);

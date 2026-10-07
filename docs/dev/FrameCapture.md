@@ -14,6 +14,8 @@ Set two environment variables before starting the title:
 
 At flip `a` the submitting thread waits until every earlier submission completed (3 s; otherwise it retries after the next flip), drains the device, and writes the base snapshot. The game keeps running after the capture finishes. Progress lines start with `[frame-capture]`.
 
+A submission still blocked in a wait at that point (GTA V's queue 0 on its closing REWIND) is carried. Every blocked wait is held until the start is recorded, even once satisfied. Otherwise the game releasing the REWIND during the base snapshot ran the next frame live, unrecorded, while the snapshot was read. The replay then ran that frame a second time over its own results (doubled exposure adaptation, broken temporal history), and the tail ran unpaced at each loop start (loops differing from each other). A queue found running instead of blocked makes the attempt retry at the next flip. `WARNING: queue ... executed ... packets while the base snapshot was written` marks a capture that is still inconsistent.
+
 Output:
 
 - `capture.txt`: status, frames, submissions per queue, address-space size and changes, base/delta sizes per frame, timings.
@@ -38,6 +40,10 @@ Output:
 | `--for-seconds S` | Loop until S seconds have passed after loop 0 (instead of `--loop`). |
 | `--no-restore-collect` | Leave the restore's write-watch walk to the first frame (by default the replay collects the pages it rewrote before the loop starts). |
 | `--no-delta-merge` | Copy each delta page whole instead of only the words the capture changed since the page's previous captured version (by default the words the replay's GPU wrote ahead of the capture are kept). |
+| `--hash-check[=N]` | Hash guest memory per 64 KiB block (GPU results flushed) at each loop's start and end, and with `--settle` at the first N pacing points; later loops print `[hash]` lines naming the blocks that differ from loop 0 at the same point. Finds where loops stop repeating each other. |
+| `--flush-check` | At each loop's end, list the blocks that change when every cached texture is written back after the access hook's flush: GPU results a capture's base snapshot would miss. |
+
+With `--png-all-loops`, `--compare` also compares every later loop's frames (`loop N frame M`); only loop 0 decides the exit status. `APS5_REPLAY_COMPARE_CURVE=1` adds the mean replayed value per 16-value band of the reference: a smooth curve is a tone or exposure difference, noise is content. Presents recorded past the captured flips are dropped (the game presents behind its flips). The per-frame `cpu ms` lines read the worker's and the committer's thread cycle counts.
 
 Each loop also prints `frame ms` (every frame's time: from the loop start, or the previous frame's GPU completion, to its own) and the time spent writing the capture's memory deltas. Deltas of 256 pages or more are written by four threads, as the title's own threads write them in the game. `APS5_TRACE_PACING=ms` lists the pacing waits longer than that with every queue's progress.
 
