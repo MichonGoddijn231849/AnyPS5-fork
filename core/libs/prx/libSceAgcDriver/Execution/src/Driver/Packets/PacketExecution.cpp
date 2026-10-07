@@ -213,7 +213,7 @@ void Driver::execute(const Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
-        if (pipelined && header != FlipPacketHeader && header != RenderingWaitPacketHeader && enqueueLabelPacket(packet, opcode, submission.queue)) {
+        if (pipelined && header != FlipPacketHeader && header != RenderingWaitPacketHeader && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue))) {
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
             packetsExecuted[submission.queue].fetch_add(1, std::memory_order_release);

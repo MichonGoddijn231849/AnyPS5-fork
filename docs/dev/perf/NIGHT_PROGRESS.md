@@ -22,6 +22,7 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
 | B6 pipelined-draw prerequisites | `fix(agc): storage images and exact target ranges in the pipelined draws' write ranges` | storage images: none (a fix to the pipelined path, which is itself off by default); exact ranges: `APS5_EXACT_DRAW_WRITES=1` | `agc_driver_draw_write_ranges`: a storage image a draw stores to is a write range (surface and keys), one it only reads is not, one without flags counts as written; the exact color/DCC/depth/stencil/HTILE ranges hold every addressed texel and nothing past the layout; the estimates cover the exact ranges; 4-sample targets scale. |
 | B8c flip numbering | `feat(agc): record each present's flip serial; replay by it under a switch` | `APS5_REPLAY_FLIP_SERIALS=1` (replay); the capture always records the serial in the event's reserved bytes | not tested end to end (no game capture here; the flip test's fake output never calls `Driver::Present`). `--summary` now lists every present's Present-count index beside its flip serial |
 | B8a replay main thread | `perf(agc): replay restores its page map from an undo log` | none (tool; same results) | builds on Linux; not run end to end (no game capture here) |
+| B9 DMA_DATA commit items | `perf(agc): pipelined DMA_DATA as ordered commit items` | `APS5_PIPELINE_DMA=1` (with `APS5_PIPELINED_DRAWS=1`) | `agc_driver_pipelined_dma`: an immediate fill and a copy of it in one DCB land as the CPU path stores them, in order (the copy sees the fill), both committed, none drained. The `agc_*` suite passes with it on, with and without pipelined draws. Dispatch commit items: design only (below) |
 
 ### B7: exit crash
 
@@ -296,3 +297,55 @@ Day-session check:
 
 Still open before the default can flip: CMASK's exact size, and mipmapped color views (only the view's mip range is
 used; writes go only there).
+
+### B9: the remaining drains
+
+**DMA_DATA** (`APS5_PIPELINE_DMA=1`). Queue 0's `DMA_DATA` to memory is now an ordered commit item, as fills and
+labels already were (`Driver::enqueueDmaPacket`, called next to `enqueueLabelPacket` before the drain decision).
+The commit runs under the GPU lock after the draws before it:
+
+- **Immediate** (source 2): the depth and color metadata fill notes, then the pattern. Up to 64 KiB it is stored on
+  the GPU like a label; larger, or when the GPU path refuses, it waits for the device and stores on the CPU.
+- **Memory-to-memory copy**: the source is read at the commit, not at enqueue, because draws before it may write it.
+  A copy over 64 KiB is recorded with `CopyBuffer`; a smaller one, or one the GPU refuses, is stored like an
+  immediate (the checked `GuestMemory::Read` waits for recorded writes to the source).
+
+The write range is the destination. These keep the drain: GDS or register selectors, overlapping copies,
+inaccessible ranges, and labels still deferred.
+
+Expected saving: the ~1.3k `DMA_DATA` drains per 10 s live. Each drain waits for the whole pipeline, so it is
+worth more than the packet itself.
+
+Day-session check: `APS5_PROFILE_DRAW=1 APS5_PIPELINED_DRAWS=1` with and without `APS5_PIPELINE_DMA=1`. The
+`[draw] pipelined ... drains:` line should show no `packet 0x50` drains, and frames should be unchanged.
+
+**Dispatch commit items: design, not implemented.** Today a non-HLE `DISPATCH_DIRECT` on pipelined queue 0 drains
+(`Dispatch.cpp`, before `copyBuffer`) because:
+
+1. its capture (user data, V#s, the memory the recompiler reads) must see the draws before it;
+2. its stage A (`PrepareDispatch`, without the GPU lock) copies read-only guest buffers on the CPU, so those bytes
+   must already hold the earlier draws' results;
+3. its recorded work must follow the draws in the recorder.
+
+A commit item would split it like a draw:
+
+- **Worker:** decode, capture and recompile as now. A captured range that overlaps a pending commit's writes drains
+  first (the existing `Drain(Capture)` rule draws use). Then stage A, but only if no range it copies on the CPU
+  overlaps `DrawPipeline::Queue0().Overlaps(...)`; otherwise drain as today. Ranges it serves in place through
+  imports are read by the GPU in recorder order, so they need no check. `noteWrittenBuffers` runs at enqueue,
+  because the worker's later write evidence needs it.
+- **Committer:** stage B (texture lookups, the rest of the upload, descriptor writes), the record, and the
+  completion notes.
+- **Write ranges:** the written buffers (`forEachWrittenBuffer`), the written storage images (as in
+  `DrawWriteRanges`), and the BDA fault ranges.
+
+Not eligible, so they keep the drain:
+
+- address-based (BDA) dispatches: their writes are not known up front (the lease covers whole heaps);
+- `DISPATCH_INDIRECT` with arguments in a pending write range;
+- dispatches whose recipe path needs `Revalidate` under the lock while texture lookups happen on the worker.
+
+What would make it not hold up: stage A's binding plan depends on texture-cache state that stage B can change
+(T1 refreshes). This needs an argument like B2's, or stage A stays on the committer for dispatches with images.
+Measure first how many of the ~4.7k drains per 10 s are image-free (`APS5_PROFILE_DRAW` with a counter at the drain
+site).
