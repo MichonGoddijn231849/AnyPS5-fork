@@ -54,6 +54,8 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
    - `APS5_PIPELINE_IDENTITY=1`: pipeline, and the repeats on `[pipecache]`;
    - `APS5_PIPELINE_DMA=1`: the `packet 0x50` drains;
    - `APS5_EXACT_DRAW_WRITES=1`: the drain counts.
+   - `APS5_VARIANT_MRU=1` (on the worker): recompile, and the `[recompile] variant scan` compares per find (read
+     the baseline's value first: at about 1 the switch cannot help).
 3. Run once with all of them plus `APS5_VERIFY_PROOFS=1`. Expected: no abort; frames identical to the baseline
    (screenshots of the same spot).
 4. Close the game window. Expected: no crash in the NVIDIA driver at exit (B7).
