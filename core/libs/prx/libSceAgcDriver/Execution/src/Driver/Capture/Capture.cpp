@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -155,6 +157,83 @@ void Driver::RestoreDriverState(bool reset, std::span<const std::byte> gds) {
     std::lock_guard lock(mutex);
     require(completed >= accepted, "driver state restored while submissions are pending");
     resetGraphics = reset;
+}
+
+// APS5_DEBUG_RESYNC=<n>: every n flips, at a submission, repeats parts of what a capture start does to the
+// device, to tell which of them a rendering fault needs: APS5_DEBUG_RESYNC_MODE bits (default 7) 1 = drain
+// the queues (1 s) and wait for the device, 2 = the capture's hook flush over every range, 4 =
+// collect CPU writes over every registered range uncached (the capture's walk), 8 = a cache drop's flush.
+void Driver::debugResync() {
+    static const std::uint64_t every = [] { const char* text = std::getenv("APS5_DEBUG_RESYNC"); return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull; }();
+    if (every == 0) return;
+    static const std::uint32_t mode = [] { const char* text = std::getenv("APS5_DEBUG_RESYNC_MODE"); return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 7u; }();
+    static std::atomic<std::uint64_t> last{0};
+    const auto flips = flipsCounted.load(std::memory_order_acquire);
+    auto previous = last.load(std::memory_order_relaxed);
+    if (flips < previous + every || !last.compare_exchange_strong(previous, flips)) return;
+    static std::atomic<std::uint64_t> resyncs{0};
+    const auto started = std::chrono::steady_clock::now();
+    bool drained = true;
+    if ((mode & 1u) != 0) {
+        drained = DrainFor(std::chrono::seconds(1));
+        Settle();
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    if ((mode & 62u) != 0) {
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        // APS5_DEBUG_RESYNC_RANGE=<hex lo>-<hex hi>: only that part of the address space (bisecting).
+        static const std::pair<std::uint64_t, std::uint64_t> limit = [] {
+            const char* text = std::getenv("APS5_DEBUG_RESYNC_RANGE");
+            if (text == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0, ~std::uint64_t{0}};
+            char* end = nullptr;
+            const auto lo = std::strtoull(text, &end, 16);
+            const auto hi = end != nullptr && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : ~std::uint64_t{0};
+            return std::pair<std::uint64_t, std::uint64_t>{lo, hi};
+        }();
+        for (const auto& range : lease) {
+            if (!range->readable) continue;
+            const auto begin = std::max<std::uint64_t>(range->address, limit.first);
+            const auto end = std::min<std::uint64_t>(range->address + range->bytes, limit.second);
+            if (begin < end) ranges.emplace_back(begin, end - begin);
+        }
+    }
+    if ((mode & 2u) != 0) {
+        // The capture's flush: every range read through the access hook in 16 MiB chunks (pending storage
+        // results stored, unit shadows published), nothing released.
+        constexpr std::uint64_t Chunk = 16u << 20u;
+        for (const auto& [address, bytes] : ranges) {
+            for (auto chunk = address; chunk < address + bytes; chunk += Chunk) GuestMemory::FlushGpuWrites(chunk, static_cast<std::size_t>(std::min<std::uint64_t>(Chunk, address + bytes - chunk)));
+        }
+    }
+    // APS5_DEBUG_RESYNC_LIST=1: the images with results pending in the resync's ranges, listed at every 20th resync.
+    static const bool listPending = std::getenv("APS5_DEBUG_RESYNC_LIST") != nullptr;
+    if (listPending && resyncs.load() % 20 == 0) {
+        for (const auto& [address, bytes] : ranges) {
+            for (const auto& image : Graphics::StorageTexture::DescribePendingOverlaps(address, static_cast<std::size_t>(bytes))) { std::fprintf(stderr, "[resync] pending %s", image.c_str()); std::fputc(10, stderr); }
+        }
+    }
+    if ((mode & 48u) != 0) {
+        // Mode 16: only the pending storage results stored (no unit shadows published); mode 32: only the
+        // unit shadows published.
+        constexpr std::uint64_t Chunk = 16u << 20u;
+        for (const auto& [address, bytes] : ranges) {
+            for (auto chunk = address; chunk < address + bytes; chunk += Chunk) {
+                const auto size = static_cast<std::size_t>(std::min<std::uint64_t>(Chunk, address + bytes - chunk));
+                if ((mode & 16u) != 0) Graphics::StorageTexture::FlushPending(chunk, size, nullptr, "debug resync", Graphics::PublishScope::None);
+                if ((mode & 32u) != 0) Graphics::StorageTexture::PublishShadowsOnly(chunk, size, Graphics::PublishScope::Whole, "debug resync");
+            }
+        }
+    }
+    if ((mode & 8u) != 0) {
+        // Mode 8: what a cache drop does, every cached storage image written back and marked released.
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (const auto localDevice = device.Load()) localDevice->FlushTextures();
+    }
+    if ((mode & 4u) != 0) {
+        for (const auto& [address, bytes] : ranges) GuestMemory::CollectWritesUncached(address, static_cast<std::size_t>(bytes));
+    }
+    if (resyncs.fetch_add(1) % 20 == 0) std::fprintf(stderr, "[resync] flip %llu mode %u: %s, %.1f ms\n", static_cast<unsigned long long>(flips), mode, drained ? "drained" : "queues still blocked after 1 s", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 }
 
 void Driver::ClearCaches(std::uint32_t classes) {

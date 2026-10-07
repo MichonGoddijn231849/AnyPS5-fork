@@ -1215,6 +1215,13 @@ void VulkanDevice::DropCaches(bool resources, bool textures, bool tables, bool s
     WaitIdle();
 }
 
+void VulkanDevice::FlushTextures() {
+    GuestMemory::AssertGpuLockHeld("VulkanDevice::FlushTextures");
+    WaitIdle();
+    Graphics::FlushCachedTextures(state->device);
+    WaitIdle();
+}
+
 std::uint64_t VulkanDevice::RelieveMemory() {
     return Graphics::RelieveGpuMemory(graphicsContext());
 }

@@ -26,6 +26,7 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <map>
 #include <limits>
 #include <exception>
@@ -83,7 +84,7 @@ std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWrit
 // whose selected pending units were dropped because their memory is no longer registered (see
 // writeBackLayers), and pending units a DCC clear -> uncompressed key flip kept as the texels
 // (Refresh).
-std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKept{0};
+std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKept{0}, staleKeysKept{0};
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
@@ -1176,6 +1177,14 @@ bool StorageTexture::Refresh() {
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         keys = ProvedClearKeys(descriptor, guestBytes, keyProof);
         if (profile && descriptor.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, keysStart);
+        // A clear code whose key bytes nobody wrote since this image's content (its generation) predates
+        // that content: the title cleared, then rendered into the image. The recorded keys were stale; the
+        // rendered results stay instead of being dropped as dead. Opt-in (APS5_KEYS_SINCE_IMAGE=1): it did not cure GTA V's bloom blobs.
+        static const bool keysSinceImage = [] { const char* text = std::getenv("APS5_KEYS_SINCE_IMAGE"); return text != nullptr && std::strcmp(text, "0") != 0; }();
+        if (keysSinceImage && keys != uploadedKeys && IsDccClear(keys) && descriptor.dccAddress != 0 && generation != 0 && anyLayerPending() && GuestMemory::UnchangedSince(descriptor.dccAddress, static_cast<std::size_t>(std::max<std::uint64_t>(guestBytes / 256, 1)), generation)) {
+            staleKeysKept.fetch_add(1, std::memory_order_relaxed);
+            uploadedKeys = keys;
+        }
         if (keys != uploadedKeys) {
             changed.assign(trackedLayers, true);
             unchanged = false;
@@ -1279,8 +1288,11 @@ bool StorageTexture::Refresh() {
     // with their results, which are stored first, as the layer model does; new keys that are a
     // clear code make every result dead on hardware too. Without a generation (no tracking) a
     // unit's stamps say nothing, so it is stored.
+    // Debug aid: APS5_NO_UNIT_DROP=1 stores a changed unit's results instead of dropping them for the CPU's bytes.
+    static const bool noUnitDrop = std::getenv("APS5_NO_UNIT_DROP") != nullptr;
     const auto droppable = [&](std::uint32_t unit) {
         if (keysChanged && IsDccClear(keys)) return true;
+        if (noUnitDrop) return false;
         if (!tracked || layerGeneration[unit] == 0 || unit >= stampedBlocks.size() || stampedBlocks[unit] != GuestMemory::BlockWritten) return false;
         const auto begin = layerBegin(unit);
         const auto bytes = layerBytes(unit);
@@ -1391,6 +1403,19 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
+    // Debug aid: APS5_TRACE_STALE_UPLOADS=1 names every other image whose results are still pending in the
+    // memory this upload reads (once per pair): the upload would read guest bytes those results replace.
+    static const bool traceStale = std::getenv("APS5_TRACE_STALE_UPLOADS") != nullptr;
+    if (traceStale) {
+        static std::mutex staleMutex;
+        static std::set<std::pair<std::uint64_t, std::uint64_t>> reported;
+        for (const auto& other : overlappingPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+            if (other.get() == this) continue;
+            std::lock_guard lock(staleMutex);
+            if (!reported.insert({descriptor.baseAddress ^ (static_cast<std::uint64_t>(descriptor.format) << 48u), other->descriptor.baseAddress ^ (static_cast<std::uint64_t>(other->descriptor.format) << 48u)}).second) continue;
+            std::fprintf(stderr, "[stale-upload] storage image 0x%llx+0x%llx %ux%u fmt %u tile %u mips %u (%s) uploads over pending results of 0x%llx+0x%llx %ux%u fmt %u tile %u mips %u\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, static_cast<unsigned>(descriptor.format), static_cast<unsigned>(descriptor.tileMode), descriptor.mipCount, uploadReason, static_cast<unsigned long long>(other->descriptor.baseAddress), static_cast<unsigned long long>(other->guestBytes), other->descriptor.width, other->descriptor.height, static_cast<unsigned>(other->descriptor.format), static_cast<unsigned>(other->descriptor.tileMode), other->descriptor.mipCount);
+        }
+    }
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto elementBytes = BytesPerElement(descriptor.format);
@@ -2376,6 +2401,16 @@ std::vector<std::shared_ptr<StorageTexture>> StorageTexture::overlappingPending(
         if (auto alive = texture->weak_from_this().lock()) overlapping.push_back(std::move(alive));
     }
     return overlapping;
+}
+
+std::vector<std::string> StorageTexture::DescribePendingOverlaps(std::uint64_t address, std::size_t bytes) {
+    std::vector<std::string> result;
+    for (const auto& texture : overlappingPending(address, bytes)) {
+        char text[200];
+        std::snprintf(text, sizeof(text), "0x%llx+0x%llx %ux%u fmt %u tile %u mips %u", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), texture->descriptor.width, texture->descriptor.height, static_cast<unsigned>(texture->descriptor.format), static_cast<unsigned>(texture->descriptor.tileMode), texture->descriptor.mipCount);
+        result.emplace_back(text);
+    }
+    return result;
 }
 
 bool StorageTexture::blocksKept(std::span<const std::shared_ptr<StorageTexture>> images, std::uint64_t address, std::size_t bytes) {

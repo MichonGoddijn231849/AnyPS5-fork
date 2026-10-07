@@ -65,6 +65,8 @@ public:
     std::uint64_t QueueAwaited(std::uint32_t queue) const { return queueAwaited.at(queue).load(std::memory_order_acquire); }
     bool DrainFor(std::chrono::milliseconds limit);
     void Settle();
+    // APS5_DEBUG_RESYNC=<n flips>: what a capture start does to the device, repeated live (see Capture.cpp).
+    void debugResync();
     void RestoreQueueState(std::uint32_t queue, std::span<const std::byte> state);
     void RestoreDriverState(bool reset, std::span<const std::byte> gds);
     void RegisterShaderSnapshot(ShaderSnapshot snapshot);

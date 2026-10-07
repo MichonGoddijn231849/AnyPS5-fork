@@ -77,6 +77,8 @@ struct Options {
     std::size_t hashPointLimit = ~std::size_t{0};
     // --flush-check: at each loop's end, the blocks a texture write-back changes after the access hook's flush.
     bool flushCheck = false;
+    // --free-run: later loops start from the previous loop's end state instead of the capture's start (no restore).
+    bool freeRun = false;
     bool hidden = false;
     // Collect the restore's writes before the loop starts (see restore()).
     bool restoreCollect = true;
@@ -712,6 +714,14 @@ public:
                 // From here every change to lastPage is logged, and restore() rewinds the log: the loop's
                 // own pages, instead of a copy of the map of every page the prologue wrote.
                 lastPageLogged = true;
+            } else if (options.freeRun) {
+                // --free-run: memory carries over (GPU-written history accumulates as in the game); only the
+                // queues' and the driver's register state return to the capture's start.
+                ReplaySettle();
+                for (std::size_t i = 0; i < prologueEnd; ++i) {
+                    const auto& event = capture.events[i];
+                    if (event.type == EventType::QueueState || event.type == EventType::DriverState) apply(event);
+                }
             } else {
                 restore();
             }
@@ -1479,7 +1489,7 @@ std::uint32_t ParseCacheClasses(const std::string& list) {
 Options ParseOptions(int argc, char** argv) {
     Options options;
     const auto usage = [] {
-        Fail("usage: agc_frame_replay <capture dir> [--loop N] [--png DIR] [--png-scale N] [--png-all-loops] [--compare DIR] [--no-pacing] [--settle] [--hash-check[=N]] [--flush-check] [--hidden] [--summary] [--shader-cache DIR] [--cold[=live|all|dispatch,draw,resources,textures,tables,space]]");
+        Fail("usage: agc_frame_replay <capture dir> [--loop N] [--png DIR] [--png-scale N] [--png-all-loops] [--compare DIR] [--no-pacing] [--settle] [--hash-check[=N]] [--flush-check] [--free-run] [--hidden] [--summary] [--shader-cache DIR] [--cold[=live|all|dispatch,draw,resources,textures,tables,space]]");
     };
     if (argc < 2) usage();
     for (int i = 1; i < argc; ++i) {
@@ -1507,6 +1517,7 @@ Options ParseOptions(int argc, char** argv) {
         else if (argument == "--settle") options.settle = true;
         else if (argument == "--hash-check") options.hashCheck = true;
         else if (argument == "--flush-check") options.flushCheck = true;
+        else if (argument == "--free-run") options.freeRun = true;
         else if (argument.rfind("--hash-check=", 0) == 0) {
             options.hashCheck = true;
             options.hashPointLimit = std::stoull(argument.substr(13));

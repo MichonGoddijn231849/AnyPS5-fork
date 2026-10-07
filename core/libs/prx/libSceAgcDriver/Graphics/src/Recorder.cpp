@@ -23,6 +23,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -2518,6 +2519,21 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
         if (end > begin) open->reads.push_back({begin, end, kind});
     }
     readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
+    // Debug aid: APS5_TRACE_STALE_READS=1 names recorded work that reads guest memory in place while an image's
+    // results are still pending over it (the GPU then reads the bytes those results replace), once per pair.
+    static const bool traceStale = std::getenv("APS5_TRACE_STALE_READS") != nullptr;
+    if (traceStale) {
+        static std::mutex staleMutex;
+        static std::set<std::string> reported;
+        for (const auto& [begin, end] : ranges) {
+            for (const auto& image : StorageTexture::DescribePendingOverlaps(begin, static_cast<std::size_t>(end - begin))) {
+                char text[300];
+                std::snprintf(text, sizeof(text), "read 0x%llx+0x%llx kind %d over pending %s", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind), image.c_str());
+                std::lock_guard lock(staleMutex);
+                if (reported.insert(text).second) { std::fprintf(stderr, "[stale-read] %s", text); std::fputc(10, stderr); }
+            }
+        }
+    }
 }
 
 const Recorder::Batch::Read* Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end) {

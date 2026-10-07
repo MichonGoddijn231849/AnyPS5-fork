@@ -257,6 +257,8 @@ public:
     VkImage Image() const { return image; }
     VkFormat StorageFormat() const { return storageFormat; }
     const GuestTextureResource& Descriptor() const { return descriptor; }
+    // Debug aid (APS5_TRACE_STALE_READS): the images with results pending in [address, address+bytes), as text.
+    static std::vector<std::string> DescribePendingOverlaps(std::uint64_t address, std::size_t bytes);
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }
     std::uint32_t ImageDepth() const { return geometry.imageDepth; }
     // Content version: advances when the image is re-uploaded or a shader wrote it. Together with

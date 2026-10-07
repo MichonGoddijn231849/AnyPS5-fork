@@ -186,6 +186,12 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
                 case 0x80: filled = Graphics::DccKeys::Clear1110; break;
                 case 0xc0: filled = Graphics::DccKeys::Clear1111; break;
                 case 0x20: filled = Graphics::DccKeys::ClearRegister; break;
+                case 0x10: {
+                    const char* single = std::getenv("APS5_DCC_SINGLE");
+                    if (single != nullptr && std::strcmp(single, "0000") == 0) filled = Graphics::DccKeys::Clear0000;
+                    else if (single != nullptr && std::strcmp(single, "reg") == 0) filled = Graphics::DccKeys::ClearRegister;
+                    break;
+                }
                 case 0xff: filled = Graphics::DccKeys::Uncompressed; break;
                 default: break;
             }

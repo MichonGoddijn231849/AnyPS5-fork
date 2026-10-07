@@ -203,6 +203,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         captureLock.lock();
         captureBeforeSubmit();
     }
+    debugResync();
     Submission submission{};
     submission.queue = queue;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
