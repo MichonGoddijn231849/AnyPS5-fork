@@ -30,6 +30,11 @@
 #include <sstream>
 #endif
 
+namespace AgcDriver::DriverDetail {
+// CpuReadTrace.cpp: the protection of a page the CPU read trace armed (false when it is not armed).
+bool CpuReadTraceProtection(std::uintptr_t address, unsigned long* protection);
+}
+
 namespace AgcDriver::GuestMemory {
 namespace {
 void require(bool condition, const char* reason) {
@@ -518,6 +523,11 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - queryStart).count();
                 std::fprintf(stderr, "[query] 0x%llx range 0x%zx: base 0x%llx size 0x%llx state 0x%lx protect 0x%lx type 0x%lx %.0f us gen %llu from +0x%llx\n", static_cast<unsigned long long>(cursor), bytes, reinterpret_cast<unsigned long long>(memory.BaseAddress), static_cast<unsigned long long>(memory.RegionSize), memory.State, memory.Protect, memory.Type, us, static_cast<unsigned long long>(GuestAllocations::GuestAllocationsGeneration_nid_postfix()), ModuleOffset(__builtin_return_address(0)));
             }
+        }
+        // Pages the CPU read trace (APS5_TRACE_CPU_READS) made inaccessible keep their real protection here.
+        if (memory.Protect == PAGE_NOACCESS) {
+            unsigned long armed = 0;
+            if (DriverDetail::CpuReadTraceProtection(cursor, &armed)) memory.Protect = armed;
         }
         const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
         if (memory.RegionSize > std::numeric_limits<std::uintptr_t>::max() - base || base + memory.RegionSize <= cursor) return false;

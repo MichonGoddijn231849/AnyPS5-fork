@@ -67,6 +67,8 @@ public:
     void Settle();
     // APS5_DEBUG_RESYNC=<n flips>: what a capture start does to the device, repeated live (see Capture.cpp).
     void debugResync();
+    // APS5_TRACE_CPU_READS=<lo>-<hi>: CPU accesses to that guest range, caught by page protection (CpuReadTrace.cpp).
+    void cpuReadTraceTick();
     void RestoreQueueState(std::uint32_t queue, std::span<const std::byte> state);
     void RestoreDriverState(bool reset, std::span<const std::byte> gds);
     void RegisterShaderSnapshot(ShaderSnapshot snapshot);
