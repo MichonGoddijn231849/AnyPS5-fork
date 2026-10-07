@@ -1074,13 +1074,25 @@ std::pair<std::uint64_t, std::uint64_t> StorageTexture::TargetProofCounts() {
     return {targetProofHits.load(std::memory_order_relaxed), targetProofMisses.load(std::memory_order_relaxed)};
 }
 
+// Why a target proof did not hold (profile only): no proof, epoch, unwatch serial, pending serial, registry, memory, keys.
+std::array<std::atomic<std::uint64_t>, 7> proofMissReasons{};
+
 bool StorageTexture::refreshProved() const {
-    if (!targetProofMemo() || refreshProof.epoch == 0) return false;
+    const bool profile = LookupOutcomes::Profiled();
+    const auto miss = [&](std::size_t reason) {
+        if (profile) proofMissReasons[reason].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (!targetProofMemo() || refreshProof.epoch == 0) return miss(0);
     const auto epoch = GuestMemory::ThreadCollectEpoch();
-    if (epoch == 0 || epoch != refreshProof.epoch || GuestMemory::UnwatchSerial() != refreshProof.unwatched || PendingSerial() != refreshProof.pendingSerial || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != refreshProof.registryGeneration) return false;
-    if (!GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), refreshProof.generation)) return false;
+    if (epoch == 0 || epoch != refreshProof.epoch) return miss(1);
+    if (GuestMemory::UnwatchSerial() != refreshProof.unwatched) return miss(2);
+    if (PendingSerial() != refreshProof.pendingSerial) return miss(3);
+    if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != refreshProof.registryGeneration) return miss(4);
+    if (!GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), refreshProof.generation)) return miss(5);
     const auto keyBytes = static_cast<std::size_t>(guestBytes / 256);
-    return descriptor.dccAddress == 0 || keyBytes == 0 || GuestMemory::UnchangedSince(descriptor.dccAddress, keyBytes, refreshProof.generation);
+    if (descriptor.dccAddress == 0 || keyBytes == 0 || GuestMemory::UnchangedSince(descriptor.dccAddress, keyBytes, refreshProof.generation)) return true;
+    return miss(6);
 }
 
 bool StorageTexture::Refresh() {
@@ -1091,7 +1103,7 @@ bool StorageTexture::Refresh() {
             NoteProved();
             ++Profile().storageReused;
             const auto hits = targetProofHits.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (profile && hits % 100000 == 0) std::fprintf(stderr, "[target-proof] %llu refreshes answered by the proof, %llu not\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(targetProofMisses.load(std::memory_order_relaxed)));
+            if (profile && hits % 100000 == 0) std::fprintf(stderr, "[target-proof] %llu refreshes answered by the proof, %llu not (no proof %llu, epoch %llu, unwatched %llu, pending %llu, registry %llu, memory %llu, keys %llu)\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(targetProofMisses.load(std::memory_order_relaxed)), static_cast<unsigned long long>(proofMissReasons[0].load()), static_cast<unsigned long long>(proofMissReasons[1].load()), static_cast<unsigned long long>(proofMissReasons[2].load()), static_cast<unsigned long long>(proofMissReasons[3].load()), static_cast<unsigned long long>(proofMissReasons[4].load()), static_cast<unsigned long long>(proofMissReasons[5].load()), static_cast<unsigned long long>(proofMissReasons[6].load()));
             if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshUnchanged, start);
             return true;
         }
