@@ -3038,7 +3038,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (override != moved.end() && !override->words.empty()) {
             // A slice of the snapshot ring when there is one, instead of a buffer of its own per draw.
             Recorder::SnapshotSlice slice{};
-            if (Recorder::SnapshotRingEnabled()) slice = recorder.AllocateDrawSnapshot(override->size);
+            static const bool movedRing = std::getenv("APS5_MOVED_RING") == nullptr || std::strcmp(std::getenv("APS5_MOVED_RING"), "0") != 0;
+            if (movedRing && Recorder::SnapshotRingEnabled()) slice = recorder.AllocateDrawSnapshot(override->size);
             auto buffer = slice.buffer != nullptr ? std::move(slice.buffer) : std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             const VkDeviceSize offset = buffer != nullptr && slice.offset != 0 ? slice.offset : 0;
             auto* bytes = buffer->Bytes().data() + offset;

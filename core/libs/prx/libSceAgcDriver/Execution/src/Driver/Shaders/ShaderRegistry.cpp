@@ -94,6 +94,9 @@ std::uint64_t NullPixelProgramAddress() {
 }
 
 std::uint64_t SnapshotCodeHash(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
+    // APS5_CODE_HASH_MEMO=0: the cache key hashes the code itself, as before.
+    static const bool enabled = [] { const char* text = std::getenv("APS5_CODE_HASH_MEMO"); return text == nullptr || std::strcmp(text, "0") != 0; }();
+    if (!enabled) return 0;
     auto& memo = *snapshot.handles;
     {
         std::lock_guard lock(memo.codeHashMutex);
