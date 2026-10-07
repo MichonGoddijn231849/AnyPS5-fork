@@ -1907,7 +1907,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         timer.phase(PhaseSetup);
         // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
         static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
-        if ((binding.gpuTiling || (color.tileMode != ColorTileMode::Linear && context.detiler != nullptr)) && residentTargets) {
+        static const bool residentLinear = std::getenv("APS5_RESIDENT_LINEAR_TARGETS") != nullptr;
+        const bool linearResident = residentLinear && color.tileMode == ColorTileMode::Linear && RegisteredReadableCovers(color.address, static_cast<std::size_t>(color.bytes));
+        if ((binding.gpuTiling || ((color.tileMode != ColorTileMode::Linear || linearResident) && context.detiler != nullptr)) && residentTargets) {
             // The lookup refreshes the image on every draw (StorageTexture::Refresh: FlushPending,
             // CollectWrites over the target's pages, the DCC key scan of TextureClearKeys, then
             // UnchangedSince). The page walk is skipped while the worker's collect epoch lasts
@@ -1936,6 +1938,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             continue;
         }
         materializeCmaskClear(context, color, nullptr);
+        static const bool traceSyncTargets = std::getenv("APS5_TRACE_SYNC_TARGETS") != nullptr;
+        if (traceSyncTargets) {
+            static std::mutex traceMutex;
+            static std::set<std::uint64_t> traced;
+            std::lock_guard lock(traceMutex);
+            if (traced.insert(color.address).second) std::fprintf(stderr, "[sync-target] 0x%llx %ux%u tile %d format %d element %u bytes 0x%llx gpuTiling %d detiler %d\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.tileMode), static_cast<int>(color.format), color.elementBytes, static_cast<unsigned long long>(color.bytes), binding.gpuTiling ? 1 : 0, context.detiler != nullptr ? 1 : 0);
+        }
         Require(!color.mipTail || binding.gpuTiling, "rendering into a packed mip tail requires the GPU tiled fallback");
         Require(color.depth == 1, "rendering into a 3D color target needs the resident image of its surface");
         Require(color.arraySlice == 0 || !ColorTileModeIsXor(color.tileMode), "rendering into a slice of a 2D array color target with an XOR tile mode needs the resident image of its array");
