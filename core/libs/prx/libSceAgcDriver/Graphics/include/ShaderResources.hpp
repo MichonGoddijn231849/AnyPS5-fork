@@ -133,6 +133,8 @@ public:
         VkDescriptorSetLayout layout = VK_NULL_HANDLE;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        // Textures a template hit rebinds (MovedImage), kept with the set that names their views.
+        std::vector<std::shared_ptr<Texture>> textures;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -141,7 +143,21 @@ public:
         std::size_t size;
         std::vector<std::uint32_t> words;
     };
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    // A sampled image element of a template hit whose T# names another texture than the build's
+    // (APS5_MOVED_IMAGES: the content key leaves texture base addresses out): the draw's own texture,
+    // written over that element of the hit's descriptor set.
+    struct MovedImage {
+        std::uint32_t binding;
+        std::uint32_t element;
+        std::shared_ptr<Texture> texture;
+        bool firstLayer = false;
+    };
+    static bool MovableImages();
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, std::span<const MovedImage> movedImages = {}) const;
+    // The sampled image elements of `shaders` (the draw's stages, the shapes this template was built
+    // for) whose descriptors differ from the build's, each looked up as the build would; nullopt when
+    // one cannot be rebound (another dimension, a missing texture, an address-based set).
+    std::optional<std::vector<MovedImage>> MovedSampledImages(std::span<const CompiledShader> shaders) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
@@ -183,7 +199,7 @@ public:
     // Without `dataWords` the ShaderData and FlattenedSrt descriptor words stay out of the key
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
-    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
+    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false, bool movableImages = false);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
@@ -425,6 +441,9 @@ private:
     std::size_t readOnlyBuffers = 0;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<bool> textureFirstLayer;
+    // The T# each entry of `textures` was built from (MovedSampledImages compares a hit's against them;
+    // Revalidate proves the build's own objects with them).
+    std::vector<std::array<std::uint32_t, 8>> textureWords;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
     std::vector<std::uint32_t> storageMips;
     std::vector<std::uint64_t> storageKeys;

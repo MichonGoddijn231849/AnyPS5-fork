@@ -574,7 +574,7 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     append64(reinterpret_cast<std::uint64_t>(context.device));
     key.push_back(static_cast<std::uint32_t>(shaders.size()));
     for (const auto& shader : shaders) {
-        const auto part = ShaderResources::ContentKey(shader, true, MovableBuffers());
+        const auto part = ShaderResources::ContentKey(shader, true, MovableBuffers(), ShaderResources::MovableImages());
         key.push_back(static_cast<std::uint32_t>(part.size()));
         key.insert(key.end(), part.begin(), part.end());
     }
@@ -1013,6 +1013,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
 struct ResolvedResources {
     std::shared_ptr<ShaderResources> resources;
     std::vector<ShaderResources::MovedBuffer> moved;
+    std::vector<ShaderResources::MovedImage> movedImages;
     ResourceCache::Key contentKey;
     bool cacheable = false;
     const ShaderResources::BuildTiming* built = nullptr;
@@ -1044,12 +1045,17 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            // The sampled textures the draw names where the template's differ (keys without base
+            // addresses, APS5_MOVED_IMAGES), looked up as a build would.
+            std::optional<std::vector<ShaderResources::MovedImage>> images;
+            if (moved.has_value()) images = ShaderResources::MovableImages() ? cached->MovedSampledImages(shaders) : std::optional(std::vector<ShaderResources::MovedImage>{});
             timer.part(SplitLookupMoved);
-            if (moved.has_value()) {
+            if (moved.has_value() && images.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 timer.part(SplitLookupAliases);
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
+                resolved.movedImages = std::move(*images);
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
@@ -1288,6 +1294,7 @@ struct RecordedDraw {
     std::vector<std::shared_ptr<StorageTexture>> targets;
     const IndirectRecord* indirect = nullptr;
     std::span<const ShaderResources::MovedBuffer> moved;
+    std::span<const ShaderResources::MovedImage> movedImages;
     bool listed = false;
     bool completion = false;
     bool waited = false;
@@ -1420,7 +1427,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     mix(state.renderExtent.width);
     mix(state.renderExtent.height);
-    const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
+    const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) {
+        return resources.ReadsImage(target.get()) || std::any_of(record.movedImages.begin(), record.movedImages.end(), [&](const ShaderResources::MovedImage& image) { return target != nullptr && image.texture != nullptr && image.texture->StorageSource() == target.get(); });
+    });
     timer.part(SplitRecordPass);
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
     // address-based build), or over its GPU-side records, lands before it, as before a dispatch
@@ -1435,7 +1444,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
     timer.part(SplitRecordStores);
-    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, record.movedImages);
     timer.part(SplitRecordBindings);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
@@ -1813,9 +1822,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool lean = recorded && !drawTransitions;
     const bool multisampled = std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.multisampled; });
     Require(lean || !multisampled, "multisampled draws are only rendered as recorded draws");
-    if (!lean && !resolved.moved.empty()) {
+    if (!lean && (!resolved.moved.empty() || !resolved.movedImages.empty())) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.moved.clear();
+        resolved.movedImages.clear();
     }
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
@@ -1840,6 +1850,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.recorder = recorder;
         record.resources = resources;
         record.moved = resolved.moved;
+        record.movedImages = resolved.movedImages;
         record.pipeline = pipeline;
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;
@@ -1853,7 +1864,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !state.depth && resolved.moved.empty() && !multisampled) {
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !state.depth && resolved.moved.empty() && resolved.movedImages.empty() && !multisampled) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;

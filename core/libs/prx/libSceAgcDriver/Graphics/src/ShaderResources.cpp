@@ -1261,7 +1261,22 @@ void ShaderResources::reportDescriptorCaches() const {
     std::fprintf(stderr, "[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
-std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {
+namespace {
+std::array<std::uint32_t, 8> ElementWords(std::span<const std::uint32_t> words) {
+    std::array<std::uint32_t, 8> result{};
+    std::copy_n(words.begin(), std::min<std::size_t>(words.size(), result.size()), result.begin());
+    return result;
+}
+}
+
+// APS5_MOVED_IMAGES=1: draw templates are keyed without their sampled textures' base addresses, and a hit
+// rebinds the elements whose texture differs (MovedSampledImages, PrepareDrawBindings).
+bool ShaderResources::MovableImages() {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_MOVED_IMAGES"); return text != nullptr && std::strcmp(text, "0") != 0; }();
+    return enabled;
+}
+
+std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, bool movableImages) {
     Require(shader.program != nullptr, "missing compiled shader");
     const auto& program = *shader.program;
     std::vector<std::uint32_t> key;
@@ -1291,6 +1306,13 @@ std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& sha
                 const bool empty = words[2] == 0 || (words[0] == 0 && (words[1] & 0xffffu) == 0);
                 if (written || empty) key.insert(key.end(), words, words + 4);
                 else key.insert(key.end(), {0u, words[1] & 0xffff0000u, 0u, words[3]});
+            }
+        } else if (movableImages && binding.kind == ShaderRecompiler::DescriptorKind::SampledImage && binding.role == ShaderRecompiler::DescriptorRole::GuestImages && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 8u) {
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 8u;
+                // Base address (dword 0, dword 1 bits 7:0) and, under APS5_MOVED_IMAGES=2, the size (dword 2).
+                static const bool sizes = [] { const char* text = std::getenv("APS5_MOVED_IMAGES"); return text != nullptr && std::strcmp(text, "2") == 0; }();
+                key.insert(key.end(), {0u, words[1] & 0xffffff00u, sizes ? 0u : words[2], words[3], words[4], words[5], words[6], words[7]});
             }
         } else if ((dataWords && !movableBuffers) || !DataRole(binding.role)) {
             key.insert(key.end(), binding.guestDescriptor.begin(), binding.guestDescriptor.end());
@@ -1875,7 +1897,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     const auto first = FirstSameSampledElements(binding);
                     const auto bindingTextures = textureIndex;
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
-                        const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
+                        auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
+                        // A template keyed without base addresses (APS5_MOVED_IMAGES) proves the objects
+                        // it was built with; the draw's own differing elements are rebound afterwards.
+                        if (textureWords.size() == textures.size() && textureIndex < textureWords.size() && elementWords == 8) words = std::span<const std::uint32_t>(textureWords[textureIndex]);
                         if (!first.empty() && first[element] != element) {
                             if (textureIndex >= textures.size() || textures[bindingTextures + first[element]] != textures[textureIndex]) return false;
                             ++textureIndex;
@@ -2776,6 +2801,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             if (!first.empty() && first[element] != element) {
                 const auto earlier = item.imageAllocations[first[element]];
                 textures.push_back(textures[earlier]);
+                textureWords.push_back(textureWords[earlier]);
                 textureFirstLayer.push_back(textureFirstLayer[earlier]);
                 describedRanges.push_back(describedRanges[bindingRanges + first[element]]);
                 item.imageAllocations.push_back(textures.size() - 1);
@@ -2784,6 +2810,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             const bool compareElement = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
             if (binding.imageShape.has_value() && (IsNullTextureDescriptor(words) || compareUnreadable(record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words), compareElement))) {
                 textures.push_back(nullTexture(context, *binding.imageShape, compareElement));
+                textureWords.push_back(ElementWords(words));
                 textureFirstLayer.push_back(false);
                 describedRanges.push_back({"texture", 0, 0, 1, 1, 56, 0, 0});
                 item.imageAllocations.push_back(textures.size() - 1);
@@ -2801,6 +2828,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             }
             if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element));
             textures.push_back(std::move(texture));
+            textureWords.push_back(ElementWords(words));
             if (Recorder::TransientUploadsOverBudget()) {
                 if (auto* recorder = Recorder::Active()) recorder->SettleTransientUploads();
             }
@@ -3021,10 +3049,73 @@ struct DrawBindingsSample {
 
 }
 
+namespace {
+// Why MovedSampledImages refused (APS5_PROFILE_DRAW), by site; printed every 1000 refusals.
+std::array<std::atomic<std::uint64_t>, 12> movedImageRefusals{};
+std::nullopt_t refuseMovedImages(std::size_t site) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile && movedImageRefusals[11].fetch_add(1, std::memory_order_relaxed) % 1000 == 999) {
+        movedImageRefusals[site].fetch_add(1, std::memory_order_relaxed);
+        std::string text;
+        for (std::size_t k = 0; k < 11; ++k) text += " " + std::to_string(movedImageRefusals[k].load());
+        std::fprintf(stderr, "[moved-images] refusals by site (sampled):%s\n", text.c_str());
+    } else if (profile) {
+        movedImageRefusals[site].fetch_add(1, std::memory_order_relaxed);
+    }
+    return std::nullopt;
+}
+}
+
+std::optional<std::vector<ShaderResources::MovedImage>> ShaderResources::MovedSampledImages(std::span<const CompiledShader> shaders) const {
+    std::vector<MovedImage> result;
+    if (textureWords.size() != textures.size()) return refuseMovedImages(0);
+    std::size_t textureIndex = 0;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) return refuseMovedImages(1);
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::SampledImage) continue;
+            if (binding.count == 0 || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 8u) return refuseMovedImages(2);
+            const auto first = FirstSameSampledElements(binding);
+            const auto movedBefore = result.size();
+            for (std::uint32_t element = 0; element < binding.count; ++element, ++textureIndex) {
+                if (textureIndex >= textures.size()) return refuseMovedImages(3);
+                const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+                if (std::equal(words.begin(), words.end(), textureWords[textureIndex].begin())) continue;
+                if (_set == VK_NULL_HANDLE || usesBda) return refuseMovedImages(4);
+                if (!first.empty() && first[element] != element) {
+                    // The same T# as an earlier element of this binding: that element's rebinding, if any.
+                    const auto earlier = std::find_if(result.begin() + static_cast<std::ptrdiff_t>(movedBefore), result.end(), [&](const MovedImage& image) { return image.binding == binding.binding && image.element == first[element]; });
+                    if (earlier == result.end()) return refuseMovedImages(5);
+                    result.push_back({binding.binding, element, earlier->texture, earlier->firstLayer});
+                    continue;
+                }
+                const bool compareElement = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
+                if (!binding.imageShape.has_value()) return refuseMovedImages(6);
+                const auto resource = DecodeTextureResource(words);
+                if (IsNullTextureDescriptor(words) || compareUnreadable(resource, compareElement)) {
+                    result.push_back({binding.binding, element, nullTexture(context, *binding.imageShape, compareElement), false});
+                    continue;
+                }
+                const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
+                if (!firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) return refuseMovedImages(7);
+                const VkComponentMapping components{ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
+                auto texture = cachedTexture(context, words, resource, components, DescribeSurface(resource).guestBytes, compareElement);
+                if (texture == nullptr) return refuseMovedImages(8);
+                if (Recorder::TransientUploadsOverBudget()) {
+                    if (auto* recorder = Recorder::Active()) recorder->SettleTransientUploads();
+                }
+                result.push_back({binding.binding, element, std::move(texture), firstLayer});
+            }
+        }
+    }
+    if (textureIndex != textures.size()) return refuseMovedImages(9);
+    return result;
+}
+
 // Largest snapshot APS5_SNAPSHOT_FRESH_COPY copies afresh on every draw.
 constexpr std::size_t FreshCopyLimit = 4096;
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, std::span<const MovedImage> movedImages) const {
     DrawBindingsSample sample;
     if (_set == VK_NULL_HANDLE || usesBda) return {};
     const auto reads = guestMemory.InPlaceReads();
@@ -3109,7 +3200,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     sample.mark(0);
-    if (selected.empty()) return {};
+    if (selected.empty() && movedImages.empty()) return {};
     sample.prepared = true;
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     thread_local std::vector<VkDescriptorPoolSize>* sizesSlot = nullptr;
@@ -3163,6 +3254,24 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             write.pBufferInfo = &infos[static_cast<std::size_t>(found - selected.begin())];
             writes.push_back(write);
         }
+    }
+    thread_local std::vector<VkDescriptorImageInfo>* imageInfosSlot = nullptr;
+    auto& imageInfos = ShaderRecompiler::ThreadOwned(imageInfosSlot);
+    imageInfos.clear();
+    imageInfos.reserve(movedImages.size());
+    for (const auto& image : movedImages) {
+        imageInfos.push_back({VK_NULL_HANDLE, image.firstLayer ? image.texture->FirstLayerView() : image.texture->View(), image.texture->Layout()});
+        result->textures.push_back(image.texture);
+    }
+    for (std::size_t i = 0; i < movedImages.size(); ++i) {
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = result->allocation.set;
+        write.dstBinding = movedImages[i].binding;
+        write.dstArrayElement = movedImages[i].element;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        write.pImageInfo = &imageInfos[i];
+        writes.push_back(write);
     }
     update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     sample.written = writes.size();
