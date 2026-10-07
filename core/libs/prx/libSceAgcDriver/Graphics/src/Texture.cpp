@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -1190,9 +1191,46 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
+namespace {
+
+bool targetProofMemo() {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_TARGET_PROOF_MEMO"); return text == nullptr || std::strcmp(text, "0") != 0; }();
+    return enabled;
+}
+
+std::atomic<std::uint64_t> targetProofHits{0};
+std::atomic<std::uint64_t> targetProofMisses{0};
+
+}
+
+std::pair<std::uint64_t, std::uint64_t> StorageTexture::TargetProofCounts() {
+    return {targetProofHits.load(std::memory_order_relaxed), targetProofMisses.load(std::memory_order_relaxed)};
+}
+
+bool StorageTexture::refreshProved() const {
+    if (!targetProofMemo() || refreshProof.epoch == 0) return false;
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
+    if (epoch == 0 || epoch != refreshProof.epoch || GuestMemory::UnwatchSerial() != refreshProof.unwatched || PendingSerial() != refreshProof.pendingSerial || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != refreshProof.registryGeneration) return false;
+    if (!GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), refreshProof.generation)) return false;
+    const auto keyBytes = static_cast<std::size_t>(guestBytes / 256);
+    return descriptor.dccAddress == 0 || keyBytes == 0 || GuestMemory::UnchangedSince(descriptor.dccAddress, keyBytes, refreshProof.generation);
+}
+
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (targetProofMemo()) {
+        if (refreshProved()) {
+            NoteProved();
+            ++Profile().storageReused;
+            const auto hits = targetProofHits.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (profile && hits % 100000 == 0) std::fprintf(stderr, "[target-proof] %llu refreshes answered by the proof, %llu not\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(targetProofMisses.load(std::memory_order_relaxed)));
+            if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshUnchanged, start);
+            return true;
+        }
+        targetProofMisses.fetch_add(1, std::memory_order_relaxed);
+        refreshProof = {};
+    }
     struct Exempt {
         const StorageTexture* previous;
         ~Exempt() { refreshing = previous; }
@@ -1334,6 +1372,9 @@ bool StorageTexture::Refresh() {
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
+        if (targetProofMemo() && current != 0 && (descriptor.dccAddress == 0 || keyProof.generation != 0)) {
+            refreshProof = {GuestMemory::ThreadCollectEpoch(), GuestMemory::UnwatchSerial(), PendingSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), current};
+        }
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
