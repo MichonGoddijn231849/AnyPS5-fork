@@ -13,6 +13,8 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
 | B7 exit crash | see `git log` (`fix(agc): retire the buffer pool ...`) | none (bug fix) | `agc_driver_buffer_pool_retire`: a retired pool frees its retained slots while the device lives and makes no Vulkan call for anything returned later, including a `Buffer` destroyed after the teardown (the image-mirror case) |
 | B10 recompile copy | `perf(agc): share the draw stage's recompile result ...` | none (no behaviour change) | the `agc_*` draw tests pass with `APS5_PIPELINED_DRAWS` off and on; the CPU-indirect path keeps its own copies, now for every stage |
 | B5 pipeline identity | `perf(agc): identity fast path for repeated pipeline lookups` | `APS5_PIPELINE_IDENTITY=1` | the `agc_*` suite passes with it on (alone and with `APS5_PIPELINED_DRAWS=1`) |
+| B8 replay on Linux | `Frame replay: host memory and process calls behind a small platform layer` (cherry-picked from `gta-v/hw-rt` `d9a73a6f`) | none (tool) | `agc_frame_replay` builds on Linux here; `--summary` reads a capture |
+| B8b driver CPU per frame | `feat(agc): per-frame CPU time of the queue 0 worker and the committer in the replay` | none (measurement only) | `agc_driver_driver_thread_clock`: a registered thread's clock counts its own CPU (193 ms of a 200 ms spin) and not the reader's sleep |
 
 ### B7: exit crash
 
@@ -59,3 +61,40 @@ of the 1.8 us pipeline phase on repeats.
 
 Day-session check: `APS5_PROFILE_DRAW=1 APS5_PIPELINED_DRAWS=1` with and without `APS5_PIPELINE_IDENTITY=1`;
 compare the committer's `pipeline` column and read the repeat count in `[pipecache]`.
+
+### B8: the frame replay as a measuring instrument
+
+(b) done. Queue 0's worker and the pipelined-draws committer register themselves (`RegisterDriverThread`, new
+`Execution/include/DriverThreadClock.hpp`: `pthread_getcpuclockid` on Linux, `GetThreadTimes` on Windows). The
+replay samples both clocks at each flip and prints, per loop:
+
+    [replay] loop N: queue 0 worker cpu ms per frame: a b c ... (T ms in F frames)
+    [replay] loop N: committer cpu ms per frame: ...
+
+These are the driver's own CPU per frame, independent of the replay's main thread. To make the tool build and run
+on Linux here, the platform layer from `gta-v/hw-rt` (`d9a73a6f`) was cherry-picked (its hw-rt progress doc left
+out).
+
+Not run end-to-end: there is no game capture in this container. A capture made from `agc_driver_flip_tests`
+(`APS5_CAPTURE`) records no address space (the test's command buffers are on its stack), so its replay crashes in
+`applyEvent` reading them. That capture is not a valid input, and the crash has nothing to do with this change.
+
+(a) main-thread cost: not attempted (it needs a game capture to profile). How to measure it: `perf record -g
+--per-thread` on the replay, or the existing `[replay] loop N: memory deltas written in X ms` and `pacing waits`
+fields against the loop's wall time.
+
+(c) flip numbering, analysis only (needs a capture to confirm). The capture numbers presents by counting
+`Driver::Present` calls (`FrameCapture::NotePresent`: `event.flip = presentsSeen - flipsBefore`). The replay numbers
+them by flip reservations (`ReplayOutput::Reserve`, one per FLIP packet at submission). `flipsBefore` is
+`capture.flips`, the count of submitted flips. Any `Present` call that is not one submitted flip shifts every
+capture index by one against the replay's: a present with no buffer from video-out setup, a repeated vblank present,
+or a present of a flip submitted before the capture whose presenter ran late. The replay then pairs its flip `k` with
+the capture's display buffer of flip `k±1`, which is the other swap-chain image. Dumping that image gives exactly
+"~20 dB, half the pixels differ". A missing index (3) fits a present that went to a slot the replay never reached.
+Proposed fix (not made): record the flip's own serial in `PresentEvent` (the `FrameTiming` id the worker assigns at
+the FLIP packet, `++frameSerial`, which advances with `flipsCounted`) and index by `serial - 1 - flipsBefore`; skip
+presents without one.
+First check for the day session: `--summary` on a game capture lists the Present events. Compare their
+`flip` fields with the Submit events' flip counts.
+
+(d) frame 1 differs between identical runs: not attempted (needs a capture).

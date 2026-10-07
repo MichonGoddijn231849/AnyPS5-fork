@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Capture/CaptureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Capture/Replay.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DriverThreadClock.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -11,6 +12,7 @@
 #include <SDL_vulkan.h>
 #include "ReplayPlatform.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -677,6 +679,10 @@ public:
             for (std::size_t queue = 0; queue < QueueCount; ++queue) base[queue] = ReplayPacketsExecuted(static_cast<std::uint32_t>(queue));
             nextFlip.store(0);
             const auto presentedBefore = presenter->Presented();
+            {
+                std::lock_guard lock(flipTimesMutex);
+                cpuAtStart = DriverCpu();
+            }
             const auto replayStarted = Clock::now();
             pacingMs = 0;
             memoryMs = 0;
@@ -719,6 +725,29 @@ public:
                     previous = at;
                 }
                 std::fprintf(stderr, "[replay] loop %u: frame ms:%s\n", loop, text.c_str());
+                // The driver's critical path per frame: the CPU time queue 0's worker and the committer spent
+                // between the previous flip (or the loop's start) and this one, from their own thread clocks, so
+                // an A/B run shows the driver's cost even when this tool's thread dominates the frame time.
+                const char* const roles[2] = {"queue 0 worker", "committer"};
+                for (std::size_t role = 0; role < 2; ++role) {
+                    std::string cpu;
+                    auto before = cpuAtStart[role];
+                    double total = 0;
+                    for (const auto& at : flipCpu) {
+                        char item[32];
+                        if (before < 0 || at[role] < 0) {
+                            std::snprintf(item, sizeof(item), " -");
+                        } else {
+                            const double ms = static_cast<double>(at[role] - before) / 1e6;
+                            total += ms;
+                            std::snprintf(item, sizeof(item), " %.1f", ms);
+                        }
+                        cpu += item;
+                        before = at[role];
+                    }
+                    std::fprintf(stderr, "[replay] loop %u: %s cpu ms per frame:%s (%.1f ms in %zu frames)\n", loop, roles[role], cpu.c_str(), total, flipCpu.size());
+                }
+                flipCpu.clear();
                 std::fprintf(stderr, "[replay] loop %u: memory deltas written in %.1f ms (%.1f MiB)\n", loop, memoryMs, static_cast<double>(memoryBytes) / 1048576.0);
                 flipTimes.clear();
             }
@@ -740,6 +769,8 @@ public:
             std::lock_guard lock(flipTimesMutex);
             if (flipTimes.size() <= flip) flipTimes.resize(static_cast<std::size_t>(flip) + 1);
             flipTimes[static_cast<std::size_t>(flip)] = Clock::now();
+            if (flipCpu.size() <= flip) flipCpu.resize(static_cast<std::size_t>(flip) + 1, {-1, -1});
+            flipCpu[static_cast<std::size_t>(flip)] = DriverCpu();
         }
         PresentJob job;
         job.timing = timing;
@@ -1150,6 +1181,13 @@ private:
     std::vector<std::uint64_t> loopFlips;
     std::mutex flipTimesMutex;
     std::vector<Clock::time_point> flipTimes;
+    // Per flip, and at the loop's start: the CPU ns of queue 0's worker and of the committer (-1: unknown).
+    std::vector<std::array<std::int64_t, 2>> flipCpu;
+    std::array<std::int64_t, 2> cpuAtStart{-1, -1};
+
+    static std::array<std::int64_t, 2> DriverCpu() {
+        return {AgcDriver::DriverThreadCpuNs(AgcDriver::DriverThread::Queue0Worker), AgcDriver::DriverThreadCpuNs(AgcDriver::DriverThread::Committer)};
+    }
     std::uint32_t loop = 0;
     double pacingMs = 0;
     static constexpr std::size_t ParallelWritePages = 256;
