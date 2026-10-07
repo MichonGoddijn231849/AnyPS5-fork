@@ -33,9 +33,11 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
   needs an argument this night could not test (see B9).
 - **B10:** only the `RecompileResult` copy is gone; the snapshot hash and the variant scan are unchanged.
 - **CMASK:** keeps an estimated range in B6 (no exact formula in the code).
-- **Test infrastructure:** `agc_driver_recorder_tests` is not a ctest here and stops at a pre-existing failure
-  (`unitShadowTests`, or `storageRefreshTests` with `APS5_NO_UNIT_SHADOW=1`), with or without any of tonight's
-  changes. The new tests in it (`snapshotRingTests`, `targetProofTests`, `drawInputMemoTests`) run before that point.
+- **Test infrastructure, fixed later in the night:** `agc_driver_recorder_tests` used to stop at `unitShadowTests`
+  (and `storageRefreshTests`). Both assume a GPU store into a host import is invisible to the write watch, which does
+  not hold on lavapipe, where the GPU is CPU threads. They now detect this and skip (`GpuStoresLookLikeCpuStores`,
+  cherry-picked from `gta-v/hw-rt`), and the binary is the ctest `agc_driver_recorder`. It passes, including with
+  `APS5_SNAPSHOT_RING`, `APS5_TARGET_PROOF_MEMO` and `APS5_DRAW_INPUT_MEMO` on.
 
 ### For the day session
 
@@ -187,9 +189,8 @@ Day-session check: `APS5_PROFILE_DRAW=1 APS5_PIPELINED_DRAWS=1` with and without
 `[bufferpool]` for fewer small-tier hits/misses. Correctness: the Lombank prologue renders the same (A/B
 screenshots).
 
-Pre-existing, seen while testing: `agc_driver_recorder_tests` stops at `unitShadowTests` ("the partial publish did
-not copy exactly the partly covered unit", then SIGSEGV), with and without the switch and at `e302895b` without
-B1. That is probably why the binary is not a ctest here.
+Seen while testing: `agc_driver_recorder_tests` stopped at `unitShadowTests`. This is a lavapipe artifact, now
+skipped there; the binary is a ctest since (see "Blocked, and why").
 
 ### B2: readTarget (`APS5_TARGET_PROOF_MEMO=1`)
 
@@ -232,9 +233,8 @@ Day-session check: `APS5_PROFILE_DRAW=1 APS5_PIPELINED_DRAWS=1` with and without
 Compare the committer's `readTarget` column. The `[target-proof]` line (every 100k hits) gives the hit/miss counts.
 Correctness: the prologue's frames match A/B (screenshots, or a replay with `--compare`).
 
-Pre-existing, seen while testing: with `APS5_NO_UNIT_SHADOW=1` (to get past `unitShadowTests`),
-`agc_driver_recorder_tests` stops at `storageRefreshTests` ("a CPU store into a unit with results pending was not
-seen by the refresh"), with every switch off too. The binary is not a ctest on this branch.
+Seen while testing: `storageRefreshTests` failed with every switch off as well. This is the same lavapipe artifact,
+now skipped there (see "Blocked, and why").
 
 ### B3: resource lookup (`APS5_LOOKUP_MEMO=1`)
 

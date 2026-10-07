@@ -1378,6 +1378,26 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
 // makes the unit stale), the scopes, the slab boundary, and the retire publish. With
 // APS5_UNIT_SHADOW_MIB=8 (one slab) the second slab's allocation evicts the first with a publish;
 // with APS5_NO_UNIT_SHADOW=1 every primitive is inert.
+// Whether a GPU store into a host import reads, to the write watch, like a CPU store: on lavapipe the GPU is CPU
+// threads writing the imported pages, which the watch reports as written; a real GPU's writes are not seen. The
+// unit-shadow and refresh tests assume the latter, so they skip where it does not hold. The probe stores the bytes
+// the first dword already holds.
+bool GpuStoresLookLikeCpuStores(const Device& device, Recorder& recorder, const HostImport& import, std::uint64_t address) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& context = device.GetContext();
+    std::uint32_t value = 0;
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+    const auto before = CollectWritesUncached(address, sizeof(value));
+    const auto commands = recorder.Commands();
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import.buffer, address - import.base, sizeof(value), value);
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    const bool seen = !UnchangedSinceCollected(address, sizeof(value), before);
+    static_cast<void>(CollectWritesUncached(address, sizeof(value)));
+    return seen;
+}
+
 void unitShadowTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
@@ -1421,6 +1441,10 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     }
     if (!Watched(address, bytes)) {
         std::cout << "host imports are compared, not watched: unit shadows not tested\n";
+        return;
+    }
+    if (GpuStoresLookLikeCpuStores(device, recorder, *import, address)) {
+        std::cout << "GPU stores into host imports read as CPU stores to the write watch (lavapipe): unit shadows not tested\n";
         return;
     }
     Require(import->base == address && import->bytes == bytes, "the import does not cover the block");
@@ -1693,6 +1717,10 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
     }
     if (watched && !AgcDriver::GuestMemory::Watched(address, bytes)) std::cout << "host imports are compared, not watched: storage refresh in watched memory runs as unwatched\n";
     watched = watched && AgcDriver::GuestMemory::Watched(address, bytes);
+    if (watched && GpuStoresLookLikeCpuStores(device, recorder, *import, address)) {
+        std::cout << "GPU stores into host imports read as CPU stores to the write watch (lavapipe): storage refresh in watched memory not tested\n";
+        return;
+    }
     Require(watched || !ShadowDestinationFor(base, *import, address, address + 65536).has_value(), "a unit shadow was offered for memory the write tracker does not watch");
     if (!AgcDriver::GuestMemory::WriteWatched()) Require(!UnitShadowEnabled(), "unit shadows are on without write watching");
     TextureDetiler detiler(base);
