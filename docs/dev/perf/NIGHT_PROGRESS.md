@@ -12,6 +12,7 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
 |---|---|---|---|
 | B7 exit crash | see `git log` (`fix(agc): retire the buffer pool ...`) | none (bug fix) | `agc_driver_buffer_pool_retire`: a retired pool frees its retained slots while the device lives and makes no Vulkan call for anything returned later, including a `Buffer` destroyed after the teardown (the image-mirror case) |
 | B10 recompile copy | `perf(agc): share the draw stage's recompile result ...` | none (no behaviour change) | the `agc_*` draw tests pass with `APS5_PIPELINED_DRAWS` off and on; the CPU-indirect path keeps its own copies, now for every stage |
+| B10 variant scan | `perf(shader): most recent variant first in the recompile's variant scan` | `APS5_VARIANT_MRU=1` | the `agc_*` suite passes with it on and off (baseline vopc failures aside); the scan finds the same variant in any order, since at most one matches. Measurement only otherwise: `[recompile] variant scan` under `APS5_PROFILE_DRAW` |
 | B5 pipeline identity | `perf(agc): identity fast path for repeated pipeline lookups` | `APS5_PIPELINE_IDENTITY=1` | the `agc_*` suite passes with it on (alone and with `APS5_PIPELINED_DRAWS=1`) |
 | B8 replay on Linux | `Frame replay: host memory and process calls behind a small platform layer` (cherry-picked from `gta-v/hw-rt` `d9a73a6f`) | none (tool) | `agc_frame_replay` builds on Linux here; `--summary` reads a capture |
 | B8b driver CPU per frame | `feat(agc): per-frame CPU time of the queue 0 worker and the committer in the replay` | none (measurement only) | `agc_driver_driver_thread_clock`: a registered thread's clock counts its own CPU (193 ms of a 200 ms spin) and not the reader's sleep |
@@ -31,7 +32,9 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
   or checked against live frames.
 - **Dispatch commit items** (B9, second half): design only, because the stage A/B split for dispatches with images
   needs an argument this night could not test (see B9).
-- **B10:** only the `RecompileResult` copy is gone; the snapshot hash and the variant scan are unchanged.
+- **B10:** the `RecompileResult` copy is gone and the variant scan can run most recent first (`APS5_VARIANT_MRU=1`).
+  The snapshot hash is unchanged: the result memo trusts it without a full compare, so a cheaper hash would add
+  collision risk. Both are now measured under `APS5_PROFILE_DRAW` (`[recompile] variant scan`).
 - **CMASK:** keeps an estimated range in B6 (no exact formula in the code).
 - **Test infrastructure, fixed later in the night:** `agc_driver_recorder_tests` used to stop at `unitShadowTests`
   (and `storageRefreshTests`). Both assume a GPU store into a host import is invisible to the write watch, which does
@@ -89,6 +92,24 @@ and the binding vectors; not measured here).
 
 Day-session check: `APS5_PROFILE_DRAW=1 APS5_PIPELINED_DRAWS=1` in the Lombank, compare the worker's `recompile`
 column before/after (same spot, 30 s).
+
+Second part, `APS5_VARIANT_MRU=1` (`perf(shader): most recent variant first in the recompile's variant scan`): a found
+variant is swapped to the front of its source's list. At most one variant matches a (layout, specialization), so the
+order only changes how many compares find it. With `APS5_PROFILE_DRAW`, a new line beside the result memo's reports
+the candidates compared per find and the snapshot hash's time per call:
+`[recompile] variant scan (10 s): N found, X candidates compared per find; snapshot hash Y us per call`.
+
+Expected saving: none if X is about 1 (a source with one specialization); otherwise (X - 1) specialization compares
+(two vectors of buffer and image descriptions) per recompiled stage. Not measured here: the driver tests draw too few
+times for a report.
+
+Day-session check: in the Lombank with `APS5_PROFILE_DRAW=1 APS5_PIPELINED_DRAWS=1`, read X and Y without the
+switch. If X is well above 1, turn `APS5_VARIANT_MRU=1` on and check that X drops toward 1 and the worker's
+`recompile` column drops. If Y is a large share of the 5.6 us, the hash is the next target (for example, hashing the
+descriptor words during the capture walk); keep it a full-strength hash.
+
+Test: the `agc_*` suite with the switch on and off (same two baseline vopc failures), and the non-agc suite with the
+switch and `APS5_PROFILE_DRAW=1`.
 
 ### B5: pipeline lookup identity fast path (`APS5_PIPELINE_IDENTITY=1`)
 

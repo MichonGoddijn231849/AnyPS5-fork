@@ -377,11 +377,39 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
     return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
 }
 
+// APS5_VARIANT_MRU=1: a found variant is swapped to the front of its source's list, so a source the
+// title draws with several specializations finds its current one first. At most one variant matches
+// a (layout, specialization), so the order changes which compare finds it, never which it finds.
+bool VariantMru() {
+    static const bool mru = std::getenv("APS5_VARIANT_MRU") != nullptr;
+    return mru;
+}
+
+// APS5_PROFILE_DRAW: the variant scans that found a variant and the candidates they compared, and
+// the snapshot hashes' time, reported with the result memo.
+struct VariantScanCounters {
+    std::atomic<std::uint64_t> found{0}, compared{0}, hashes{0}, hashNanoseconds{0};
+};
+
+VariantScanCounters& variantScanCounters() {
+    static VariantScanCounters counters;
+    return counters;
+}
+
 std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization, bool& cacheHit) {
-    for (const auto& candidate : source.variants) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    for (std::size_t i = 0; i < source.variants.size(); ++i) {
+        const auto& candidate = source.variants[i];
         if (sameLayout(candidate->layout, request.layout) && candidate->specialization == specialization) {
             cacheHit = true;
-            return candidate;
+            if (profile) {
+                auto& counters = variantScanCounters();
+                counters.found.fetch_add(1, std::memory_order_relaxed);
+                counters.compared.fetch_add(i + 1, std::memory_order_relaxed);
+            }
+            auto variant = candidate;
+            if (VariantMru() && i != 0) std::swap(source.variants[0], source.variants[i]);
+            return variant;
         }
     }
     cacheHit = false;
@@ -475,6 +503,12 @@ void reportResultMemo() {
     const auto evictions = counters.evictions.exchange(0, std::memory_order_relaxed);
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
+    auto& scans = variantScanCounters();
+    const auto found = scans.found.exchange(0, std::memory_order_relaxed);
+    const auto compared = scans.compared.exchange(0, std::memory_order_relaxed);
+    const auto hashes = scans.hashes.exchange(0, std::memory_order_relaxed);
+    const auto hashed = scans.hashNanoseconds.exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[recompile] variant scan (10 s): %llu found, %.2f candidates compared per find%s; snapshot hash %.2f us per call\n", static_cast<unsigned long long>(found), found != 0 ? static_cast<double>(compared) / static_cast<double>(found) : 0.0, VariantMru() ? " (most recent first)" : "", hashes != 0 ? static_cast<double>(hashed) / 1000.0 / static_cast<double>(hashes) : 0.0);
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
@@ -528,7 +562,13 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::shared_ptr<const CompiledVariant> variant;
     bool cacheHit = false;
+    const auto hashStarted = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto hash = snapshotHash(request, snapshot);
+    if (profile) {
+        auto& scans = variantScanCounters();
+        scans.hashes.fetch_add(1, std::memory_order_relaxed);
+        scans.hashNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - hashStarted).count()), std::memory_order_relaxed);
+    }
     std::uint64_t index = 0;
     auto& counters = resultMemoCounters();
     {
