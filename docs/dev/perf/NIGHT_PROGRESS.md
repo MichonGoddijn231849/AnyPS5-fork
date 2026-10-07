@@ -21,6 +21,7 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
 | B4 draw input memo | `perf(agc): per-thread memo of reused draw inputs within a collect epoch` | `APS5_DRAW_INPUT_MEMO=1` | `agc_driver_recorder_tests` `drawInputMemoTests` (with the switch set): a repeat within the epoch is answered by the memo (same buffer, same derived value); a stamp, a new epoch after a CPU store, a pending-registry change and a recorded pending write each force the full path. The `agc_*` suite passes with it on, and with all B switches on together. |
 | B6 pipelined-draw prerequisites | `fix(agc): storage images and exact target ranges in the pipelined draws' write ranges` | storage images: none (a fix to the pipelined path, which is itself off by default); exact ranges: `APS5_EXACT_DRAW_WRITES=1` | `agc_driver_draw_write_ranges`: a storage image a draw stores to is a write range (surface and keys), one it only reads is not, one without flags counts as written; the exact color/DCC/depth/stencil/HTILE ranges hold every addressed texel and nothing past the layout; the estimates cover the exact ranges; 4-sample targets scale. |
 | B8c flip numbering | `feat(agc): record each present's flip serial; replay by it under a switch` | `APS5_REPLAY_FLIP_SERIALS=1` (replay); the capture always records the serial in the event's reserved bytes | not tested end to end (no game capture here; the flip test's fake output never calls `Driver::Present`). `--summary` now lists every present's Present-count index beside its flip serial |
+| B8a replay main thread | `perf(agc): replay restores its page map from an undo log` | none (tool; same results) | builds on Linux; not run end to end (no game capture here) |
 
 ### B7: exit crash
 
@@ -85,9 +86,21 @@ Not run end-to-end: there is no game capture in this container. A capture made f
 (`APS5_CAPTURE`) records no address space (the test's command buffers are on its stack), so its replay crashes in
 `applyEvent` reading them. That capture is not a valid input, and the crash has nothing to do with this change.
 
-(a) main-thread cost: not attempted (it needs a game capture to profile). How to measure it: `perf record -g
---per-thread` on the replay, or the existing `[replay] loop N: memory deltas written in X ms` and `pacing waits`
-fields against the loop's wall time.
+(a) main-thread cost. Not profiled (no game capture here), but the code shows one per-loop cost that scales with the
+whole capture. Every restore copied `initialLastPage`, an `unordered_map` with an entry for every page the prologue
+wrote (the base snapshot: hundreds of thousands of pages for GTA V). The restore's own rewrite of those pages also
+updated `lastPage` for each of them, only for the copy to overwrite it.
+
+Now the restore writes without touching `lastPage` (`writeRuns(..., track = false)`). The loop's own changes to it go
+to an undo log that the restore rewinds, so the per-loop cost is the loop's delta pages, not the base. `writeRuns`
+also reuses its two per-event vectors. Results are identical: the map ends each restore exactly as the copy left it.
+
+Expected saving: tens of ms of setup per loop on a GTA capture (a copy of a map with ~10^5-10^6 entries, plus as
+many hash updates).
+
+Day-session check: compare the `[replay] loop N: ... setup X ms` field before and after on the same capture. For a
+full profile: `perf record -g --per-thread` on the replay, then read `memory deltas written in X ms` and `pacing
+waits` against the loop's wall time.
 
 (c) flip numbering, analysis only (needs a capture to confirm). The capture numbers presents by counting
 `Driver::Present` calls (`FrameCapture::NotePresent`: `event.flip = presentsSeen - flipsBefore`). The replay numbers

@@ -692,7 +692,9 @@ public:
                 for (std::size_t i = 0; i < prologueEnd; ++i) apply(capture.events[i]);
                 initialPieces = space.Pieces();
                 initialRegistry = space.Registry();
-                initialLastPage = lastPage;
+                // From here every change to lastPage is logged, and restore() rewinds the log: the loop's
+                // own pages, instead of a copy of the map of every page the prologue wrote.
+                lastPageLogged = true;
             } else {
                 restore();
             }
@@ -977,20 +979,25 @@ private:
 
     // A delta (`merge`) writes only what the capture changed in each page since its last captured version;
     // a base, a mapping or a restore writes whole pages.
-    void writeRuns(std::span<const MemoryRun> runs, std::span<const std::uint32_t> indices, bool compareFirst, bool merge = false) {
+    // `track`: note the pages' captured contents in lastPage (what a later merged delta compares against); restore()
+    // does not, as it rewinds lastPage afterwards and a compare-first write never merges.
+    void writeRuns(std::span<const MemoryRun> runs, std::span<const std::uint32_t> indices, bool compareFirst, bool merge = false, bool track = true) {
         std::size_t total = 0;
         for (const auto& run : runs) total += run.pages;
         if (total > indices.size()) Fail("capture memory event has fewer pages than its runs");
-        std::vector<std::uint64_t> addresses;
+        auto& addresses = writeAddresses;
+        addresses.clear();
         addresses.reserve(total);
         for (const auto& run : runs) {
             if (compareFirst) AgcDriver::GuestMemory::FlushGpuWrites(run.address, static_cast<std::size_t>(run.pages) * PageBytes);
             for (std::uint32_t page = 0; page < run.pages; ++page) addresses.push_back(run.address + static_cast<std::uint64_t>(page) * PageBytes);
         }
         constexpr std::uint64_t NoPage = std::uint64_t{1} << 32u;
-        std::vector<std::uint64_t> previous(total, NoPage);
-        for (std::size_t i = 0; i < total; ++i) {
+        auto& previous = writePrevious;
+        previous.assign(total, NoPage);
+        for (std::size_t i = 0; i < total && track; ++i) {
             auto& last = lastPage[addresses[i]];
+            if (lastPageLogged) lastPageUndo.emplace_back(addresses[i], last);
             if (merge && last != 0) previous[i] = last - 1;
             last = std::uint64_t{indices[i]} + 1;
         }
@@ -1164,12 +1171,16 @@ private:
             if (event.type == EventType::Memory) {
                 static_cast<void>(reader.Get<MemoryKind>());
                 const auto runs = reader.GetSpan<MemoryRun>();
-                writeRuns(runs, reader.GetSpan<std::uint32_t>(), true);
+                writeRuns(runs, reader.GetSpan<std::uint32_t>(), true, false, false);
             } else if (event.type == EventType::QueueState || event.type == EventType::DriverState) {
                 apply(event);
             }
         }
-        lastPage = initialLastPage;
+        for (auto it = lastPageUndo.rbegin(); it != lastPageUndo.rend(); ++it) {
+            if (it->second == 0) lastPage.erase(it->first);
+            else lastPage[it->first] = it->second;
+        }
+        lastPageUndo.clear();
         space.ApplyProtections();
         // The restore rewrites every page the loop changed, several times what the game writes
         // between two frames: collected here, the write-watch walk and reset of those pages land in
@@ -1219,7 +1230,12 @@ private:
     std::uint64_t memoryBytes = 0;
     std::uint64_t stallReleases = 0;
     // Each written page's last captured version (page index + 1), at the loop's start and now.
-    std::unordered_map<std::uint64_t, std::uint64_t> initialLastPage;
+    // The changes to lastPage since the prologue, oldest first (address, value before; 0: none), rewound by restore().
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> lastPageUndo;
+    bool lastPageLogged = false;
+    // writeRuns' per-event buffers, kept for their capacity.
+    std::vector<std::uint64_t> writeAddresses;
+    std::vector<std::uint64_t> writePrevious;
     std::unordered_map<std::uint64_t, std::uint64_t> lastPage;
     std::uint64_t submits = 0;
     std::uint64_t mappingChanges = 0;
