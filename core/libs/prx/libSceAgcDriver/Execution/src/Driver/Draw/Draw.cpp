@@ -307,7 +307,11 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
         phaseTiming.Phase(DrawRowDecode);
     }
     ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    // Results the draw changes (the rect list's stages, the CPU-indirect path's patched programs); the compiled
+    // stages are the captures' own results, held in `compiledStages`.
     std::vector<ShaderRecompiler::RecompileResult> results;
+    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> compiledStages;
+    compiledStages.reserve(programs.size());
     std::vector<Graphics::CompiledShader> stages;
     results.reserve(programs.size() + (graphics.rectList ? 2u : 0u));
     stages.reserve(programs.size());
@@ -406,10 +410,9 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
                 memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
             } else {
                 if (!dataCandidates[i].empty() && !verifyDrawDataHits()) decodeVertexInfo(i);
-                resultIndex[i] = results.size();
-                results.push_back(compileDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
+                compiledStages.push_back(compileDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
                 if (!rejected.empty()) return DrawVerdict::Rejected;
-                programResults[i] = &results.back();
+                programResults[i] = compiledStages.back().get();
                 if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
             }
             if (dataEntry != nullptr && reused[i]) ++dataStagesReused;
@@ -491,17 +494,16 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
     if (drawParameters.indirect && indirectCpu) {
 
         const auto indirect = *drawParameters.indirect;
-        if (drawHit) {
-
-            for (std::size_t i = 0; i < programs.size(); ++i) {
-                if (programResults[i] == nullptr) continue;
-                resultIndex[i] = results.size();
-                results.push_back(ShaderRecompiler::RecompileResult(*programResults[i]));
-                for (auto& stage : stages) {
-                    if (stage.program == programResults[i]) stage.program = &results[resultIndex[i]];
-                }
-                programResults[i] = &results[resultIndex[i]];
+        // The records patch the programs' user data and recompile them in place: copies the draw owns (the
+        // results are shared with the variant cache or the capture).
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            if (programResults[i] == nullptr) continue;
+            resultIndex[i] = results.size();
+            results.push_back(ShaderRecompiler::RecompileResult(*programResults[i]));
+            for (auto& stage : stages) {
+                if (stage.program == programResults[i]) stage.program = &results[resultIndex[i]];
             }
+            programResults[i] = &results[resultIndex[i]];
         }
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
@@ -543,8 +545,9 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
                 auto& result = results[resultIndex[programIndex]];
                 const auto pushBytes = result.pushConstants.size();
                 decodeVertexInfo(programIndex);
-                result = compileDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
+                const auto patchedResult = compileDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
+                result = *patchedResult;
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
             }
             fold(*programResults[0], direct);
@@ -587,7 +590,7 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
         const auto commitQueue = submission.queue;
         const auto commitPacket = t.packetOpcode;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry)] {
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), compiledStages = std::move(compiledStages), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry)] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
