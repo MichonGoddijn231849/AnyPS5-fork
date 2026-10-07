@@ -364,16 +364,20 @@ void append(std::vector<std::byte>& key, const TValue& value) {
 // (the recompiler could not identify it, so nothing else may share its pipeline). The rect-list
 // control and evaluation stages are generated from the vertex and fragment results, which the key
 // already names, so they carry no id of their own.
-std::vector<std::byte> pipelineKey(const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+// Written into `key` (cleared first, so a caller's buffer keeps its capacity).
+void pipelineKeyInto(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     using Stage = ShaderRecompiler::ShaderStage;
-    std::vector<std::byte> key;
+    key.clear();
     append(key, context.device);
     append(key, attachmentLayout);
     append(key, shaders.size());
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
         const bool generated = state.rectList && (shader.stage == Stage::TessellationControl || shader.stage == Stage::TessellationEvaluation);
-        if (!generated && shader.program->variantId == 0) return {};
+        if (!generated && shader.program->variantId == 0) {
+            key.clear();
+            return;
+        }
         append(key, shader.stage);
         append(key, generated ? std::uint64_t{0} : shader.program->variantId);
         // Where the stage's push constants sit in the block (AssemblePushConstants).
@@ -445,6 +449,11 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
         append(key, tessellation.partitioning);
         append(key, tessellation.outputTopology);
     }
+}
+
+std::vector<std::byte> pipelineKey(const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    std::vector<std::byte> key;
+    pipelineKeyInto(key, context, state, input, resources, shaders, attachmentLayout);
     return key;
 }
 
@@ -475,8 +484,38 @@ struct PipelineStore {
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
     std::uint64_t evicted = 0;
+    // APS5_PIPELINE_IDENTITY: bumped whenever an entry leaves `entries`, so an iterator taken at an
+    // unchanged generation still names a live entry.
+    std::uint64_t generation = 1;
+    std::uint64_t identityHits = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
+
+// APS5_PIPELINE_IDENTITY=1: consecutive draws of one thread (the committer's) mostly repeat the
+// previous draw's pipeline state. Each thread keeps the previous lookup's key and the store entry it
+// found; a lookup whose key equals it (one compare of the bytes) takes that entry without the hash,
+// the index lookup or a fresh key allocation (the key is built into a reused buffer). The entry is
+// trusted only while the store's generation is the one it was taken at: every erase from the store
+// (eviction, abandonment, ClearCachedPipelines) bumps it, so the iterator cannot dangle, and the
+// device check (`alive`) is made as on a normal hit. The hit counts, the LRU order and the result are
+// the normal hit's.
+bool pipelineIdentity() {
+    static const bool enabled = std::getenv("APS5_PIPELINE_IDENTITY") != nullptr;
+    return enabled;
+}
+
+struct LastPipeline {
+    std::vector<std::byte> key;
+    std::vector<std::byte> scratch;
+    std::list<PipelineStore::Entry>::iterator entry;
+    // 0: none.
+    std::uint64_t generation = 0;
+};
+
+LastPipeline& ThreadLastPipeline() {
+    thread_local LastPipeline last;
+    return last;
+}
 
 // Never destroyed: the pipelines belong to a device that may already be gone when statics die, and
 // the device's teardown (ClearCachedPipelines) is the place to destroy them.
@@ -496,6 +535,7 @@ bool alive(const PipelineStore::Entry& entry, const Context& context) {
 // not destroyed.
 std::list<PipelineStore::Entry>::iterator abandon(PipelineStore& store, std::list<PipelineStore::Entry>::iterator it) {
     it->pipeline->Abandon();
+    ++store.generation;
     store.index.erase(it->hash);
     return store.entries.erase(it);
 }
@@ -507,8 +547,8 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    std::fprintf(stderr, "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
-    store.hits = store.misses = store.uncached = store.evicted = 0;
+    std::fprintf(stderr, "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%; %llu repeats of the thread's previous key), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.identityHits), static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
+    store.hits = store.misses = store.uncached = store.evicted = store.identityHits = 0;
 }
 
 }
@@ -519,7 +559,29 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
     reportPipelines(store);
-    const auto key = pipelineKey(context, state, vertexInput, resources, shaders, attachmentLayout);
+    const bool identity = pipelineIdentity();
+    auto* last = identity ? &ThreadLastPipeline() : nullptr;
+    std::vector<std::byte> built;
+    if (identity) {
+        pipelineKeyInto(last->scratch, context, state, vertexInput, resources, shaders, attachmentLayout);
+        if (!last->scratch.empty() && last->generation == store.generation && last->scratch == last->key && alive(*last->entry, context)) {
+            ++store.hits;
+            ++store.identityHits;
+            store.entries.splice(store.entries.end(), store.entries, last->entry);
+            return last->entry->pipeline;
+        }
+        last->generation = 0;
+    } else {
+        built = pipelineKey(context, state, vertexInput, resources, shaders, attachmentLayout);
+    }
+    const auto& key = identity ? last->scratch : built;
+    // The entry this lookup ends on, for the thread's next lookup.
+    const auto remember = [&](std::list<PipelineStore::Entry>::iterator entry) {
+        if (!identity) return;
+        last->key = key;
+        last->entry = entry;
+        last->generation = store.generation;
+    };
     if (key.empty()) {
         ++store.uncached;
         return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
@@ -533,6 +595,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             if (alive(*it, context)) {
                 ++store.hits;
                 store.entries.splice(store.entries.end(), store.entries, it);
+                remember(it);
                 return it->pipeline;
             }
             abandon(store, it);
@@ -558,8 +621,12 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         if (victim == store.entries.end()) break;
         store.index.erase(victim->hash);
         store.entries.erase(victim);
+        ++store.generation;
         ++store.evicted;
     }
+    // The new entry, unless the bound evicted it (only an entry no draw holds goes, and the caller
+    // holds this one, so it stays).
+    if (const auto found = store.index.find(hash); found != store.index.end() && found->second->pipeline == pipeline) remember(found->second);
     return pipeline;
 }
 
@@ -573,6 +640,7 @@ void ClearCachedPipelines(VkDevice device) {
         }
         store.index.erase(it->hash);
         it = store.entries.erase(it);
+        ++store.generation;
     }
 }
 
