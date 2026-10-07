@@ -24,6 +24,39 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
 | B8a replay main thread | `perf(agc): replay restores its page map from an undo log` | none (tool; same results) | builds on Linux; not run end to end (no game capture here) |
 | B9 DMA_DATA commit items | `perf(agc): pipelined DMA_DATA as ordered commit items` | `APS5_PIPELINE_DMA=1` (with `APS5_PIPELINED_DRAWS=1`) | `agc_driver_pipelined_dma`: an immediate fill and a copy of it in one DCB land as the CPU path stores them, in order (the copy sees the fill), both committed, none drained. The `agc_*` suite passes with it on, with and without pipelined draws. Dispatch commit items: design only (below) |
 
+### Blocked, and why
+
+- **B8d** (frame 1 differs between identical runs): needs a game capture to compare runs; none is in this container.
+- **B8a/B8c, end to end:** the changes build and run on Linux, but without a game capture they could not be measured
+  or checked against live frames.
+- **Dispatch commit items** (B9, second half): design only, because the stage A/B split for dispatches with images
+  needs an argument this night could not test (see B9).
+- **B10:** only the `RecompileResult` copy is gone; the snapshot hash and the variant scan are unchanged.
+- **CMASK:** keeps an estimated range in B6 (no exact formula in the code).
+- **Test infrastructure:** `agc_driver_recorder_tests` is not a ctest here and stops at a pre-existing failure
+  (`unitShadowTests`, or `storageRefreshTests` with `APS5_NO_UNIT_SHADOW=1`), with or without any of tonight's
+  changes. The new tests in it (`snapshotRingTests`, `targetProofTests`, `drawInputMemoTests`) run before that point.
+
+### For the day session
+
+1. Build `night/perf`. Run GTA V to the Lombank prologue with `APS5_PROFILE_DRAW=1 APS5_PIPELINED_DRAWS=1` and save
+   the 30 s profile as the baseline.
+2. Add each switch on its own, same spot, 30 s each. Compare the committer's columns:
+   - `APS5_SNAPSHOT_RING=1`: record, and the `[draw-bindings]` create/fill parts;
+   - `APS5_TARGET_PROOF_MEMO=1`: readTarget, and the `[target-proof]` counts;
+   - `APS5_LOOKUP_MEMO=1`: lookup revalidate, and the `[rescache] revalidate` memo counts;
+   - `APS5_DRAW_INPUT_MEMO=1`: vertex;
+   - `APS5_PIPELINE_IDENTITY=1`: pipeline, and the repeats on `[pipecache]`;
+   - `APS5_PIPELINE_DMA=1`: the `packet 0x50` drains;
+   - `APS5_EXACT_DRAW_WRITES=1`: the drain counts.
+3. Run once with all of them plus `APS5_VERIFY_PROOFS=1`. Expected: no abort; frames identical to the baseline
+   (screenshots of the same spot).
+4. Close the game window. Expected: no crash in the NVIDIA driver at exit (B7).
+5. Make a new capture. Run `agc_frame_replay <capture> --summary` and check the present numbering (B8c), then
+   `--png --compare` with `APS5_REPLAY_FLIP_SERIALS=1`. Expected: PSNR back to normal and frame 3 present.
+   Read the per-frame `cpu ms` lines for the worker and the committer (B8b), and the `setup` time (B8a).
+6. For B8d: two identical replays with `--png-all-loops`, then diff frame 1 of each loop.
+
 ### B7: exit crash
 
 `VulkanDevice`'s teardown now, before `vkDestroyDevice`:
