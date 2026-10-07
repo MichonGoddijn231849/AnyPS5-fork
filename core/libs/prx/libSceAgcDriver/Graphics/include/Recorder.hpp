@@ -102,8 +102,22 @@ public:
     static constexpr std::size_t DrawSnapshotEntries = 1024;
     static constexpr std::size_t DrawInputBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawInputEntries = 16384;
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
-    void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    // `offset`: where the snapshot starts in `buffer` (a slice of a snapshot arena, see AllocateDrawSnapshot). A
+    // caller without `offset` is served only snapshots at offset 0.
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, VkDeviceSize* offset = nullptr);
+    void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0, VkDeviceSize offset = 0);
+    // APS5_SNAPSHOT_RING=1: a draw's new storage snapshot is a slice of a host-visible arena instead of a Buffer of
+    // its own. The arena is a pooled Buffer the slices share: every batch that bound a slice keeps it (through the
+    // draw's bindings) and so does every reuse entry naming one, and it goes back to the BufferPool when the last
+    // of them is gone. Slices are written once, when allocated, and never again, so recycling needs no fence of its
+    // own. A request larger than a quarter arena, or one made while the arenas still held reach their cap, gets
+    // nothing (the caller makes a Buffer as before).
+    struct SnapshotSlice {
+        std::shared_ptr<Buffer> buffer;
+        VkDeviceSize offset = 0;
+    };
+    static bool SnapshotRingEnabled();
+    SnapshotSlice AllocateDrawSnapshot(std::size_t bytes);
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
@@ -751,6 +765,7 @@ private:
         std::list<DrawSnapshotKey>::iterator recent;
         std::shared_ptr<Buffer> buffer;
         std::uint32_t derived;
+        VkDeviceSize offset;
     };
     struct DrawSnapshotPool {
         std::list<DrawSnapshotKey> recency;
@@ -758,6 +773,9 @@ private:
     };
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
+    // APS5_SNAPSHOT_RING: the arena slices are cut from, and the next free byte in it.
+    std::shared_ptr<Buffer> snapshotArena;
+    std::size_t snapshotArenaCursor = 0;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
 };
 

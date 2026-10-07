@@ -15,6 +15,7 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
 | B5 pipeline identity | `perf(agc): identity fast path for repeated pipeline lookups` | `APS5_PIPELINE_IDENTITY=1` | the `agc_*` suite passes with it on (alone and with `APS5_PIPELINED_DRAWS=1`) |
 | B8 replay on Linux | `Frame replay: host memory and process calls behind a small platform layer` (cherry-picked from `gta-v/hw-rt` `d9a73a6f`) | none (tool) | `agc_frame_replay` builds on Linux here; `--summary` reads a capture |
 | B8b driver CPU per frame | `feat(agc): per-frame CPU time of the queue 0 worker and the committer in the replay` | none (measurement only) | `agc_driver_driver_thread_clock`: a registered thread's clock counts its own CPU (193 ms of a 200 ms spin) and not the reader's sleep |
+| B1 snapshot ring | `perf(agc): draw snapshots as slices of shared arenas` | `APS5_SNAPSHOT_RING=1` (`APS5_SNAPSHOT_RING_KIB`, default 1024) | `agc_driver_recorder_tests` (not a ctest on this branch; run by hand) `snapshotRingTests`: slices aligned for a storage descriptor, non-overlapping, one arena until full, a new one after, over a quarter arena refused, an arena released with its last slice. The reuse and in-flight tests there now check slices by (buffer, offset) and copy from the slice's offset; they pass with the switch on and off. The `agc_*` suite passes with it on (also with pipelined draws). |
 
 ### B7: exit crash
 
@@ -98,3 +99,34 @@ First check for the day session: `--summary` on a game capture lists the Present
 `flip` fields with the Submit events' flip counts.
 
 (d) frame 1 differs between identical runs: not attempted (needs a capture).
+
+### B1: snapshot upload ring (`APS5_SNAPSHOT_RING=1`)
+
+A new storage snapshot in `PrepareDrawBindings` takes a slice of the recorder's current arena
+(`Recorder::AllocateDrawSnapshot`) instead of a `Buffer` of its own. The arena is a 1 MiB pooled host-visible
+`Buffer` (`STORAGE | TRANSFER_SRC`, as before). Slices are cut forward at `minStorageBufferOffsetAlignment` (at
+least 16), written once at allocation and never rewritten. Lifetime is the `shared_ptr<Buffer>` the slices share:
+the draw's `DrawBindings` (kept by its batch until the fence) and the reuse entry both hold it. When an arena is
+full the recorder lets go of it and takes a new one. The old arena returns to the `BufferPool` when its last batch
+completes and its last reuse entry is evicted, so recycling never overwrites bytes in flight.
+
+- The reuse rule is unchanged: same key (address, use, bytes), same generation checks. The entry now also records
+  the slice's offset (`DrawSnapshot::offset`). A caller that passes no offset (the vertex/index path) is only
+  served offset-0 entries.
+- The descriptors take `{arena, offset, bytes}`, and `captureInputs` (APS5 input capture) copies from the offset.
+- Fallbacks to a `Buffer` of its own: a snapshot over a quarter arena, or when the live arenas reach 256 MiB (an
+  arena pinned by one long-lived reuse entry stays whole, so this bounds that waste).
+- Not changed: the snapshot `std::map` (kept; the reuse lookup was 0.74 us and the fill's map insert is part of
+  the 1.9 us fill).
+
+Expected saving: the per-snapshot `make_shared<Buffer>` and pool `Take` (the 0.78 us "create"), about 1.6 us per
+draw at 2.1 new snapshots per draw, plus the matching `Put` on release.
+
+Day-session check: `APS5_PROFILE_DRAW=1 APS5_PIPELINED_DRAWS=1` with and without `APS5_SNAPSHOT_RING=1`, same spot,
+30 s. Read the `create` and `fill` parts of `[draw-bindings]` and the committer's `record` column. Also watch
+`[bufferpool]` for fewer small-tier hits/misses. Correctness: the Lombank prologue renders the same (A/B
+screenshots).
+
+Pre-existing, seen while testing: `agc_driver_recorder_tests` stops at `unitShadowTests` ("the partial publish did
+not copy exactly the partly covered unit", then SIGSEGV), with and without the switch and at `e302895b` without
+B1. That is probably why the binary is not a ctest here.

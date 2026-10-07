@@ -961,8 +961,9 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         const auto commands = snapshotRecorder.Commands();
         RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         const auto copy = snapshotContext.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
-        VkBufferCopy region{0, 0, elementBytes};
+        VkBufferCopy region{first->snapshots[0].offset, 0, elementBytes};
         copy(commands, first->snapshots[0].buffer->Handle(), downloaded->Handle(), 1, &region);
+        region.srcOffset = second->snapshots[0].offset;
         region.dstOffset = elementBytes;
         copy(commands, second->snapshots[0].buffer->Handle(), downloaded->Handle(), 1, &region);
         RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
@@ -1060,9 +1061,9 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
         Require(push[0] == std::byte{0} && adjustment == offset % alignment, "the inner view's shader offset is not its distance from the binding");
         const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
         Require(bindings != nullptr && bindings->snapshots.size() == 2, "read-only draw inputs were not snapshotted");
-        const auto outerContents = bindings->snapshots[0].buffer->Bytes();
+        const auto outerContents = bindings->snapshots[0].Bytes();
         Require(outerContents.size() >= outerBytes && std::memcmp(outerContents.data(), guest + outer, outerBytes) == 0, "an aligned draw snapshot misses its view's bytes");
-        const auto contents = bindings->snapshots[1].buffer->Bytes();
+        const auto contents = bindings->snapshots[1].Bytes();
         Require(contents.size() >= adjustment + elementBytes, "a draw snapshot ends before the bytes the shader reads");
         Require(std::memcmp(contents.data() + adjustment, guest + offset, elementBytes) == 0, "the shader's offset into a draw snapshot misses the view's bytes");
         snapshotRecorder.Sync();
@@ -1126,10 +1127,11 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         const auto snapshot = [&](std::byte expected) {
             const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
-            const auto buffer = bindings->snapshots[0].buffer;
-            const auto contents = buffer->Bytes();
+            const auto& taken = bindings->snapshots[0];
+            const auto contents = taken.Bytes();
             Require(contents.size() == elementBytes && std::all_of(contents.begin(), contents.end(), [&](std::byte value) { return value == expected; }), "a draw snapshot does not hold the guest bytes of its draw");
-            return buffer;
+            // A snapshot's identity: its buffer and, under APS5_SNAPSHOT_RING, its place in the arena.
+            return std::pair{taken.buffer, taken.offset};
         };
         const auto first = snapshot(std::byte{0x11});
         Require(snapshot(std::byte{0x11}) == first, "an unchanged draw input was copied again");
@@ -1148,6 +1150,38 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         snapshotRecorder.Sync();
     }
     recorder.Activate();
+}
+
+// APS5_SNAPSHOT_RING=1 (agc_driver_recorder_snapshot_ring): slices are aligned for a storage descriptor, do not
+// overlap, share an arena until it is full and then move to a new one; a request over a quarter arena gets none.
+void snapshotRingTests(const Device& device) {
+    if (!Recorder::SnapshotRingEnabled()) return;
+    const auto& context = device.GetContext();
+    Recorder ring(context);
+    const auto alignment = std::max<VkDeviceSize>(16, context.limits.minStorageBufferOffsetAlignment);
+    auto first = ring.AllocateDrawSnapshot(100);
+    Require(first.buffer != nullptr && first.offset == 0, "snapshot ring: the first slice starts an arena");
+    const auto arenaBytes = first.buffer->Bytes().size();
+    auto second = ring.AllocateDrawSnapshot(100);
+    Require(second.buffer == first.buffer && second.offset >= first.offset + 100 && second.offset % alignment == 0, "snapshot ring: a second slice follows the first, aligned, in the same arena");
+    Require(ring.AllocateDrawSnapshot(arenaBytes / 4 + 1).buffer == nullptr, "snapshot ring: a slice over a quarter arena is refused");
+    auto last = second;
+    std::size_t slices = 2;
+    while (last.buffer == first.buffer) {
+        last = ring.AllocateDrawSnapshot(arenaBytes / 4);
+        Require(last.buffer != nullptr, "snapshot ring: a slice fits after the arena filled");
+        Require(last.buffer != first.buffer || last.offset + arenaBytes / 4 <= arenaBytes, "snapshot ring: a slice runs past its arena");
+        ++slices;
+        Require(slices < 16, "snapshot ring: the arena never filled");
+    }
+    Require(last.offset == 0, "snapshot ring: a full arena moves the next slice to a new one");
+    // The filled arena lives while a slice of it is held, and goes when the last one does.
+    const std::weak_ptr<Buffer> filled = first.buffer;
+    first.buffer.reset();
+    Require(!filled.expired(), "snapshot ring: an arena went while a slice of it was held");
+    second.buffer.reset();
+    Require(filled.expired(), "snapshot ring: a filled arena outlived its slices");
+    std::cout << "snapshot ring: " << arenaBytes / 1024 << " KiB arenas, " << slices << " slices to fill one\n";
 }
 
 void drawSnapshotEvictionTests(const Device& device) {
@@ -2705,6 +2739,7 @@ int main() {
         resourceReadTests(device, recorder);
         misalignedSnapshotTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
+        snapshotRingTests(device);
         drawSnapshotEvictionTests(device);
         drawInputReuseTests(device, recorder);
         RunResidentPresentTests(device.GetContext());

@@ -114,9 +114,14 @@ public:
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
         DrawBindings& operator=(const DrawBindings&) = delete;
+        // The snapshot's bytes are `bytes` at `offset` in `buffer` (a snapshot arena's slice under
+        // APS5_SNAPSHOT_RING, else a Buffer of its own at offset 0).
         struct Snapshot {
             std::uint64_t address;
             std::shared_ptr<Buffer> buffer;
+            VkDeviceSize offset = 0;
+            std::size_t bytes = 0;
+            std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
         };
         DescriptorCache* cache = nullptr;
         VkDescriptorSetLayout layout = VK_NULL_HANDLE;
