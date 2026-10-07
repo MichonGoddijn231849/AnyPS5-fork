@@ -23,6 +23,8 @@ public:
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
     void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot) const;
     static std::uint64_t SpecializationNanoseconds();
+    static std::uint64_t EvaluateNanoseconds();
+    static std::uint64_t MaterializeNanoseconds();
     static std::uint32_t BindlessSlots();
     static void CountBindlessRejection(BindlessRejection reason);
 };

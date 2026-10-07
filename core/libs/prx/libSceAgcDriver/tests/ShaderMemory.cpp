@@ -383,7 +383,7 @@ void verifySignedMinimum() {
         SrtRuntime runtime{data};
         Detail::Evaluator evaluator(plan, runtime);
         std::uint32_t result = 0;
-        require(evaluator.Evaluate(&minimum, result) && result == expected, "SRT signed minimum used unsigned ordering or failed evaluation");
+        require(evaluator.Evaluate(Detail::IrNode(&minimum), result) && result == expected, "SRT signed minimum used unsigned ordering or failed evaluation");
     }
 }
 
