@@ -24,6 +24,12 @@ class Recorder;
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
+// APS5_LOOKUP_MEMO: Revalidate calls answered by the template's last fast proof, and those that were not.
+struct LookupMemoCounts {
+    std::uint64_t hits;
+    std::uint64_t misses;
+};
+LookupMemoCounts LookupMemoCounters();
 void ClearSampledTables(VkDevice device);
 
 // The cached storage image of a surface (render targets use it as their resident image); brought up
@@ -435,6 +441,25 @@ private:
     std::uint64_t pendingSerialSeen = 0;
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
+    // APS5_LOOKUP_MEMO: the last fast proof's stamp checks (the surfaces at their generations, the
+    // DCC key ranges at their proofs'), the images whose cache residency it checked and what else it
+    // stood on; `epoch` 0: none (see lookupMemoHolds).
+    struct RangeStamp {
+        std::uint64_t address;
+        std::size_t bytes;
+        std::uint64_t generation;
+    };
+    struct LookupMemo {
+        std::uint64_t epoch = 0;
+        std::uint64_t unwatched = 0;
+        std::uint64_t pendingSerial = 0;
+        std::uint64_t registryGeneration = 0;
+        std::vector<RangeStamp> stamps;
+        std::vector<const StorageTexture*> images;
+        bool keysKept = true;
+    };
+    LookupMemo lookupMemo;
+    bool lookupMemoHolds(std::uint64_t serialBefore);
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
     std::uint64_t dataWordsHash = 14695981039346656037ull;
     void rehashDataWords();

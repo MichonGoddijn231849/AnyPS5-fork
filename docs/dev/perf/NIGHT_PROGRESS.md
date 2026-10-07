@@ -17,6 +17,7 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
 | B8b driver CPU per frame | `feat(agc): per-frame CPU time of the queue 0 worker and the committer in the replay` | none (measurement only) | `agc_driver_driver_thread_clock`: a registered thread's clock counts its own CPU (193 ms of a 200 ms spin) and not the reader's sleep |
 | B1 snapshot ring | `perf(agc): draw snapshots as slices of shared arenas` | `APS5_SNAPSHOT_RING=1` (`APS5_SNAPSHOT_RING_KIB`, default 1024) | `agc_driver_recorder_tests` (not a ctest on this branch; run by hand) `snapshotRingTests`: slices aligned for a storage descriptor, non-overlapping, one arena until full, a new one after, over a quarter arena refused, an arena released with its last slice. The reuse and in-flight tests there now check slices by (buffer, offset) and copy from the slice's offset; they pass with the switch on and off. The `agc_*` suite passes with it on (also with pipelined draws). |
 | B2 target proof memo | `perf(agc): memoize a storage image's refresh proof within a collect epoch` | `APS5_TARGET_PROOF_MEMO=1` | `agc_driver_recorder_tests` `targetProofTests` (runs with the switch set): a repeat within the epoch is answered by the proof; a stamp over the surface, a new epoch after a CPU store, and another image marked dirty over it each force the full Refresh (which then uploads for the CPU store). The `agc_*` suite passes with it on (also with pipelined draws). |
+| B3 lookup memo | `perf(agc): re-prove a reused template from its last fast proof` | `APS5_LOOKUP_MEMO=1` | `agc_driver_lookup_memo` (sets the switch and `APS5_VERIFY_PROOFS=1`, which runs the fast proof beside every memo hit and aborts on a disagreement): a repeat within the epoch is answered by the memo; a pending-registry change, a new collect epoch and a registry mutation each force the fast proof; results never change. The `agc_*` suite passes with it on. |
 
 ### B7: exit crash
 
@@ -176,3 +177,46 @@ Correctness: the prologue's frames match A/B (screenshots, or a replay with `--c
 Pre-existing, seen while testing: with `APS5_NO_UNIT_SHADOW=1` (to get past `unitShadowTests`),
 `agc_driver_recorder_tests` stops at `storageRefreshTests` ("a CPU store into a unit with results pending was not
 seen by the refresh"), with every switch off too. The binary is not a ctest on this branch.
+
+### B3: resource lookup (`APS5_LOOKUP_MEMO=1`)
+
+What was looked at: the 5.4 us lookup is key 0.95, find 0.5, `Revalidate` 2.1 and `MovedReadOnlyBuffers` 1.7.
+
+- `Revalidate` already has the fast proof (`fastRevalidate`), the epoch gate and the pending-serial memo. Its
+  per-use work (step 3, the staging copies) must run on every use.
+- `MovedReadOnlyBuffers` and `DrawResourceKey` compare or hash the draw's descriptor words. A memo on them would have
+  to compare the same words, so there is little to save.
+
+The memo therefore targets what `fastRevalidate` repeats for an immediate re-use of a template by the same thread:
+the collects of every surface, the DCC key proofs (a collect and an `UnchangedSince` each), the decode and the
+query building. After a plain fast proof (no accepted overlap, no own-object refresh, every key proof kept, the
+registry unmoved through the call) the template keeps:
+
+- the proof's stamp queries, with the key ranges added at their proofs' generations;
+- the images whose cache residency it checked;
+- the thread's collect epoch, the unwatch serial, the pending serial and the registry generation.
+
+The next `Revalidate` of that template is answered from the memo when the epoch, the unwatch serial, the pending
+serial and the registry generation are all unchanged, and these checks pass:
+
+- one `UnchangedSinceAll` over the stamps;
+- the cache flags and `StorageImagesCached`, because eviction moves no serial;
+- `StorageImageServesKeys` for each storage image.
+
+Steps (2), the import checks, and (3), the staging copies, run as before.
+
+The argument for skipping the collects and key proofs is B2's: within the epoch a collect returns its memoized
+generation, and a kept key proof answers while its range is unstamped. Given an unchanged pending registry, the
+proof's decisions (keys, the identities asked of the registry) come out the same.
+
+`APS5_VERIFY_PROOFS=1` checks every memo hit against the fast proof. Use it for the day session's first runs.
+
+A bug found by the test and fixed before the commit: the pending serial starts at 0, which is also
+`pendingSerialSeen`'s "none". The memo now compares the serial directly.
+
+Expected saving: most of `fastRevalidate` on repeats within an epoch, perhaps 1 us of the 2.1 us revalidate.
+Nothing changes for templates with no textures.
+
+Day-session check: `APS5_PROFILE_DRAW=1 APS5_PIPELINED_DRAWS=1` with and without `APS5_LOOKUP_MEMO=1`. Compare the
+committer's lookup `revalidate` part, and read the memo hits and misses on the `[rescache] revalidate` line. Run
+once with `APS5_VERIFY_PROOFS=1`: no abort is the check.

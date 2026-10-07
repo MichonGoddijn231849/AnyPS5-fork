@@ -1419,6 +1419,14 @@ bool SameKeySurface(const StorageTexture* source, const GuestTextureResource& re
     return own.dccAddress == resource.dccAddress && source->GuestBytes() == guestBytes && own.format == resource.format && own.dccAlphaOnMsb == resource.dccAlphaOnMsb;
 }
 
+
+std::atomic<std::uint64_t> lookupMemoHits{0};
+std::atomic<std::uint64_t> lookupMemoMisses{0};
+
+void countLookupMemo(bool hit) {
+    (hit ? lookupMemoHits : lookupMemoMisses).fetch_add(1, std::memory_order_relaxed);
+}
+
 void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point start) {
     auto& profile = Revalidations();
     const auto now = std::chrono::steady_clock::now();
@@ -1440,13 +1448,19 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto reasons = byReason(profile.fastFails, FastFailNames);
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
-    std::fprintf(stderr, "[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
+    std::fprintf(stderr, "[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; lookup memo (APS5_LOOKUP_MEMO, cumulative): %llu hits, %llu misses\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()), static_cast<unsigned long long>(lookupMemoHits.load()), static_cast<unsigned long long>(lookupMemoMisses.load()));
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
 // flush and import lookups of every Revalidate, as before the epoch gate.
 bool EpochRevalidate() {
     static const bool enabled = std::getenv("APS5_NO_EPOCH_REVALIDATE") == nullptr;
+    return enabled;
+}
+
+// APS5_LOOKUP_MEMO=1: see ShaderResources::lookupMemoHolds.
+bool LookupMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_LOOKUP_MEMO") != nullptr && EpochRevalidate();
     return enabled;
 }
 
@@ -1513,6 +1527,19 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     owners.clear();
     images.clear();
     scannedKeys.assign(textures.size(), DccKeys::Uncompressed);
+    // APS5_LOOKUP_MEMO: the key ranges this proof read, at the generations of the key proofs that
+    // answered them (a proof not kept, generation 0, means its scan repeats on every call).
+    const bool memo = LookupMemoEnabled();
+    lookupMemo.epoch = 0;
+    lookupMemo.stamps.clear();
+    lookupMemo.keysKept = keyProofs;
+    const auto noteKeys = [&](const GuestTextureResource& resource, std::uint64_t surfaceBytes, const DccKeyProof& proof) {
+        if (!memo || resource.dccAddress == 0) return;
+        const auto keyBytes = static_cast<std::size_t>(surfaceBytes / 256);
+        if (keyBytes == 0) return;
+        if (proof.generation == 0) lookupMemo.keysKept = false;
+        lookupMemo.stamps.push_back({resource.dccAddress, keyBytes, proof.generation});
+    };
     const auto query = [&](std::uint64_t begin, std::uint64_t end, const StorageTexture* except, const StorageTexture* identity, PendingOverlap owner) {
         pending.push_back({begin, end, except, identity, false});
         owners.push_back(owner);
@@ -1539,8 +1566,11 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             // proof when they are the image's, else from the texture's.
             const auto& own = source->Descriptor();
             const auto sourceKeys = own.dccAddress != 0 ? ProvedClearKeys(own, source->GuestBytes(), source->KeyProof()) : DccKeys::Uncompressed;
+            noteKeys(own, source->GuestBytes(), source->KeyProof());
             if (sourceKeys != source->UploadedKeys()) return fail(FastFail::Keys);
-            const auto keys = surface.resource.dccAddress == 0 ? DccKeys::Uncompressed : SameKeySurface(source, surface.resource, surface.bytes) ? sourceKeys : ProvedClearKeys(surface.resource, surface.bytes, textures[i]->KeyProof());
+            const bool sameKeys = SameKeySurface(source, surface.resource, surface.bytes);
+            const auto keys = surface.resource.dccAddress == 0 ? DccKeys::Uncompressed : sameKeys ? sourceKeys : ProvedClearKeys(surface.resource, surface.bytes, textures[i]->KeyProof());
+            if (!sameKeys) noteKeys(surface.resource, surface.bytes, textures[i]->KeyProof());
             if (surface.resource.dccAddress != 0 && surface.resource.dccAddress != own.dccAddress && (keys != DccKeys::Uncompressed || !StorageImageServesKeys(*source, surface.resource.dccAddress))) return fail(FastFail::Keys);
             scannedKeys[i] = keys;
             // A view of a fast-cleared surface stays one only while its image still has results
@@ -1554,6 +1584,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         } else {
             // A snapshot holds its clear texels or the guest bytes: the keys must be what it was made under.
             const auto keys = surface.resource.dccAddress != 0 ? ProvedClearKeys(surface.resource, surface.bytes, textures[i]->KeyProof()) : DccKeys::Uncompressed;
+            noteKeys(surface.resource, surface.bytes, textures[i]->KeyProof());
             if (keys != surface.keys) return fail(FastFail::Keys);
             scannedKeys[i] = keys;
             if (!unchanged) query(address, address + bytes, nullptr, nullptr, {i, false, false});
@@ -1581,6 +1612,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             // uploaded under, through the image's proof; the memory query below), minus its
             // byte-compare fallback; the image's generation is left where it is.
             if (!keyProofs || ProvedClearKeys(own, bytes, image->KeyProof()) != image->UploadedKeys()) return fail(FastFail::StorageKeys);
+            noteKeys(own, bytes, image->KeyProof());
             countKeysProven(true);
         }
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
@@ -1630,6 +1662,57 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (surface.source == nullptr) surface.generation = surface.collected;
         surface.keys = scannedKeys[i];
     }
+    // The memo is the proof as it stands now; Revalidate keeps it only for a plain success (no
+    // accepted overlap, no own-object refresh) whose registry did not move (see lookupMemoHolds).
+    if (memo && lookupMemo.keysKept && !accepted && refreshed.empty() && GuestMemory::ThreadCollectEpoch() != 0) {
+        for (const auto& entry : queries) lookupMemo.stamps.push_back({entry.address, entry.bytes, entry.generation});
+        // A surface without a source is checked at the generation it just moved to.
+        for (std::size_t i = 0, k = 0; i < validatedTextures.size(); ++i, ++k) {
+            const auto& surface = validatedTextures[i];
+            if (surface.source == nullptr) lookupMemo.stamps[lookupMemo.stamps.size() - queries.size() + k].generation = surface.generation;
+        }
+        lookupMemo.images = images;
+        lookupMemo.epoch = GuestMemory::ThreadCollectEpoch();
+        lookupMemo.unwatched = GuestMemory::UnwatchSerial();
+        lookupMemo.pendingSerial = serialBefore;
+        lookupMemo.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    }
+    return true;
+}
+
+// APS5_LOOKUP_MEMO=1: a template revalidated by a plain fast proof is proved again, by the same
+// thread within its collect epoch, from that proof's own results: while the epoch and the unwatch
+// serial stand, every collect the proof made (surfaces, keys) would return its memoized generation
+// without a walk, and every key proof would answer from its kept proof while its range is
+// unstamped, so the decisions the proof took (keys, the identities asked of the registry) come out
+// the same while the pending serial is the one it was taken at (no image marked dirty, stored,
+// flushed or dropped) and the registry generation stands. What can still move without any of
+// those (eviction from the texture and storage caches, a storage image serving other keys, a stamp)
+// is checked again: the stamp checks in one tracker lock, the cache flags, StorageImagesCached and
+// StorageImageServesKeys. The images are noted proved as the proof does. The surfaces' generations
+// stay where the proof moved them: no stamp lies between.
+LookupMemoCounts LookupMemoCounters() {
+    return {lookupMemoHits.load(std::memory_order_relaxed), lookupMemoMisses.load(std::memory_order_relaxed)};
+}
+
+bool ShaderResources::lookupMemoHolds(std::uint64_t serialBefore) {
+    if (!LookupMemoEnabled() || lookupMemo.epoch == 0) return false;
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
+    if (epoch == 0 || epoch != lookupMemo.epoch || GuestMemory::UnwatchSerial() != lookupMemo.unwatched || serialBefore != lookupMemo.pendingSerial || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != lookupMemo.registryGeneration) return false;
+    if (validatedTextures.size() != textures.size()) return false;
+    for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+        if (storageTextures[i] == nullptr || i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i])) return false;
+    }
+    thread_local std::vector<GuestMemory::UnchangedQuery>* stampsSlot = nullptr;
+    auto& stamps = ShaderRecompiler::ThreadOwned(stampsSlot);
+    stamps.clear();
+    for (const auto& entry : lookupMemo.stamps) stamps.push_back({entry.address, entry.bytes, entry.generation});
+    if (!GuestMemory::UnchangedSinceAll(stamps)) return false;
+    for (const auto* image : lookupMemo.images) {
+        if (!image->Cached()) return false;
+    }
+    if (!StorageImagesCached(context, lookupMemo.images)) return false;
+    for (const auto* image : lookupMemo.images) image->NoteProved();
     return true;
 }
 
@@ -1836,7 +1919,23 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
-    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    const bool memoHit = !noFast && lookupMemoHolds(serialBefore);
+    if (memoHit) countLookupMemo(true);
+    else if (LookupMemoEnabled()) countLookupMemo(false);
+    if (memoHit && VerifyProofs()) {
+        // APS5_VERIFY_PROOFS: the fast proof the memo stands for must hold too.
+        thread_local std::vector<PendingOverlap>* checkSlot = nullptr;
+        auto& check = ShaderRecompiler::ThreadOwned(checkSlot);
+        FastFail checkReason = FastFail::Count;
+        bool checkAccepted = false;
+        if (!fastRevalidate(serialBefore, refreshed, checkReason, check, checkAccepted)) {
+            std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the lookup memo (APS5_LOOKUP_MEMO) proved a template its fast proof refuses (reason %d)\n", static_cast<int>(checkReason));
+            std::fflush(stderr);
+            std::abort();
+        }
+        if (BuildProfiled()) Revalidations().proofsVerified.fetch_add(1, std::memory_order_relaxed);
+    }
+    bool fast = memoHit || (!noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted));
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
@@ -1945,6 +2044,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
     }
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
+    // A proof whose own flushes moved the registry stands on nothing the next call can check.
+    if (StorageTexture::PendingSerial() != serialBefore) lookupMemo.epoch = 0;
     return finish(fast, true);
 }
 
