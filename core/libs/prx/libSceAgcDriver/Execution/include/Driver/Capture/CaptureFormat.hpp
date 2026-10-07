@@ -120,7 +120,9 @@ struct PresentEvent {
     std::uint64_t flip;
     std::uint8_t hasBuffer;
     std::uint8_t opaque;
-    std::uint8_t reserved[6];
+    // The flip's serial (FrameTiming::Id, the driver's 1-based count of executed FLIP packets) in 48 bits, little
+    // endian; 0 when unknown (captures made before it was recorded). `flip` counts Present calls instead.
+    std::uint8_t flipSerial[6];
     DisplayBufferRecord buffer;
 };
 

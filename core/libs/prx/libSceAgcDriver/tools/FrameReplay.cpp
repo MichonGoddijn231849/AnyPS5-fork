@@ -633,17 +633,38 @@ std::filesystem::path FramePath(const std::filesystem::path& directory, std::uin
 class Replayer {
 public:
     Replayer(const Options& options, const CaptureFile& capture) : options(options), capture(capture) {
+        // APS5_REPLAY_FLIP_SERIALS=1: a present is the flip its recorded serial names (the capture's flips after the
+        // start, in FLIP packet order, as the replay reserves them) instead of its place among the Present calls,
+        // which a Present that is not a captured flip shifts (docs/dev/perf/NIGHT_PROGRESS.md, B8c). Presents
+        // without a serial (older captures) keep their place.
+        static const bool bySerial = std::getenv("APS5_REPLAY_FLIP_SERIALS") != nullptr;
+        std::uint64_t flipsBefore = 0;
+        std::size_t shifted = 0;
         for (std::size_t i = 0; i < capture.events.size(); ++i) {
             const auto& event = capture.events[i];
+            if (event.type == EventType::Begin) {
+                Reader reader(event.payload);
+                flipsBefore = reader.Get<BeginEvent>().flipsBefore;
+            }
             if (event.type == EventType::Present) {
                 Reader reader(event.payload);
                 const auto present = reader.Get<PresentEvent>();
-                if (presents.size() <= present.flip) presents.resize(static_cast<std::size_t>(present.flip) + 1);
-                presents[static_cast<std::size_t>(present.flip)] = present;
+                std::uint64_t serial = 0;
+                for (std::size_t k = 0; k < sizeof(present.flipSerial); ++k) serial |= static_cast<std::uint64_t>(present.flipSerial[k]) << (8u * k);
+                auto index = present.flip;
+                if (bySerial && serial > flipsBefore) {
+                    index = serial - 1 - flipsBefore;
+                    if (index != present.flip) ++shifted;
+                } else if (bySerial && serial != 0) {
+                    continue;
+                }
+                if (presents.size() <= index) presents.resize(static_cast<std::size_t>(index) + 1);
+                presents[static_cast<std::size_t>(index)] = present;
             }
             if (prologueEnd == 0 && (event.type == EventType::Progress || event.type == EventType::Submit)) prologueEnd = i;
         }
         if (prologueEnd == 0) Fail("the capture has no submissions");
+        if (shifted != 0) std::fprintf(stderr, "[replay] %zu presents placed by their flip serial differ from their Present count (APS5_REPLAY_FLIP_SERIALS)\n", shifted);
     }
 
     void Run() {
@@ -1338,6 +1359,23 @@ int Summarize(const CaptureFile& capture) {
     }
     std::printf("%zu events, %llu pages in pages.bin\n", capture.events.size(), static_cast<unsigned long long>(capture.PageCount()));
     for (const auto& [type, entry] : counts) std::printf("  %-12s %8zu events %12llu bytes\n", type < Names.size() ? Names[type] : "unknown", entry.first, static_cast<unsigned long long>(entry.second));
+    // Each present's place among the Present calls (`flip`) beside the flip its serial names (the replay's flip index
+    // under APS5_REPLAY_FLIP_SERIALS): a difference is the numbering skew of B8c.
+    std::uint64_t flipsBefore = 0;
+    for (const auto& event : capture.events) {
+        if (event.type == EventType::Begin) {
+            Reader reader(event.payload);
+            flipsBefore = reader.Get<BeginEvent>().flipsBefore;
+            std::printf("begin: capture starts after flip %llu\n", static_cast<unsigned long long>(flipsBefore));
+        }
+        if (event.type != EventType::Present) continue;
+        Reader reader(event.payload);
+        const auto present = reader.Get<PresentEvent>();
+        std::uint64_t serial = 0;
+        for (std::size_t k = 0; k < sizeof(present.flipSerial); ++k) serial |= static_cast<std::uint64_t>(present.flipSerial[k]) << (8u * k);
+        if (serial == 0) std::printf("  present %llu: no flip serial%s\n", static_cast<unsigned long long>(present.flip), present.hasBuffer ? "" : ", no buffer");
+        else std::printf("  present %llu: flip serial %llu (replay flip %lld)%s\n", static_cast<unsigned long long>(present.flip), static_cast<unsigned long long>(serial), static_cast<long long>(serial) - 1 - static_cast<long long>(flipsBefore), present.hasBuffer ? "" : ", no buffer");
+    }
     return 0;
 }
 

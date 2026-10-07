@@ -67,7 +67,8 @@ public:
     void RecordShader(std::uint64_t codeAddress, std::uint64_t headerAddress, std::uint8_t type, std::span<const std::uint32_t> code, std::span<const std::byte> header);
     void RecordSubmit(const SubmitEvent& submit, std::span<const std::uint32_t> words);
     void RecordRewindTail(const RewindTailEvent& tail, std::span<const std::uint32_t> words);
-    void NotePresent(const DisplayBuffer* buffer, bool opaque, std::string& dumpPath);
+    // `flipSerial`: the presented flip's FrameTiming::Id, 0 when the present has none.
+    void NotePresent(const DisplayBuffer* buffer, bool opaque, std::string& dumpPath, std::uint64_t flipSerial = 0);
     bool PresentsReached(std::uint64_t flipsEnd) const;
     void Finish(const EndEvent& end);
     void Fail(const std::string& reason);

@@ -31,6 +31,8 @@ public:
     };
 
     explicit FrameTiming(std::uint64_t id) : id(id) {}
+    // The flip's serial: the driver numbers frames from 1 as their FLIP packets execute (with flipsCounted).
+    std::uint64_t Id() const { return id; }
 
     Metric* Get(const char* scope, const char* stage) {
         std::lock_guard lock(mutex);

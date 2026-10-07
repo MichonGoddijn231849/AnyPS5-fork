@@ -20,6 +20,7 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
 | B3 lookup memo | `perf(agc): re-prove a reused template from its last fast proof` | `APS5_LOOKUP_MEMO=1` | `agc_driver_lookup_memo` (sets the switch and `APS5_VERIFY_PROOFS=1`, which runs the fast proof beside every memo hit and aborts on a disagreement): a repeat within the epoch is answered by the memo; a pending-registry change, a new collect epoch and a registry mutation each force the fast proof; results never change. The `agc_*` suite passes with it on. |
 | B4 draw input memo | `perf(agc): per-thread memo of reused draw inputs within a collect epoch` | `APS5_DRAW_INPUT_MEMO=1` | `agc_driver_recorder_tests` `drawInputMemoTests` (with the switch set): a repeat within the epoch is answered by the memo (same buffer, same derived value); a stamp, a new epoch after a CPU store, a pending-registry change and a recorded pending write each force the full path. The `agc_*` suite passes with it on, and with all B switches on together. |
 | B6 pipelined-draw prerequisites | `fix(agc): storage images and exact target ranges in the pipelined draws' write ranges` | storage images: none (a fix to the pipelined path, which is itself off by default); exact ranges: `APS5_EXACT_DRAW_WRITES=1` | `agc_driver_draw_write_ranges`: a storage image a draw stores to is a write range (surface and keys), one it only reads is not, one without flags counts as written; the exact color/DCC/depth/stencil/HTILE ranges hold every addressed texel and nothing past the layout; the estimates cover the exact ranges; 4-sample targets scale. |
+| B8c flip numbering | `feat(agc): record each present's flip serial; replay by it under a switch` | `APS5_REPLAY_FLIP_SERIALS=1` (replay); the capture always records the serial in the event's reserved bytes | not tested end to end (no game capture here; the flip test's fake output never calls `Driver::Present`). `--summary` now lists every present's Present-count index beside its flip serial |
 
 ### B7: exit crash
 
@@ -96,11 +97,19 @@ capture index by one against the replay's: a present with no buffer from video-o
 or a present of a flip submitted before the capture whose presenter ran late. The replay then pairs its flip `k` with
 the capture's display buffer of flip `k±1`, which is the other swap-chain image. Dumping that image gives exactly
 "~20 dB, half the pixels differ". A missing index (3) fits a present that went to a slot the replay never reached.
-Proposed fix (not made): record the flip's own serial in `PresentEvent` (the `FrameTiming` id the worker assigns at
-the FLIP packet, `++frameSerial`, which advances with `flipsCounted`) and index by `serial - 1 - flipsBefore`; skip
-presents without one.
-First check for the day session: `--summary` on a game capture lists the Present events. Compare their
-`flip` fields with the Submit events' flip counts.
+Made since. The capture records the flip's own serial in `PresentEvent` (the former `reserved` bytes, 48 bits: the
+`FrameTiming` id the worker assigns at the FLIP packet, `++frameSerial`, which advances with `flipsCounted`).
+With `APS5_REPLAY_FLIP_SERIALS=1` the replay indexes presents by `serial - 1 - flipsBefore`; presents of pre-capture
+flips are skipped, and presents without a serial (older captures) keep their place. It prints how many presents
+moved.
+
+Day-session check:
+
+1. Make a new capture (old ones carry no serials).
+2. Run `agc_frame_replay <capture> --summary`. Every present line shows `present N: flip serial S (replay flip F)`;
+   `N != F` is the skew.
+3. Run `--png DIR --compare <live frames>` with and without `APS5_REPLAY_FLIP_SERIALS=1`. Expected: the ~20 dB
+   frames reach the replay's normal PSNR, and frame 3 is dumped.
 
 (d) frame 1 differs between identical runs: not attempted (needs a capture).
 

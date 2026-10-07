@@ -56,7 +56,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     std::shared_ptr<VulkanDevice> presenting;
     std::string dumpPath;
     try {
-        Capture::FrameCapture::Get().NotePresent(buffer, opaque, dumpPath);
+        Capture::FrameCapture::Get().NotePresent(buffer, opaque, dumpPath, window.timing != nullptr ? window.timing->Id() : 0);
     } catch (const std::exception& error) {
         captureFailed(error);
     }

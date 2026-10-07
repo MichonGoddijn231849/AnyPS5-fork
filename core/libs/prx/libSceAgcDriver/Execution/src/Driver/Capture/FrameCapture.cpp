@@ -318,7 +318,7 @@ void FrameCapture::RecordSubmit(const SubmitEvent& submit, std::span<const std::
     ++submitsPerQueue[submit.queue];
 }
 
-void FrameCapture::NotePresent(const DisplayBuffer* buffer, bool opaque, std::string& dumpPath) {
+void FrameCapture::NotePresent(const DisplayBuffer* buffer, bool opaque, std::string& dumpPath, std::uint64_t flipSerial) {
     if (phase.load(std::memory_order_acquire) == Phase::Off) return;
     const auto present = presentsSeen.fetch_add(1, std::memory_order_acq_rel);
     if (!Recording() || present < flipsBefore) return;
@@ -326,6 +326,7 @@ void FrameCapture::NotePresent(const DisplayBuffer* buffer, bool opaque, std::st
     event.flip = present - flipsBefore;
     event.hasBuffer = buffer != nullptr;
     event.opaque = opaque;
+    for (std::size_t k = 0; k < sizeof(event.flipSerial); ++k) event.flipSerial[k] = static_cast<std::uint8_t>(flipSerial >> (8u * k));
     if (buffer != nullptr) {
         event.buffer = {buffer->address, buffer->pixelFormat, buffer->width, buffer->height, buffer->tilingMode, buffer->pitchInPixel};
         char name[32];
