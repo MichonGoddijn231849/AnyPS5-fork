@@ -139,6 +139,14 @@ std::array<std::uint32_t, 5> ReadDispatchArguments(std::uint64_t arguments, std:
 std::array<std::uint32_t, 5> ResolveDispatch(std::span<const std::uint32_t> packet, const QueueState& queue);
 DrawParameters ResolveDraw(std::span<const std::uint32_t> packet, const QueueState& queue);
 
+// The value a guest GPU timestamp (RELEASE_MEM/EVENT_WRITE_EOP data select 3) gets: the reference clock (100 MHz)
+// when the packet is parsed. APS5_GPU_TIMESTAMP_SCALE=<percent> (100-300, default 100 = off) stretches the time
+// since the last flip, so a title that sizes its dynamic resolution from its GPU timestamps measures more GPU time
+// (BryKytyPS5's --gpu-timestamp-scale; each flip returns to the real clock).
+std::uint64_t GuestGpuTimestamp();
+// Called at every executed flip: the base GuestGpuTimestamp stretches from.
+void NoteTimestampFlip();
+
 }
 
 #endif

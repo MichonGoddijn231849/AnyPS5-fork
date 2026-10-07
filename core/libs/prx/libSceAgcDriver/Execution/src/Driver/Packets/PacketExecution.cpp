@@ -305,6 +305,7 @@ void Driver::execute(const Submission& submission) {
                 if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
             }
             ++flipsCounted;
+            Pm4::NoteTimestampFlip();
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
 
