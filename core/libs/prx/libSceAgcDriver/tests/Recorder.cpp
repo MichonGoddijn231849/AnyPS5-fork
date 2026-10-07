@@ -1222,6 +1222,81 @@ void drawSnapshotEvictionTests(const Device& device) {
     Require(cache.ReusableDrawSnapshot(address, 16) == nullptr && cache.ReusableDrawSnapshot(address, 16) == nullptr, "a snapshot outlived a CPU store");
 }
 
+// APS5_DRAW_INPUT_MEMO=1 (run the binary with it set): a reused draw input is reused again from the thread's memo
+// within its collect epoch, and nothing else is: a stamp over the range, a new epoch after a CPU store, a pending
+// registry change and a recorded pending write each make the next copy take the full path. Runs on a thread of its
+// own: the epoch it bumps is that thread's.
+void drawInputMemoTests(const Device& device, Recorder& recorder) {
+    if (std::getenv("APS5_DRAW_INPUT_MEMO") == nullptr) return;
+    using namespace AgcDriver::GuestMemory;
+    using Use = Recorder::SnapshotUse;
+    constexpr std::size_t bytes = 65536;
+    void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "write watching unavailable: draw input memo not tested\n";
+        return;
+    }
+    const auto& context = device.GetContext();
+    auto* words = static_cast<std::uint32_t*>(block);
+    for (std::uint32_t i = 0; i < bytes / sizeof(std::uint32_t); ++i) words[i] = i * 5;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    constexpr std::size_t size = 256;
+    std::exception_ptr failure;
+    GpuMutex().unlock();
+    std::thread worker([&] {
+        try {
+            std::lock_guard gpu(GpuMutex());
+            BumpCollectEpoch();
+            const auto hits = [] { return DrawInputMemoCounters().hits; };
+            const auto equalsGuest = [&](const DrawInputCopy& copy) { return std::memcmp(copy.buffer->Bytes().data(), block, size) == 0; };
+            const auto settle = [&](std::uint32_t derived) {
+                const auto copy = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
+                KeepDrawInput(&recorder, address, copy, Use::Index32, derived);
+                const auto reused = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
+                Require(reused.reused, "draw input memo: the kept copy was not reused");
+                return reused;
+            };
+            const auto first = settle(7);
+            auto before = hits();
+            const auto repeat = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
+            Require(hits() == before + 1 && repeat.reused && repeat.buffer == first.buffer && repeat.derived == 7, "draw input memo: a repeat within the epoch was not answered by the memo");
+            // A stamp over the range.
+            static_cast<void>(MarkWritten(address + 16, 4));
+            before = hits();
+            Require(!CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused && hits() == before, "draw input memo: a stamp over the range was not seen");
+            static_cast<void>(settle(8));
+            before = hits();
+            Require(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).derived == 8 && hits() == before + 1, "draw input memo: not taken again after the stamp");
+            // A CPU store: hidden within the epoch from the full path too, seen in the next.
+            words[1] = 0xfeed;
+            BumpCollectEpoch();
+            before = hits();
+            const auto stored = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
+            Require(!stored.reused && equalsGuest(stored) && hits() == before, "draw input memo: a CPU store was hidden after a new epoch");
+            KeepDrawInput(&recorder, address, stored, Use::Index32, 9);
+            static_cast<void>(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32));
+            // The pending registry.
+            StorageTexture::BumpPendingSerial();
+            before = hits();
+            Require(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused && hits() == before, "draw input memo: a pending registry change was not seen");
+            Require(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused && hits() == before + 1, "draw input memo: not taken again after the registry change");
+            // A recorded GPU write over the range.
+            recorder.NotePendingWrite(address, 16);
+            before = hits();
+            static_cast<void>(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32));
+            Require(hits() == before, "draw input memo: a recorded pending write was not seen");
+            recorder.Sync();
+            std::cout << "draw input memo: " << DrawInputMemoCounters().hits << " copies answered, " << DrawInputMemoCounters().misses << " full\n";
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    worker.join();
+    GpuMutex().lock();
+    ReleaseWatched(block, bytes);
+    if (failure != nullptr) std::rethrow_exception(failure);
+}
+
 void drawInputReuseTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     using Use = Recorder::SnapshotUse;
@@ -2820,6 +2895,7 @@ int main() {
         targetProofTests(device);
         drawSnapshotEvictionTests(device);
         drawInputReuseTests(device, recorder);
+        drawInputMemoTests(device, recorder);
         RunResidentPresentTests(device.GetContext());
         storeRunTests(device, recorder);
         movedMetadataTests(device, recorder);

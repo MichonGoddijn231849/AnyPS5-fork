@@ -325,6 +325,9 @@ public:
     // Whether the lock-free pending-write snapshot (open, in-flight and finishing batches) overlaps
     // the range: false means no recorded work writes it, so a wait on it has nothing to submit.
     static bool SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes);
+    // Whether a label the calling thread queued but has not recorded writes the range (what the flush
+    // hook records first, see FlushForAccess).
+    static bool QueuedLabelsOverlap(std::uint64_t address, std::size_t bytes);
     // The snapshot itself (the sorted, merged union of the pending ranges; null when none), for a
     // reader that tests many ranges against one loaded snapshot: one atomic shared_ptr load per
     // validation instead of one per run, and every test sees the same snapshot (design13 R1's p0).

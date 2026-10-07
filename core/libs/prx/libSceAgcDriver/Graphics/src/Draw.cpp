@@ -727,16 +727,93 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 
 }
 
+namespace {
+
+// APS5_DRAW_INPUT_MEMO=1: a vertex or index range a draw reused from the recorder's snapshots is reused again by the
+// same thread's next draws of the range without the flush hook, the collect and the map lookup, while nothing they
+// consult can have moved:
+// - the thread's collect epoch and the unwatch serial are the memo's: the collect would return its memoized
+//   generation, a CPU store not yet collected being as invisible to it;
+// - nothing stamped the range since that generation (UnchangedSince): driver stores, the notes of recorded GPU
+//   writes, write-backs;
+// - the pending registry's serial (read after the flush) and the registry generation are the memo's: no image's
+//   results became pending over the range, nothing was stored or dropped, no unit shadow retiled, so the hook would
+//   store and publish nothing;
+// - the recorder has no pending write over the range and the thread queued no label over it (what the hook would
+//   record and wait for first).
+// The buffer is held weakly: the reuse entry and the batches that bound it keep it, the memo never does (it outlives
+// no device). The reuse map's recency is not touched on a memo hit.
+bool drawInputMemo() {
+    static const bool enabled = std::getenv("APS5_DRAW_INPUT_MEMO") != nullptr;
+    return enabled;
+}
+
+struct DrawInputMemoEntry {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    Recorder::SnapshotUse use = Recorder::SnapshotUse::Vertex;
+    std::uint64_t epoch = 0;
+    std::uint64_t unwatched = 0;
+    std::uint64_t pendingSerial = 0;
+    std::uint64_t registryGeneration = 0;
+    std::uint64_t generation = 0;
+    std::uint32_t derived = 0;
+    const Recorder* recorder = nullptr;
+    std::weak_ptr<Buffer> buffer;
+};
+
+constexpr std::size_t DrawInputMemoSlots = 64;
+
+std::array<DrawInputMemoEntry, DrawInputMemoSlots>& DrawInputMemoTable() {
+    thread_local std::array<DrawInputMemoEntry, DrawInputMemoSlots> table;
+    return table;
+}
+
+DrawInputMemoEntry& drawInputMemoSlot(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use) {
+    const auto hash = (address >> 4u) ^ (static_cast<std::uint64_t>(bytes) * 0x9e3779b97f4a7c15ull) ^ static_cast<std::uint64_t>(use);
+    return DrawInputMemoTable()[static_cast<std::size_t>((hash ^ (hash >> 29u)) % DrawInputMemoSlots)];
+}
+
+std::atomic<std::uint64_t> drawInputMemoHits{0};
+std::atomic<std::uint64_t> drawInputMemoMisses{0};
+
+}
+
+DrawInputMemoCounts DrawInputMemoCounters() {
+    return {drawInputMemoHits.load(std::memory_order_relaxed), drawInputMemoMisses.load(std::memory_order_relaxed)};
+}
+
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     DrawInputCopy copy;
     if (recorder != nullptr && bytes != 0) {
+        const bool memo = drawInputMemo();
+        const auto epoch = memo ? GuestMemory::ThreadCollectEpoch() : 0;
+        if (epoch != 0) {
+            auto& slot = drawInputMemoSlot(address, bytes, use);
+            if (slot.epoch == epoch && slot.address == address && slot.bytes == bytes && slot.use == use && slot.recorder == recorder && slot.unwatched == GuestMemory::UnwatchSerial() && slot.pendingSerial == StorageTexture::PendingSerial() && slot.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && GuestMemory::UnchangedSince(address, bytes, slot.generation) && !recorder->PendingWriteOverlaps(address, bytes) && !Recorder::QueuedLabelsOverlap(address, bytes)) {
+                if (auto buffer = slot.buffer.lock()) {
+                    drawInputMemoHits.fetch_add(1, std::memory_order_relaxed);
+                    copy.buffer = std::move(buffer);
+                    copy.reused = true;
+                    copy.derived = slot.derived;
+                    copy.generation = slot.generation;
+                    copy.registryGeneration = slot.registryGeneration;
+                    return copy;
+                }
+            }
+            drawInputMemoMisses.fetch_add(1, std::memory_order_relaxed);
+        }
         GuestMemory::FlushGpuWrites(address, bytes);
+        const auto pendingSerial = epoch != 0 ? StorageTexture::PendingSerial() : 0;
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
         if (copy.buffer != nullptr) {
             copy.reused = true;
+            if (epoch != 0 && GuestMemory::ThreadCollectEpoch() == epoch && StorageTexture::PendingSerial() == pendingSerial) {
+                drawInputMemoSlot(address, bytes, use) = {address, bytes, use, epoch, GuestMemory::UnwatchSerial(), pendingSerial, copy.registryGeneration, copy.generation, copy.derived, recorder, copy.buffer};
+            }
             return copy;
         }
     }

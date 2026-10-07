@@ -18,6 +18,7 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
 | B1 snapshot ring | `perf(agc): draw snapshots as slices of shared arenas` | `APS5_SNAPSHOT_RING=1` (`APS5_SNAPSHOT_RING_KIB`, default 1024) | `agc_driver_recorder_tests` (not a ctest on this branch; run by hand) `snapshotRingTests`: slices aligned for a storage descriptor, non-overlapping, one arena until full, a new one after, over a quarter arena refused, an arena released with its last slice. The reuse and in-flight tests there now check slices by (buffer, offset) and copy from the slice's offset; they pass with the switch on and off. The `agc_*` suite passes with it on (also with pipelined draws). |
 | B2 target proof memo | `perf(agc): memoize a storage image's refresh proof within a collect epoch` | `APS5_TARGET_PROOF_MEMO=1` | `agc_driver_recorder_tests` `targetProofTests` (runs with the switch set): a repeat within the epoch is answered by the proof; a stamp over the surface, a new epoch after a CPU store, and another image marked dirty over it each force the full Refresh (which then uploads for the CPU store). The `agc_*` suite passes with it on (also with pipelined draws). |
 | B3 lookup memo | `perf(agc): re-prove a reused template from its last fast proof` | `APS5_LOOKUP_MEMO=1` | `agc_driver_lookup_memo` (sets the switch and `APS5_VERIFY_PROOFS=1`, which runs the fast proof beside every memo hit and aborts on a disagreement): a repeat within the epoch is answered by the memo; a pending-registry change, a new collect epoch and a registry mutation each force the fast proof; results never change. The `agc_*` suite passes with it on. |
+| B4 draw input memo | `perf(agc): per-thread memo of reused draw inputs within a collect epoch` | `APS5_DRAW_INPUT_MEMO=1` | `agc_driver_recorder_tests` `drawInputMemoTests` (with the switch set): a repeat within the epoch is answered by the memo (same buffer, same derived value); a stamp, a new epoch after a CPU store, a pending-registry change and a recorded pending write each force the full path. The `agc_*` suite passes with it on, and with all B switches on together. |
 
 ### B7: exit crash
 
@@ -220,3 +221,25 @@ Nothing changes for templates with no textures.
 Day-session check: `APS5_PROFILE_DRAW=1 APS5_PIPELINED_DRAWS=1` with and without `APS5_LOOKUP_MEMO=1`. Compare the
 committer's lookup `revalidate` part, and read the memo hits and misses on the `[rescache] revalidate` line. Run
 once with `APS5_VERIFY_PROOFS=1`: no abort is the check.
+
+### B4: vertex and index inputs (`APS5_DRAW_INPUT_MEMO=1`)
+
+`CopyDrawInput`'s reuse path runs the flush hook (`FlushGpuWrites`), the collect and the reuse-map lookup. Each
+thread now keeps a 64-slot direct-mapped memo of the inputs it reused, keyed by (address, bytes, use, recorder). A
+repeat is answered from the memo when all of these hold:
+
+- the collect epoch and the unwatch serial are the same, so the collect would return its memoized generation;
+- `UnchangedSince` holds over the range, so no driver store, recorded-GPU-write note or write-back stamped it;
+- the pending serial (read after the flush) and the registry generation are the same, so the hook would store and
+  publish nothing;
+- the recorder has no pending write over the range and the thread queued no label over it. These are the hook's
+  other two actions.
+
+The buffer is held weakly, so the memo never keeps GPU memory alive past its reuse entry and batches, or past a
+device. A hit does not touch the reuse map's LRU order.
+
+Expected saving: most of the reuse path's cost on repeated ranges, perhaps 1-2 us of the 4.2 us vertex phase.
+
+Day-session check: `APS5_PROFILE_DRAW=1 APS5_PIPELINED_DRAWS=1` with and without `APS5_DRAW_INPUT_MEMO=1`. Compare
+the committer's `vertex` column. `DrawInputMemoCounters()` gives the hit/miss counts; a report line could be added
+if useful.

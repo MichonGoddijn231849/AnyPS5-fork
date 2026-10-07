@@ -1313,6 +1313,10 @@ std::uint64_t Recorder::ThreadHookWaits() {
     return hookRealWaits;
 }
 
+bool Recorder::QueuedLabelsOverlap(std::uint64_t address, std::size_t bytes) {
+    return !QueuedLabelRanges().empty() && QueuedLabelOverlaps(address, bytes);
+}
+
 bool Recorder::SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes) {
     return AgcDriver::Graphics::SnapshotOverlaps(address, bytes);
 }
