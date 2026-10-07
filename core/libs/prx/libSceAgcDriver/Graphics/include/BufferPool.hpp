@@ -61,6 +61,11 @@ public:
     void Put(const BufferAllocation& allocation) noexcept;
     VkDeviceSize Trim() noexcept;
     std::pair<VkDeviceSize, VkDeviceSize> RetainedBytes();
+    // The device is about to be destroyed (VulkanDevice teardown): the retained slots are destroyed
+    // now, and every allocation that comes back later (a buffer kept by a static that outlives the
+    // device, such as an image mirror, destroyed at exit) is dropped without a Vulkan call, since its
+    // device and the loader's entry points may be gone by then.
+    void Retire() noexcept;
 
 private:
     struct Slot {
@@ -95,7 +100,10 @@ private:
     Tier& tierFor(std::size_t capacity, VkMemoryPropertyFlags properties);
     // The device tier's budget (APS5_STAGING_POOL_MIB), read once.
     static VkDeviceSize DeviceBudget();
-    void destroy(const BufferAllocation& allocation) noexcept;
+    // `live`: the device stands (not retired), so the handles are destroyed and the memory freed.
+    void destroy(const BufferAllocation& allocation, bool live) noexcept;
+    // Body of Trim and Retire: every retained slot is destroyed; `retire` also marks the pool retired.
+    VkDeviceSize trim(bool retire) noexcept;
     // Moves the tier's least recently used slot (the oldest front of its lists) to `evicted`; the
     // caller destroys those after releasing the mutex, so builds taking buffers on other threads
     // do not wait behind the Vulkan destroy calls. Nothing changes when the vector cannot grow.
@@ -107,6 +115,8 @@ private:
     PFN_vkUnmapMemory unmap;
     PFN_vkDestroyBuffer destroyBuffer;
     PFN_vkFreeMemory freeMemory;
+    // Set by Retire, under the mutex.
+    bool retired = false;
     std::mutex mutex;
     // Not `small`/`large`: <rpcndr.h> (via <windows.h>) defines `small` as a macro.
     Tier smallTier;

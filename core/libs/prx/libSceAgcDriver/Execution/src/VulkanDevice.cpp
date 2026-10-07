@@ -529,6 +529,12 @@ struct VulkanDevice::State {
             // sets and samplers they borrowed can go.
             resourceCache.Clear();
             Graphics::ClearCachedTextures(device);
+            // Statics holding this device's buffers (the image mirrors, the BDA tables, the cached
+            // address space) let them go now: destroyed at exit, after the device, they freed
+            // memory on the dead device (the exit crash).
+            Graphics::ClearImageMirrors(device);
+            Graphics::BdaResources::ClearTableCache();
+            Graphics::DropAddressSpaceCache();
             descriptorCache.reset();
             emptyBuffer.reset();
             samplerCache.reset();
@@ -537,6 +543,10 @@ struct VulkanDevice::State {
             colorTransfer.reset();
             scaler.reset();
             pipelineCache.reset();
+            // Buffers still held elsewhere come back after the device is gone: the pool drops them
+            // without Vulkan calls from here on.
+            if (bufferPool) bufferPool->Retire();
+            if (context.bufferPool && context.bufferPool != bufferPool) context.bufferPool->Retire();
             context.bufferPool.reset();
             bufferPool.reset();
             const auto destroyFence = reinterpret_cast<PFN_vkDestroyFence>(deviceProc(device, "vkDestroyFence"));

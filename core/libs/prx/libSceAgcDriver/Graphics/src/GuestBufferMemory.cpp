@@ -1225,6 +1225,21 @@ void DropAddressSpaceCache() {
     Spaces().current.store(nullptr);
 }
 
+void ClearImageMirrors(VkDevice device) {
+    auto& state = Mirrors();
+    std::map<std::uint64_t, std::shared_ptr<ImageMirror>> entries;
+    {
+        std::lock_guard lock(state.mutex);
+        if (state.device != device) return;
+        entries.swap(state.entries);
+        state.failed.clear();
+        state.heapBytes = 0;
+        state.device = VK_NULL_HANDLE;
+    }
+    // Released outside the mirrors' mutex: each buffer goes back to the pool.
+    entries.clear();
+}
+
 namespace {
 
 struct WatchedRanges {

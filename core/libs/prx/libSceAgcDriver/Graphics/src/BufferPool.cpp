@@ -28,7 +28,7 @@ BufferPool::BufferPool(const Context& context) : device(context.device), unmap(c
 BufferPool::~BufferPool() {
     for (auto* tier : {&smallTier, &largeTier, &deviceTier}) {
         for (const auto& [key, slots] : tier->free) {
-            for (const auto& slot : slots) destroy(slot.allocation);
+            for (const auto& slot : slots) destroy(slot.allocation, !retired);
         }
     }
 }
@@ -41,11 +41,14 @@ VkDeviceSize BufferPool::DeviceBudget() {
     return deviceBudget;
 }
 
-void BufferPool::destroy(const BufferAllocation& allocation) noexcept {
-    // Device-local allocations (see DeviceBuffer) are never mapped.
-    if (allocation.mapping != nullptr) unmap(device, allocation.memory);
-    destroyBuffer(device, allocation.buffer, nullptr);
-    freeMemory(device, allocation.memory, nullptr);
+void BufferPool::destroy(const BufferAllocation& allocation, bool live) noexcept {
+    // Not live: the device is gone (see Retire), and its objects with it.
+    if (live) {
+        // Device-local allocations (see DeviceBuffer) are never mapped.
+        if (allocation.mapping != nullptr) unmap(device, allocation.memory);
+        destroyBuffer(device, allocation.buffer, nullptr);
+        freeMemory(device, allocation.memory, nullptr);
+    }
     CountGpuMemory((allocation.properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 ? GpuMemoryKind::HostBuffer : GpuMemoryKind::DeviceBuffer, -static_cast<std::int64_t>(allocation.allocationBytes));
 }
 
@@ -116,10 +119,12 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     // Evicted allocations are destroyed after the mutex is released (see evictOldest). The vector
     // may throw on growth; a Put that cannot retain simply destroys, as noexcept requires.
     std::vector<BufferAllocation> evicted;
+    bool live = true;
     try {
         std::lock_guard lock(mutex);
+        live = !retired;
         auto& tier = tierFor(allocation.bytes, allocation.properties);
-        if (allocation.allocationBytes > tier.budget) {
+        if (!live || allocation.allocationBytes > tier.budget) {
             evicted.push_back(allocation);
         } else {
             while (tier.slots != 0 && (tier.retainedBytes + allocation.allocationBytes > tier.budget || tier.slots >= maxSlots)) evictOldest(tier, evicted);
@@ -128,16 +133,27 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
             tier.retainedBytes += allocation.allocationBytes;
         }
     } catch (...) {
-        destroy(allocation);
+        destroy(allocation, live);
     }
-    for (const auto& gone : evicted) destroy(gone);
+    for (const auto& gone : evicted) destroy(gone, live);
 }
 
 VkDeviceSize BufferPool::Trim() noexcept {
+    return trim(false);
+}
+
+void BufferPool::Retire() noexcept {
+    trim(true);
+}
+
+VkDeviceSize BufferPool::trim(bool retire) noexcept {
     std::vector<BufferAllocation> evicted;
     VkDeviceSize bytes = 0;
+    bool live = true;
     try {
         std::lock_guard lock(mutex);
+        live = !retired;
+        if (retire) retired = true;
         evicted.reserve(smallTier.slots + largeTier.slots + deviceTier.slots);
         for (auto* tier : {&smallTier, &largeTier, &deviceTier}) {
             for (const auto& [key, slots] : tier->free) {
@@ -152,9 +168,22 @@ VkDeviceSize BufferPool::Trim() noexcept {
             tier->slots = 0;
         }
     } catch (...) {
+        // The vector could not hold the slots: they are destroyed in place, under the mutex.
+        if (retire) {
+            std::lock_guard lock(mutex);
+            retired = true;
+            for (auto* tier : {&smallTier, &largeTier, &deviceTier}) {
+                for (const auto& [key, slots] : tier->free) {
+                    for (const auto& slot : slots) destroy(slot.allocation, live);
+                }
+                tier->free.clear();
+                tier->retainedBytes = 0;
+                tier->slots = 0;
+            }
+        }
         return 0;
     }
-    for (const auto& gone : evicted) destroy(gone);
+    for (const auto& gone : evicted) destroy(gone, live);
     return bytes;
 }
 

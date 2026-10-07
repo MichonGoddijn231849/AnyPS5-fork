@@ -51,6 +51,9 @@ std::uint64_t RelieveGpuMemory(const Context& context);
 // Debug aid (APS5_CHECK_BVH): ranges whose GPU copy-backs and copy-outs are logged ([bvh-copy]).
 void DebugWatchRange(std::uint64_t begin, std::uint64_t end);
 void DropAddressSpaceCache();
+// Drops the image mirrors made on `device` (VulkanDevice teardown): their buffers must go back to
+// the device's pool while the device lives, not at static destruction.
+void ClearImageMirrors(VkDevice device);
 std::uint64_t HostImportLimit();
 
 // The host import of the registered allocation containing [address, address + bytes), made on demand
