@@ -1488,6 +1488,83 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     else Require(words[128 * unit] == 0x77, "the eviction before the retire did not publish unit 128");
 }
 
+// APS5_TARGET_PROOF_MEMO=1 (run the binary with it set): a Refresh that found a storage image current answers the
+// next Refresh of that image within the thread's collect epoch, and nothing else does: a stamp over the surface, a
+// new epoch (a CPU store collected), and a change of the pending registry each make the next Refresh a full one.
+// Runs on a thread of its own: the epoch it bumps is that thread's, not the one the other tests collect in.
+void targetProofTests(const Device& device) {
+    if (std::getenv("APS5_TARGET_PROOF_MEMO") == nullptr) return;
+    using namespace AgcDriver::GuestMemory;
+    const auto& base = device.GetContext();
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t surfaceBytes = side * side * 4;
+    void* block = WriteWatched() ? AllocateWatched(surfaceBytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "no write watching: target proof memo not tested\n";
+        return;
+    }
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    std::memset(block, 0x55, surfaceBytes);
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    std::exception_ptr failure;
+    GpuMutex().unlock();
+    std::thread worker([&] {
+        try {
+            std::lock_guard gpu(GpuMutex());
+            BumpCollectEpoch();
+            auto image = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+            static_cast<void>(image->Refresh());
+            Require(image->Refresh(), "target proof: an unchanged image is not current");
+            const auto hits = [] { return StorageTexture::TargetProofCounts().first; };
+            auto before = hits();
+            Require(image->Refresh() && hits() == before + 1, "target proof: a repeat within the epoch was not answered by the proof");
+            // A driver store over the surface (the same bytes): stamped, so the full Refresh runs (and finds the
+            // bytes equal), and the proof it takes answers the next one.
+            static_cast<void>(MarkWritten(address, 4));
+            before = hits();
+            Require(image->Refresh() && hits() == before, "target proof: a stamp over the surface was not seen");
+            Require(image->Refresh() && hits() == before + 1, "target proof: the proof was not taken again");
+            // A CPU store: invisible within the epoch to a full Refresh too (its collect is memoized), seen in the next.
+            std::memset(block, 0x66, 64);
+            before = hits();
+            static_cast<void>(image->Refresh());
+            BumpCollectEpoch();
+            const auto afterHits = hits();
+            Require(!image->Refresh() && hits() == afterHits, "target proof: a CPU store was hidden by the proof after a new epoch");
+            Require(image->Refresh(), "target proof: the uploaded image is not current");
+            // The pending registry: another image over the same memory marked dirty.
+            Require(image->Refresh() && hits() == afterHits + 1, "target proof: no proof after the upload");
+            auto other = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+            other->MarkDirty();
+            const auto beforeOther = hits();
+            static_cast<void>(image->Refresh());
+            Require(hits() == beforeOther, "target proof: a pending registry change was not seen");
+            other->Flush();
+            std::cout << "target proof memo: " << StorageTexture::TargetProofCounts().first << " refreshes answered, " << StorageTexture::TargetProofCounts().second << " full\n";
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    worker.join();
+    GpuMutex().lock();
+    ReleaseWatched(block, surfaceBytes);
+    if (failure != nullptr) std::rethrow_exception(failure);
+}
+
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -2740,6 +2817,7 @@ int main() {
         misalignedSnapshotTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
         snapshotRingTests(device);
+        targetProofTests(device);
         drawSnapshotEvictionTests(device);
         drawInputReuseTests(device, recorder);
         RunResidentPresentTests(device.GetContext());

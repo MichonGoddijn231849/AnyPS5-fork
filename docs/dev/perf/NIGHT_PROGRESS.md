@@ -16,6 +16,7 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
 | B8 replay on Linux | `Frame replay: host memory and process calls behind a small platform layer` (cherry-picked from `gta-v/hw-rt` `d9a73a6f`) | none (tool) | `agc_frame_replay` builds on Linux here; `--summary` reads a capture |
 | B8b driver CPU per frame | `feat(agc): per-frame CPU time of the queue 0 worker and the committer in the replay` | none (measurement only) | `agc_driver_driver_thread_clock`: a registered thread's clock counts its own CPU (193 ms of a 200 ms spin) and not the reader's sleep |
 | B1 snapshot ring | `perf(agc): draw snapshots as slices of shared arenas` | `APS5_SNAPSHOT_RING=1` (`APS5_SNAPSHOT_RING_KIB`, default 1024) | `agc_driver_recorder_tests` (not a ctest on this branch; run by hand) `snapshotRingTests`: slices aligned for a storage descriptor, non-overlapping, one arena until full, a new one after, over a quarter arena refused, an arena released with its last slice. The reuse and in-flight tests there now check slices by (buffer, offset) and copy from the slice's offset; they pass with the switch on and off. The `agc_*` suite passes with it on (also with pipelined draws). |
+| B2 target proof memo | `perf(agc): memoize a storage image's refresh proof within a collect epoch` | `APS5_TARGET_PROOF_MEMO=1` | `agc_driver_recorder_tests` `targetProofTests` (runs with the switch set): a repeat within the epoch is answered by the proof; a stamp over the surface, a new epoch after a CPU store, and another image marked dirty over it each force the full Refresh (which then uploads for the CPU store). The `agc_*` suite passes with it on (also with pipelined draws). |
 
 ### B7: exit crash
 
@@ -130,3 +131,48 @@ screenshots).
 Pre-existing, seen while testing: `agc_driver_recorder_tests` stops at `unitShadowTests` ("the partial publish did
 not copy exactly the partly covered unit", then SIGSEGV), with and without the switch and at `e302895b` without
 B1. That is probably why the binary is not a ctest here.
+
+### B2: readTarget (`APS5_TARGET_PROOF_MEMO=1`)
+
+`StorageTexture::Refresh` keeps a proof after a refresh that found the image current: the thread's collect epoch,
+the unwatch serial, the pending registry's serial (read after the refresh's flush), the registry generation and
+the collect generation. The next Refresh of that image returns "current" without the flush, the collects, the
+alias scan or the DCC key proof if all of these hold:
+
+- the collect epoch is the calling thread's current one, and the unwatch serial is unchanged;
+- `UnchangedSince(surface, proof generation)` holds, and the same over the DCC key range;
+- the pending serial and the registry generation are unchanged.
+
+Any other outcome drops the proof.
+
+Invalidation argument (also in the code above `refreshProved`):
+
+- **CPU stores.** Within one collect epoch every collect of the surface or its keys returns its memoized generation
+  without walking (`GuestMemory.hpp`, collect epoch). A CPU store not yet collected is therefore as invisible to a
+  full Refresh as to the proof, and the next epoch (a new submission, a satisfied wait, a drain; on the committer,
+  a new worker epoch token through `FollowEpoch`) drops the proof.
+- **Driver stores, GPU writes into the imports and write-backs of any image there.** These stamp the blocks, which
+  `UnchangedSince` sees.
+- **Other images' pending results.** Marking dirty, storing, flushing or dropping any image bumps the pending serial,
+  so the full Refresh's `FlushPending` and `pendingAlias` would answer as they did at the proof. Marking an
+  already-dirty image dirty again does not bump it. A run of draws into the same target therefore keeps the proof
+  after its first draw, which is the case being targeted.
+- **The image's own pending results.** These are exempt from the flush and the alias check in the full path too.
+- **DCC keys.** The proof is only taken when the key proof itself was kept. A scan made while recorded work still
+  writes the keys is redone on every call, so the memo makes no proof then.
+- **Host imports.** The `direct` and borrow decisions depend on host imports; the registry generation covers them.
+- **The full path's other effect.** On an unchanged result it moves the layer generations to the current one. The
+  memo skips that, which is safe because no stamp lies between the proof's generation and now.
+- **No epoch.** A thread without one (one that never bumped, or `APS5_NO_COLLECT_MEMO=1`) never uses the proof.
+
+Expected saving: most of the 5.1 us readTarget on draws after the first into a target within an epoch (the flush
+scan, the collect memo lookups, the key proof's collect, the alias and import lookups, the vector allocations).
+`UnchangedSince` over the surface and keys remains.
+
+Day-session check: `APS5_PROFILE_DRAW=1 APS5_PIPELINED_DRAWS=1` with and without `APS5_TARGET_PROOF_MEMO=1`.
+Compare the committer's `readTarget` column. The `[target-proof]` line (every 100k hits) gives the hit/miss counts.
+Correctness: the prologue's frames match A/B (screenshots, or a replay with `--compare`).
+
+Pre-existing, seen while testing: with `APS5_NO_UNIT_SHADOW=1` (to get past `unitShadowTests`),
+`agc_driver_recorder_tests` stops at `storageRefreshTests` ("a CPU store into a unit with results pending was not
+seen by the refresh"), with every switch off too. The binary is not a ctest on this branch.
