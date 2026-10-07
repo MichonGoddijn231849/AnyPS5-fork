@@ -16,6 +16,19 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+// A DMA_DATA immediate fill of a surface's DCC keys with one key byte (GTA V clears its bloom target this way every
+// frame) is a key fill like the title's fill kernel: the surface learns of it even when the keys already held that
+// value, so the next refresh clears its results instead of drawing over last frame's. APS5_NO_DMA_KEYS_FILL=1 off.
+void NoteDmaKeysFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
+    static const bool disabled = std::getenv("APS5_NO_DMA_KEYS_FILL") != nullptr;
+    if (disabled || (pattern & 0xffu) * 0x01010101u != pattern) return;
+    Graphics::StorageTexture::NoteKeysFill(address, bytes, static_cast<std::uint8_t>(pattern));
+}
+
+}
+
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -67,6 +80,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             const auto address = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
             Graphics::NoteDepthMetadataFill(address, packet[6] & 0x3ffffffu, packet[2]);
             Graphics::NoteColorMetadataFill(address, packet[6] & 0x3ffffffu, packet[2]);
+            NoteDmaKeysFill(address, packet[6] & 0x3ffffffu, packet[2]);
         }
     }
     if (!drainAll && !endOfPipeInterrupt && (opcode == 0x49 || opcode == 0x37)) {
@@ -268,6 +282,7 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
             GuestMemory::SetCurrentPacket(0x50, queue);
             Graphics::NoteDepthMetadataFill(address, bytes.size(), pattern);
             Graphics::NoteColorMetadataFill(address, bytes.size(), pattern);
+            NoteDmaKeysFill(address, bytes.size(), pattern);
             commitDmaStore(queue, address, bytes);
         }, {{address, address + size}});
         return true;

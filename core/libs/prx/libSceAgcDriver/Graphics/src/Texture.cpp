@@ -2674,20 +2674,29 @@ StorageTexture::FillCoverage StorageTexture::ClassifyFill(std::uint64_t address,
                 if (texture->descriptor.baseAddress >= address && texture->descriptor.baseAddress + texture->guestBytes <= end) ++coverage.inside;
             }
         }
-    } else if (overlapping.empty()) {
+    }
+    // A surface's DCC keys, even over the memory of other images: transient memory aliases a dead surface's bytes
+    // with live keys (GTA V's 640x360 bloom target keeps its keys inside a 4K target's range and clears them by a
+    // fill every frame; taken for a store into the 4K image, the bloom never learned of the clear and drew each
+    // frame over the last). APS5_NO_ALIASED_KEYS_FILL=1: keys only where no image overlaps, as before.
+    static const bool aliasedKeys = std::getenv("APS5_NO_ALIASED_KEYS_FILL") == nullptr;
+    if (covered == nullptr && (overlapping.empty() || aliasedKeys)) {
         constexpr std::uint64_t keyBytes = 256;
         for (const auto* texture : live.textures) {
             if (!texture->released && texture->descriptor.dccAddress == address && texture->guestBytes / keyBytes != 0 && bytes >= texture->guestBytes / keyBytes) coverage.cover = FillCover::Keys;
         }
-    } else if (overlapping.size() > 1) {
-        coverage.cover = FillCover::Several;
-    } else {
-        auto* single = overlapping.front();
-        const auto begin = single->descriptor.baseAddress;
-        const auto stop = begin + single->guestBytes;
-        if (address >= begin && end <= stop) coverage.cover = FillCover::Inside;
-        else if (address <= begin && end >= stop) coverage.cover = FillCover::Around;
-        else coverage.cover = FillCover::Straddle;
+    }
+    if (covered == nullptr && !overlapping.empty() && coverage.cover != FillCover::Keys) {
+        if (overlapping.size() > 1) {
+            coverage.cover = FillCover::Several;
+        } else {
+            auto* single = overlapping.front();
+            const auto begin = single->descriptor.baseAddress;
+            const auto stop = begin + single->guestBytes;
+            if (address >= begin && end <= stop) coverage.cover = FillCover::Inside;
+            else if (address <= begin && end >= stop) coverage.cover = FillCover::Around;
+            else coverage.cover = FillCover::Straddle;
+        }
     }
     // Debug aid: APS5_TRACE_FILL_COVER=1 prints the first fills that meet images without covering
     // one of them (or a layer of one), with the images' surfaces, so a wider conversion can be
