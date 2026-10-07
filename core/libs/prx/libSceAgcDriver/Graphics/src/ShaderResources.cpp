@@ -563,25 +563,25 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
 
 struct NullTextures {
     std::mutex mutex;
-    std::map<std::pair<VkDevice, int>, std::shared_ptr<Texture>> textures;
+    std::map<std::tuple<VkDevice, int, bool>, std::shared_ptr<Texture>> textures;
 };
 NullTextures& NullTextureCache() {
     static NullTextures cache;
     return cache;
 }
 
-std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::DescriptorImageShape shape) {
+std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::DescriptorImageShape shape, bool depthCompare) {
     constexpr VkComponentMapping mapping{VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO};
     auto& cache = NullTextureCache();
     std::lock_guard lock(cache.mutex);
-    auto& texture = cache.textures[{context.device, static_cast<int>(shape)}];
+    auto& texture = cache.textures[{context.device, static_cast<int>(shape), depthCompare}];
     if (texture == nullptr) {
         GuestTextureResource resource{};
         resource.width = 1;
         resource.height = 1;
         resource.mipCount = 1;
         resource.tileMode = TextureTileMode::kLinear;
-        resource.format = 56;
+        resource.format = depthCompare ? 22u : 56u;
         switch (shape) {
             case ShaderRecompiler::DescriptorImageShape::Image1D: resource.dimension = TextureDimension::k1D; break;
             case ShaderRecompiler::DescriptorImageShape::Image2D: resource.dimension = TextureDimension::k2D; break;
@@ -594,7 +594,8 @@ std::shared_ptr<Texture> nullTexture(const Context& context, ShaderRecompiler::D
         resource.dstSelZ = 6;
         resource.dstSelW = 7;
         const std::vector<std::byte> zeros(static_cast<std::size_t>(DescribeSurface(resource).guestBytes));
-        texture = std::make_shared<Texture>(context, *context.detiler, resource, mapping, zeros);
+        texture = std::make_shared<Texture>(context, *context.detiler, resource, mapping, zeros, depthCompare);
+        texture->MarkNull();
     }
     return texture;
 }
@@ -1123,7 +1124,7 @@ void ShaderResources::buildComplete() {
                         break;
                     case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
                         write.pImageInfo = images.data() + images.size();
-                        for (const auto index : binding.imageAllocations) images.push_back({VK_NULL_HANDLE, textureFirstLayer[index] ? textures[index]->FirstLayerView() : textures[index]->View(), textures[index]->Layout()});
+                        for (const auto index : binding.imageAllocations) images.push_back(context.nullDescriptor && textures[index]->Null() ? VkDescriptorImageInfo{VK_NULL_HANDLE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED} : VkDescriptorImageInfo{VK_NULL_HANDLE, textureFirstLayer[index] ? textures[index]->FirstLayerView() : textures[index]->View(), textures[index]->Layout()});
                         break;
                     case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
                         write.pImageInfo = images.data() + images.size();
@@ -1771,7 +1772,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
                         if (IsNullTextureDescriptor(words) && binding.imageShape.has_value()) {
-                            if (textureIndex >= textures.size() || nullTexture(context, *binding.imageShape) != textures[textureIndex]) return false;
+                            if (textureIndex >= textures.size() || nullTexture(context, *binding.imageShape, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element)) != textures[textureIndex]) return false;
                             ++textureIndex;
                             continue;
                         }
@@ -2650,7 +2651,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
             const auto* record = nextRecord();
             if (IsNullTextureDescriptor(words) && binding.imageShape.has_value()) {
-                textures.push_back(nullTexture(context, *binding.imageShape));
+                textures.push_back(nullTexture(context, *binding.imageShape, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element)));
                 textureFirstLayer.push_back(false);
                 describedRanges.push_back({"texture", 0, 0, 1, 1, 56, 0, 0});
                 item.imageAllocations.push_back(textures.size() - 1);
