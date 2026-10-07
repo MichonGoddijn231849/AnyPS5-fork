@@ -1592,7 +1592,7 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
 // new epoch (a CPU store collected), and a change of the pending registry each make the next Refresh a full one.
 // Runs on a thread of its own: the epoch it bumps is that thread's, not the one the other tests collect in.
 void targetProofTests(const Device& device) {
-    if (std::getenv("APS5_TARGET_PROOF_MEMO") == nullptr) return;
+    if (const char* memo = std::getenv("APS5_TARGET_PROOF_MEMO"); memo != nullptr && std::strcmp(memo, "0") == 0) return;
     using namespace AgcDriver::GuestMemory;
     const auto& base = device.GetContext();
     constexpr std::uint32_t side = 256;

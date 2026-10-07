@@ -1046,7 +1046,7 @@ namespace {
 
 // APS5_TARGET_PROOF_MEMO=1: see StorageTexture::refreshProved.
 bool targetProofMemo() {
-    static const bool enabled = std::getenv("APS5_TARGET_PROOF_MEMO") != nullptr;
+    static const bool enabled = [] { const char* text = std::getenv("APS5_TARGET_PROOF_MEMO"); return text == nullptr || std::strcmp(text, "0") != 0; }();
     return enabled;
 }
 

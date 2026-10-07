@@ -2326,7 +2326,7 @@ constexpr std::size_t SnapshotArenaCap = std::size_t{256} << 20u;
 }
 
 bool Recorder::SnapshotRingEnabled() {
-    static const bool enabled = std::getenv("APS5_SNAPSHOT_RING") != nullptr;
+    static const bool enabled = [] { const char* text = std::getenv("APS5_SNAPSHOT_RING"); return text == nullptr || std::strcmp(text, "0") != 0; }();
     return enabled;
 }
 

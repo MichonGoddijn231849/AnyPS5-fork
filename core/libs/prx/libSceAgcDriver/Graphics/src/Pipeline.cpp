@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -500,7 +501,7 @@ struct PipelineStore {
 // device check (`alive`) is made as on a normal hit. The hit counts, the LRU order and the result are
 // the normal hit's.
 bool pipelineIdentity() {
-    static const bool enabled = std::getenv("APS5_PIPELINE_IDENTITY") != nullptr;
+    static const bool enabled = [] { const char* text = std::getenv("APS5_PIPELINE_IDENTITY"); return text == nullptr || std::strcmp(text, "0") != 0; }();
     return enabled;
 }
 
