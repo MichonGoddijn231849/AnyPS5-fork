@@ -33,6 +33,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
@@ -715,13 +716,7 @@ public:
                 // own pages, instead of a copy of the map of every page the prologue wrote.
                 lastPageLogged = true;
             } else if (options.freeRun) {
-                // --free-run: memory carries over (GPU-written history accumulates as in the game); only the
-                // queues' and the driver's register state return to the capture's start.
-                ReplaySettle();
-                for (std::size_t i = 0; i < prologueEnd; ++i) {
-                    const auto& event = capture.events[i];
-                    if (event.type == EventType::QueueState || event.type == EventType::DriverState) apply(event);
-                }
+                freeRunRestore();
             } else {
                 restore();
             }
@@ -1279,6 +1274,71 @@ private:
         }
     }
 
+    // --free-run: the pages the game's CPU wrote during the capture (every delta page: command buffers,
+    // constants, labels) return to their base contents, so each loop runs the captured commands over the
+    // captured CPU data; everything else, the GPU-written surfaces and the driver's images, carries over from
+    // the previous loop, so temporal effects accumulate as in the game. Queue and driver state are restored.
+    void freeRunRestore() {
+        ReplaySettle();
+        if (!freeRunPagesBuilt) {
+            freeRunPagesBuilt = true;
+            std::unordered_set<std::uint64_t> deltaPages;
+            for (std::size_t i = prologueEnd; i < capture.events.size(); ++i) {
+                const auto& event = capture.events[i];
+                if (event.type != EventType::Memory) continue;
+                Reader reader(event.payload);
+                if (reader.Get<MemoryKind>() != MemoryKind::Delta) continue;
+                for (const auto& run : reader.GetSpan<MemoryRun>()) {
+                    for (std::uint32_t page = 0; page < run.pages; ++page) deltaPages.insert(run.address + static_cast<std::uint64_t>(page) * PageBytes);
+                }
+            }
+            for (std::size_t i = 0; i < prologueEnd; ++i) {
+                const auto& event = capture.events[i];
+                if (event.type != EventType::Memory) continue;
+                Reader reader(event.payload);
+                static_cast<void>(reader.Get<MemoryKind>());
+                const auto runs = reader.GetSpan<MemoryRun>();
+                const auto indices = reader.GetSpan<std::uint32_t>();
+                std::size_t next = 0;
+                for (const auto& run : runs) {
+                    for (std::uint32_t page = 0; page < run.pages; ++page, ++next) {
+                        const auto address = run.address + static_cast<std::uint64_t>(page) * PageBytes;
+                        if (next < indices.size() && deltaPages.count(address) != 0) freeRunPages.emplace_back(address, indices[next]);
+                    }
+                }
+            }
+            std::sort(freeRunPages.begin(), freeRunPages.end());
+            std::fprintf(stderr, "[replay] --free-run: %zu CPU-written pages return to their base contents each loop (%zu delta pages)\n", freeRunPages.size(), deltaPages.size());
+        }
+        space.restoredPages = 0;
+        space.restoredRanges.clear();
+        for (const auto& [address, index] : freeRunPages) {
+            AgcDriver::GuestMemory::FlushGpuWrites(address, PageBytes);
+            space.Write(address, capture.Page(index), PageBytes, true);
+        }
+        for (std::size_t i = 0; i < prologueEnd; ++i) {
+            const auto& event = capture.events[i];
+            if (event.type == EventType::QueueState || event.type == EventType::DriverState) apply(event);
+        }
+        for (auto it = lastPageUndo.rbegin(); it != lastPageUndo.rend(); ++it) {
+            if (it->second == 0) lastPage.erase(it->first);
+            else lastPage[it->first] = it->second;
+        }
+        lastPageUndo.clear();
+        space.ApplyProtections();
+        if (!space.restoredRanges.empty()) {
+            auto& ranges = space.restoredRanges;
+            std::sort(ranges.begin(), ranges.end());
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+            for (const auto& range : ranges) {
+                if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+                else merged.push_back(range);
+            }
+            ReplayCollectWrites(merged);
+        }
+        std::fprintf(stderr, "[replay] loop %u: free run, %llu CPU-written pages restored\n", loop, static_cast<unsigned long long>(space.restoredPages));
+    }
+
     void restore() {
         ReplaySettle();
         if (options.cold != 0) {
@@ -1353,6 +1413,9 @@ private:
         return {AgcDriver::DriverThreadCpuNs(AgcDriver::DriverThread::Queue0Worker), AgcDriver::DriverThreadCpuNs(AgcDriver::DriverThread::Committer)};
     }
     std::uint32_t loop = 0;
+    // --free-run: the delta pages with their base page index, built at the first free-run restore.
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> freeRunPages;
+    bool freeRunPagesBuilt = false;
     // --hash-check: loop 0's block hashes per point, the point counter of the running loop, and how many points differed.
     std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> hashReference;
     std::size_t hashPoints = 0;
