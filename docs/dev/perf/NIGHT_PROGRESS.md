@@ -4,7 +4,13 @@
 
 Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `build-perf` on lavapipe; the
 `agc_*` ctest suite (143 tests) passes with the switches below off and on, except `agc_driver_vopc_compare` and
-`agc_driver_vopc_compare_table`, which fail at the base commit too (lavapipe).
+`agc_driver_vopc_compare_table`, which fail at the base commit too. They are lavapipe's: `gta-v/hw-rt`'s
+`PROGRESS.md` (section D) has the evidence. The suite also passes with all the B switches on together, plus
+`APS5_PIPELINED_DRAWS=1` and `APS5_VERIFY_PROOFS=1`.
+
+Build fix carried over from `gta-v/hw-rt`: `ShaderDiskCache.cpp`'s Linux layout asserts match the current structs
+(`fix(shader): the disk cache's Linux layout checks match the current structs`). The local `HWRT_LOCAL_BUILD`
+workaround is gone, so `night/perf` builds on Linux as checked out.
 
 ### Commits
 
