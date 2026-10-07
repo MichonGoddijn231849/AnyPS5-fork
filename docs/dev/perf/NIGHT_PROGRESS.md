@@ -19,6 +19,7 @@ Base: `a75aea29` (`gta-v/fidelity-main` + the pipelined-draws work). Built in `b
 | B2 target proof memo | `perf(agc): memoize a storage image's refresh proof within a collect epoch` | `APS5_TARGET_PROOF_MEMO=1` | `agc_driver_recorder_tests` `targetProofTests` (runs with the switch set): a repeat within the epoch is answered by the proof; a stamp over the surface, a new epoch after a CPU store, and another image marked dirty over it each force the full Refresh (which then uploads for the CPU store). The `agc_*` suite passes with it on (also with pipelined draws). |
 | B3 lookup memo | `perf(agc): re-prove a reused template from its last fast proof` | `APS5_LOOKUP_MEMO=1` | `agc_driver_lookup_memo` (sets the switch and `APS5_VERIFY_PROOFS=1`, which runs the fast proof beside every memo hit and aborts on a disagreement): a repeat within the epoch is answered by the memo; a pending-registry change, a new collect epoch and a registry mutation each force the fast proof; results never change. The `agc_*` suite passes with it on. |
 | B4 draw input memo | `perf(agc): per-thread memo of reused draw inputs within a collect epoch` | `APS5_DRAW_INPUT_MEMO=1` | `agc_driver_recorder_tests` `drawInputMemoTests` (with the switch set): a repeat within the epoch is answered by the memo (same buffer, same derived value); a stamp, a new epoch after a CPU store, a pending-registry change and a recorded pending write each force the full path. The `agc_*` suite passes with it on, and with all B switches on together. |
+| B6 pipelined-draw prerequisites | `fix(agc): storage images and exact target ranges in the pipelined draws' write ranges` | storage images: none (a fix to the pipelined path, which is itself off by default); exact ranges: `APS5_EXACT_DRAW_WRITES=1` | `agc_driver_draw_write_ranges`: a storage image a draw stores to is a write range (surface and keys), one it only reads is not, one without flags counts as written; the exact color/DCC/depth/stencil/HTILE ranges hold every addressed texel and nothing past the layout; the estimates cover the exact ranges; 4-sample targets scale. |
 
 ### B7: exit crash
 
@@ -243,3 +244,33 @@ Expected saving: most of the reuse path's cost on repeated ranges, perhaps 1-2 u
 Day-session check: `APS5_PROFILE_DRAW=1 APS5_PIPELINED_DRAWS=1` with and without `APS5_DRAW_INPUT_MEMO=1`. Compare
 the committer's `vertex` column. `DrawInputMemoCounters()` gives the hit/miss counts; a report line could be added
 if useful.
+
+### B6: prerequisites for making `APS5_PIPELINED_DRAWS` the default
+
+`Driver::drawWriteRanges` now forwards to `DrawWriteRanges` (new `Execution/include/Driver/Memory/DrawWriteRanges.hpp`),
+so a test can call it.
+
+1. **Storage images.** Images that draws store to (pixel-shader image stores, image atomics) were missing from the
+   ranges, so a later reader of that memory did not order against the pipelined draw. They are now included: the
+   surface (`DescribeSurface(...).guestBytes`) and its DCC keys. Elements the shader only reads are left out; a
+   binding without `imageWritten` flags counts as written. This is not behind a switch, because it only affects the
+   pipelined path, which is off by default, and only makes it more conservative.
+2. **Exact target ranges** (`APS5_EXACT_DRAW_WRITES=1`):
+   - color: `[address, address + ColorTargetLayout bytes x samples x 3D slices)` instead of twice the bytes plus
+     64 KiB from the surface base;
+   - DCC: one key byte per 256 surface bytes instead of a sixteenth plus 64 KiB;
+   - depth and stencil: `DepthSliceBytes` x samples;
+   - HTILE: 4 bytes per 8x8 tile;
+   - CMASK keeps its estimate (no exact formula in the code yet).
+
+   For 1080p RGBA8 the color range goes from 17.8 MB to 8.8 MB.
+
+Day-session check:
+
+- `APS5_PIPELINED_DRAWS=1 APS5_EXACT_DRAW_WRITES=1` in the Lombank against `APS5_PIPELINED_DRAWS=1` alone.
+  Expected: the same frames, and fewer `[draw] pipelined ... drains` caused by write-range overlaps.
+- Look for any scene that writes storage images from pixel shaders; before this change it could read stale bytes
+  in pipelined mode.
+
+Still open before the default can flip: CMASK's exact size, and mipmapped color views (only the view's mip range is
+used; writes go only there).

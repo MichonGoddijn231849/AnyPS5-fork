@@ -1,10 +1,19 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include <algorithm>
+#include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
 template<typename TVisit>
-void Driver::forEachWrittenBuffer(const ShaderRecompiler::RecompileResult& compiled, TVisit&& visit) {
+void visitWrittenBuffers(const ShaderRecompiler::RecompileResult& compiled, TVisit&& visit) {
     for (const auto& binding : compiled.bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
@@ -18,6 +27,13 @@ void Driver::forEachWrittenBuffer(const ShaderRecompiler::RecompileResult& compi
             visit(element, base, base + size, element < binding.bufferAtomic.size() && binding.bufferAtomic[element]);
         }
     }
+}
+
+}
+
+template<typename TVisit>
+void Driver::forEachWrittenBuffer(const ShaderRecompiler::RecompileResult& compiled, TVisit&& visit) {
+    visitWrittenBuffers(compiled, std::forward<TVisit>(visit));
 }
 
 void Driver::noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled) {
@@ -42,7 +58,12 @@ void Driver::noteDrawWriters(std::span<const Graphics::CompiledShader> stages, s
     }
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
+bool ExactDrawWrites() {
+    static const bool exact = std::getenv("APS5_EXACT_DRAW_WRITES") != nullptr;
+    return exact;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact) {
     constexpr std::uint64_t Slack = 64 * 1024;
     constexpr std::uint64_t UnknownBytes = 64ull * 1024 * 1024;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
@@ -50,9 +71,33 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(con
         if (begin != 0) ranges.emplace_back(begin, begin + bytes);
     };
     for (const auto& stage : stages) {
-        forEachWrittenBuffer(*stage.program, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { ranges.emplace_back(begin, end); });
+        if (stage.program == nullptr) continue;
+        visitWrittenBuffers(*stage.program, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { ranges.emplace_back(begin, end); });
+        // Storage images the stage stores to (a missing flag counts as written): the whole surface and its keys.
+        for (const auto& binding : stage.program->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) continue;
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
+                if (!written || binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) continue;
+                const auto resource = Graphics::DecodeTextureResource(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8));
+                if (resource.baseAddress == 0) continue;
+                const auto surfaceBytes = Graphics::DescribeSurface(resource).guestBytes;
+                add(resource.baseAddress, surfaceBytes != 0 ? surfaceBytes : UnknownBytes);
+                add(resource.dccAddress, surfaceBytes != 0 ? surfaceBytes / 256 + 1 : UnknownBytes);
+            }
+        }
     }
     const auto addColor = [&](const Graphics::ColorTarget& color) {
+        if (exact && color.bytes != 0) {
+            // The view's mip or slice: ColorTargetLayout's bytes per sample; a 3D target's slice lies anywhere in it.
+            const auto samples = static_cast<std::uint64_t>(std::max<std::uint32_t>(color.samples, 1));
+            const auto slices = static_cast<std::uint64_t>(std::max<std::uint32_t>(color.depth, 1));
+            const auto bytes = static_cast<std::uint64_t>(color.bytes) * samples * slices;
+            add(color.address, bytes);
+            add(color.dccAddress, (bytes + 255) / 256);
+            add(color.cmaskAddress, bytes / 16 + Slack);
+            return;
+        }
         const std::uint64_t bytes = color.bytes != 0 ? static_cast<std::uint64_t>(color.bytes) : UnknownBytes;
         const auto base = color.surfaceAddress != 0 ? std::min(color.surfaceAddress, color.address) : color.address;
         if (base != 0) ranges.emplace_back(base, color.address + 2 * bytes + Slack);
@@ -63,14 +108,26 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(con
     for (const auto& color : graphics.colors) addColor(color);
     if (graphics.depth) {
         const auto& depth = *graphics.depth;
-        const auto align = [](std::uint64_t value) { return (value + 255) & ~255ull; };
-        const auto pixels = align(depth.extent.width) * align(depth.extent.height) * std::max<std::uint64_t>(depth.samples, 1);
-        const auto bytes = pixels != 0 ? pixels * 8 + Slack : UnknownBytes;
-        add(depth.address, bytes);
-        add(depth.stencilAddress, bytes);
-        add(depth.htileAddress, pixels / 4 + Slack);
+        if (exact && depth.extent.width != 0 && depth.extent.height != 0) {
+            const auto samples = static_cast<std::uint64_t>(std::max<std::uint32_t>(depth.samples, 1));
+            const bool d16 = depth.format == VK_FORMAT_D16_UNORM || depth.format == VK_FORMAT_D16_UNORM_S8_UINT;
+            add(depth.address, Graphics::DepthSliceBytes(depth.extent, d16 ? 2u : 4u) * samples);
+            add(depth.stencilAddress, Graphics::DepthSliceBytes(depth.extent, 1u) * samples);
+            add(depth.htileAddress, static_cast<std::uint64_t>((depth.extent.width + 7u) / 8u) * ((depth.extent.height + 7u) / 8u) * 4u);
+        } else {
+            const auto align = [](std::uint64_t value) { return (value + 255) & ~255ull; };
+            const auto pixels = align(depth.extent.width) * align(depth.extent.height) * std::max<std::uint64_t>(depth.samples, 1);
+            const auto bytes = pixels != 0 ? pixels * 8 + Slack : UnknownBytes;
+            add(depth.address, bytes);
+            add(depth.stencilAddress, bytes);
+            add(depth.htileAddress, pixels / 4 + Slack);
+        }
     }
     return ranges;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
+    return DrawWriteRanges(graphics, stages, ExactDrawWrites());
 }
 
 std::optional<WrittenBuffer> Driver::newestWriterLocked(std::uint64_t begin, std::uint64_t end) const {
