@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libc/include/Shutdown.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -63,10 +64,12 @@ int main() {
         const auto stores = storesOnCpu.load() + storesOnGpu.load() + storesBehindCompletions.load() - cpuBefore;
         check(stores == 2, "the DMA_DATA packets were not committed (" + std::to_string(stores) + " committed stores)");
         check(storesDrained.load() == drainedBefore, "a DMA_DATA packet still drained");
+        LibcRunShutdown_nid_postfix();
         std::puts("pipelined DMA tests passed");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
+        try { LibcRunShutdown_nid_postfix(); } catch (...) {}
         return 1;
     }
 }

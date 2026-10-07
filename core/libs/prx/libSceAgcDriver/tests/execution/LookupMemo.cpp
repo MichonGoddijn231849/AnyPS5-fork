@@ -18,6 +18,7 @@
 #include <iostream>
 #include <optional>
 #include <span>
+#include <new>
 #include <vector>
 
 namespace {
@@ -179,14 +180,14 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        auto* block = static_cast<std::uint32_t*>(std::aligned_alloc(BlockBytes, 2 * BlockBytes));
+        auto* block = static_cast<std::uint32_t*>(::operator new(2 * BlockBytes, std::align_val_t{BlockBytes}, std::nothrow));
         Require(block != nullptr, "lookup memo: cannot allocate the guest block");
         GuestAllocations::Mutation().Add(block, 2 * BlockBytes, true, true);
         struct Release {
             std::uint32_t* block;
             ~Release() {
                 GuestAllocations::Mutation().Remove(block);
-                std::free(block);
+                ::operator delete(block, std::align_val_t{BlockBytes});
             }
         } release{block};
         Input = block;
