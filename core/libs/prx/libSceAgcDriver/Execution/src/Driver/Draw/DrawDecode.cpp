@@ -65,6 +65,7 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
             it->second,
             codeOffset
         };
+        result.binary.codeHash = SnapshotCodeHash(snapshot, codeOffset);
         result.resourceRegister = rsrc2;
         result.nullPixel = nullPixel;
         readUserWords(queue, result);

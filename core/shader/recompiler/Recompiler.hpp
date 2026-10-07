@@ -35,6 +35,8 @@ struct ShaderBinary {
     std::span<const std::uint32_t> code;
     std::uint64_t headerAddress;
     std::span<const std::byte> header;
+    // RecompileCacheKey::HashCode of `code` when the caller knows it (a registered shader's memo), else 0.
+    std::uint64_t codeHash = 0;
 };
 
 struct ShaderComputeStageInfo {

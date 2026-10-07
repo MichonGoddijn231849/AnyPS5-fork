@@ -209,6 +209,7 @@ function(add_shader_recompiler target runtimeTarget)
             DebugProbeActive
             DepthBitsTextureWidth
             HashBytes
+            RecompileCacheKey::HashCode
             PixelInput
             PixelInputBit
             ReadWholeFile

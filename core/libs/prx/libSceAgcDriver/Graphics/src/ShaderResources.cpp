@@ -3021,6 +3021,9 @@ struct DrawBindingsSample {
 
 }
 
+// Largest snapshot APS5_SNAPSHOT_FRESH_COPY copies afresh on every draw.
+constexpr std::size_t FreshCopyLimit = 4096;
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     DrawBindingsSample sample;
     if (_set == VK_NULL_HANDLE || usesBda) return {};
@@ -3033,13 +3036,18 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
-            auto buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
+            // A slice of the snapshot ring when there is one, instead of a buffer of its own per draw.
+            Recorder::SnapshotSlice slice{};
+            if (Recorder::SnapshotRingEnabled()) slice = recorder.AllocateDrawSnapshot(override->size);
+            auto buffer = slice.buffer != nullptr ? std::move(slice.buffer) : std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            const VkDeviceSize offset = buffer != nullptr && slice.offset != 0 ? slice.offset : 0;
+            auto* bytes = buffer->Bytes().data() + offset;
+            std::memcpy(bytes, override->words.data(), override->size);
             for (const auto& patch : dataPatches) {
-                if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                if (patch.allocation == index && patch.byte < override->size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
-            result->snapshots.push_back({0, std::move(buffer), 0, override->size});
+            result->snapshots.push_back({0, std::move(buffer), offset, override->size});
             continue;
         }
         std::uint64_t address = item.address;
@@ -3054,6 +3062,23 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         const auto begin = address - item.adjustment;
         const auto bytes = size + item.adjustment;
+        // Every small snapshot is copied into the ring afresh instead of proving an
+        // earlier copy still current (a write collect, a lookup and a keep record per snapshot cost more
+        // than copying a few hundred bytes). APS5_SNAPSHOT_FRESH_COPY=0 reuses proven copies as before.
+        static const bool freshCopy = [] { const char* text = std::getenv("APS5_SNAPSHOT_FRESH_COPY"); return text == nullptr || std::strcmp(text, "0") != 0; }();
+        if (freshCopy && bytes <= FreshCopyLimit && Recorder::SnapshotRingEnabled()) {
+            auto slice = recorder.AllocateDrawSnapshot(bytes);
+            if (slice.buffer != nullptr) {
+                sample.mark(0);
+                std::memcpy(slice.buffer->Bytes().data() + slice.offset, reinterpret_cast<const void*>(begin), bytes);
+                ++sample.snapshots;
+                sample.mark(7);
+                selected.push_back(index);
+                result->snapshots.push_back({begin, std::move(slice.buffer), slice.offset, bytes});
+                CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+                continue;
+            }
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         sample.mark(0);
         const auto generation = GuestMemory::CollectWrites(begin, bytes);

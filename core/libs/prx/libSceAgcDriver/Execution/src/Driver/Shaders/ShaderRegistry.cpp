@@ -93,6 +93,21 @@ std::uint64_t NullPixelProgramAddress() {
     return reinterpret_cast<std::uintptr_t>(NullPixelCode);
 }
 
+std::uint64_t SnapshotCodeHash(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
+    auto& memo = *snapshot.handles;
+    {
+        std::lock_guard lock(memo.codeHashMutex);
+        for (const auto& entry : memo.codeHashes) {
+            if (entry.offset == codeOffset) return entry.hash;
+        }
+    }
+    const auto hash = ShaderRecompiler::RecompileCacheKey::HashCode(std::span(snapshot.code).subspan(codeOffset));
+    std::lock_guard lock(memo.codeHashMutex);
+    memo.codeHashes[memo.nextCodeHash] = {codeOffset, hash};
+    memo.nextCodeHash = (memo.nextCodeHash + 1) % memo.codeHashes.size();
+    return hash;
+}
+
 void Driver::RegisterShader(const Shader* shader) {
     CheckFailure();
     GuestMemory::CheckRange(shader, sizeof(Shader), alignof(Shader));

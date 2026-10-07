@@ -24,6 +24,15 @@ struct HandleMemos {
     std::array<Entry, 8> entries;
     std::size_t next = 0;
     std::atomic<std::uint32_t> poisoned{0};
+    // The code hash per program offset (RecompileCacheKey::HashCode of the code from that offset on): the
+    // snapshot's code never changes, so a draw's cache key need not hash kilobytes of it again.
+    struct CodeHash {
+        std::size_t offset = ~std::size_t{0};
+        std::uint64_t hash = 0;
+    };
+    std::mutex codeHashMutex;
+    std::array<CodeHash, 4> codeHashes;
+    std::size_t nextCodeHash = 0;
 };
 
 struct ShaderSnapshot {
@@ -40,6 +49,9 @@ using ShaderRegistry = std::map<std::uint64_t, std::shared_ptr<const ShaderSnaps
 bool FailureMemo();
 
 std::uint64_t NullPixelProgramAddress();
+
+// RecompileCacheKey::HashCode of the snapshot's code from `codeOffset` on, computed once per offset.
+std::uint64_t SnapshotCodeHash(const ShaderSnapshot& snapshot, std::size_t codeOffset);
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint64_t deviceSerial, const ShaderRecompiler::RecompileRequest& request, bool bypass, const std::string** poisoned = nullptr);
 

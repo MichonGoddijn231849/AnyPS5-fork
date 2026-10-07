@@ -1134,6 +1134,16 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
             return std::pair{taken.buffer, taken.offset};
         };
         const auto first = snapshot(std::byte{0x11});
+        // Small snapshots are copied afresh on every draw (the bytes checked above are the contract); the reuse
+        // proofs below apply when copies are reused (APS5_SNAPSHOT_FRESH_COPY=0, or the ring off).
+        const char* freshText = std::getenv("APS5_SNAPSHOT_FRESH_COPY");
+        const bool fresh = (freshText == nullptr || std::strcmp(freshText, "0") != 0) && Recorder::SnapshotRingEnabled();
+        if (fresh) {
+            std::memset(reinterpret_cast<void*>(element), 0x22, elementBytes);
+            static_cast<void>(snapshot(std::byte{0x22}));
+            snapshotRecorder.Sync();
+        }
+        if (!fresh) {
         Require(snapshot(std::byte{0x11}) == first, "an unchanged draw input was copied again");
         std::memset(reinterpret_cast<void*>(element), 0x22, elementBytes);
         const auto afterCpu = snapshot(std::byte{0x22});
@@ -1148,6 +1158,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         }
         Require(snapshot(std::byte{0x33}) != afterStore, "a draw snapshot outlived a registry mutation");
         snapshotRecorder.Sync();
+        }
     }
     recorder.Activate();
 }
