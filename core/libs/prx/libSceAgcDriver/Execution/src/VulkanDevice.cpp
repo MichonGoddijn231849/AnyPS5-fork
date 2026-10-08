@@ -996,7 +996,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->spirvExtensions.push_back("SPV_EXT_descriptor_indexing");
     }
     VkPhysicalDeviceRobustness2FeaturesEXT robustness2Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
-    if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
+    if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) && std::getenv("APS5_NO_NULL_DESCRIPTOR") == nullptr) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness2Features};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
         state->nullDescriptor = robustness2Features.nullDescriptor == VK_TRUE;
