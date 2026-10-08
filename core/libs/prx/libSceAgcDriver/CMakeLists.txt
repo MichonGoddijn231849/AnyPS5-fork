@@ -521,6 +521,32 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    # APS5_COMMITTER_SPIN_US (DrawPipeline::run): the pipelined commit items again with an idle committer polling.
+    add_test(NAME agc_driver_pipelined_dma_spin COMMAND agc_driver_pipelined_dma_tests)
+    set_tests_properties(agc_driver_pipelined_dma_spin PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_COMMITTER_SPIN_US=50" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_driver_pipelined_dma_spin PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # APS5_PIPELINE_DISPATCH (Driver::dispatch): the direct dispatches of the pipelined queue 0 as commit items, where the
+    # cache hits with a recipe are; the dispatch test checks its values and that a repeated dispatch does not drain.
+    add_test(NAME agc_driver_pipelined_dispatch_item COMMAND agc_driver_pipelined_dispatch_tests)
+    set_tests_properties(agc_driver_pipelined_dispatch_item PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINE_DISPATCH=1" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_driver_pipelined_dispatch_item PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # APS5_SRT_EVAL_MEMO (ResourceMaterializer): the shader memory tests again with the SRT evaluation
+    # memo on and in verify mode; they re-capture one plan with changed guest words, which the memo
+    # must not answer from a stale entry.
+    foreach(srtEvalMemo IN ITEMS 1 verify)
+        add_test(NAME agc_shader_memory_srt_eval_memo_${srtEvalMemo} COMMAND agc_shader_memory_tests)
+        set_tests_properties(agc_shader_memory_srt_eval_memo_${srtEvalMemo} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SRT_EVAL_MEMO=${srtEvalMemo}" SKIP_RETURN_CODE 77)
+        if(WIN32)
+            set_tests_properties(agc_shader_memory_srt_eval_memo_${srtEvalMemo} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
 endif()
 
 option(AGC_BUILD_VISUAL_TEST "Enable the standalone AGC SPIR-V visual test" OFF)

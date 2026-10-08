@@ -1277,10 +1277,15 @@ bool ShaderResources::MovableImages() {
 }
 
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, bool movableImages) {
+    std::vector<std::uint32_t> key;
+    AppendContentKey(key, shader, dataWords, movableBuffers, movableImages);
+    return key;
+}
+
+void ShaderResources::AppendContentKey(std::vector<std::uint32_t>& key, const CompiledShader& shader, bool dataWords, bool movableBuffers, bool movableImages) {
     Require(shader.program != nullptr, "missing compiled shader");
     const auto& program = *shader.program;
-    std::vector<std::uint32_t> key;
-    key.reserve(8 + program.bindings.size() * 12);
+    key.reserve(key.size() + 8 + program.bindings.size() * 12);
     key.push_back(dataWords ? 1u : 0u);
     key.push_back(static_cast<std::uint32_t>(shader.stage));
     key.push_back(static_cast<std::uint32_t>(program.variantId));
@@ -1324,7 +1329,6 @@ std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& sha
         // must not serve a build with another (the variant implies it, this makes it explicit).
         packBits(binding.bufferWritten);
     }
-    return key;
 }
 
 namespace {
@@ -3118,8 +3122,11 @@ constexpr std::size_t FreshCopyLimit = 4096;
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, std::span<const MovedImage> movedImages) const {
     DrawBindingsSample sample;
     if (_set == VK_NULL_HANDLE || usesBda) return {};
-    const auto reads = guestMemory.InPlaceReads();
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+    auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+    guestMemory.InPlaceReads(reads);
     auto result = std::make_shared<DrawBindings>();
+    result->snapshots.reserve(allocations.size());
     thread_local std::vector<std::size_t>* selectedSlot = nullptr;
     auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
     selected.clear();
@@ -3305,7 +3312,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
-    recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+    auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+    guestMemory.InPlaceReads(reads);
+    recorder.NotePendingReads(reads, guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageWritten[index]) storageTextures[index]->MarkDirty();
@@ -3342,8 +3352,7 @@ bool ShaderResources::WritesMemory() const {
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {
-    const auto reads = guestMemory.InPlaceReads();
-    return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
+    return guestMemory.InPlaceReadOverlaps(address, bytes);
 }
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {

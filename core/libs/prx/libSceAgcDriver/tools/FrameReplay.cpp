@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <SDL_vulkan.h>
@@ -38,6 +39,272 @@
 #define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#include <cstdlib>
+#include <new>
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <cerrno>
+#include <csignal>
+#include <sys/time.h>
+#include <ucontext.h>
+#endif
+
+// APS5_COUNT_ALLOCS=1 (docs/dev/NIGHT_SHIFT.md B6): the replay replaces the global operator new and counts the
+// allocations (and bytes) of the driver threads by role (DriverThreadClock), the driver's library included (its
+// operator new binds to this one). On Linux, one committer allocation in SampleEvery (queue 0's worker's with
+// APS5_COUNT_ALLOCS=worker) also records its five callers,
+// printed per loop as module offsets (symbolize with addr2line against the module). Without the switch the
+// replacement only forwards to malloc.
+namespace ReplayAllocations {
+
+bool Enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_COUNT_ALLOCS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+struct Counts {
+    std::atomic<std::uint64_t> allocations{0};
+    std::atomic<std::uint64_t> bytes{0};
+};
+
+// Index role + 1 (0: any other thread).
+std::array<Counts, static_cast<std::size_t>(AgcDriver::DriverThread::Count) + 1> byRole;
+
+// The role whose call sites are sampled: the committer, or queue 0's worker with APS5_COUNT_ALLOCS=worker.
+int SampledRole() {
+    static const int role = [] {
+        const char* value = std::getenv("APS5_COUNT_ALLOCS");
+        return value != nullptr && std::strcmp(value, "worker") == 0 ? static_cast<int>(AgcDriver::DriverThread::Queue0Worker) : static_cast<int>(AgcDriver::DriverThread::Committer);
+    }();
+    return role;
+}
+
+constexpr unsigned SampleEvery = 31;
+constexpr std::size_t SiteFrames = 5;
+using SiteKey = std::array<std::uintptr_t, SiteFrames>;
+std::mutex sitesMutex;
+std::map<SiteKey, std::pair<std::uint64_t, std::uint64_t>>* sites = nullptr;
+thread_local bool inside = false;
+
+void Note(std::size_t bytes) {
+    if (!Enabled() || inside) return;
+    inside = true;
+    const int role = AgcDriver::CurrentDriverThreadRole();
+    auto& counts = byRole[static_cast<std::size_t>(role + 1)];
+    counts.allocations.fetch_add(1, std::memory_order_relaxed);
+    counts.bytes.fetch_add(bytes, std::memory_order_relaxed);
+#ifndef _WIN32
+    thread_local unsigned sampled = 0;
+    if (role == SampledRole() && ++sampled % SampleEvery == 0) {
+        void* raw[SiteFrames + 2];
+        const int captured = backtrace(raw, static_cast<int>(SiteFrames + 2));
+        SiteKey key{};
+        for (int i = 2; i < captured && static_cast<std::size_t>(i - 2) < SiteFrames; ++i) key[static_cast<std::size_t>(i - 2)] = reinterpret_cast<std::uintptr_t>(raw[i]);
+        std::lock_guard lock(sitesMutex);
+        if (sites == nullptr) sites = new std::map<SiteKey, std::pair<std::uint64_t, std::uint64_t>>();
+        auto& site = (*sites)[key];
+        site.first += SampleEvery;
+        site.second += bytes * SampleEvery;
+    }
+#endif
+    inside = false;
+}
+
+std::array<std::uint64_t, 2> Take(AgcDriver::DriverThread role) {
+    auto& counts = byRole[static_cast<std::size_t>(role) + 1];
+    return {counts.allocations.load(std::memory_order_relaxed), counts.bytes.load(std::memory_order_relaxed)};
+}
+
+// The sampled committer sites by estimated allocations, most first, as one line; the samples are cleared.
+std::string SiteReport(std::size_t limit) {
+    std::vector<std::pair<SiteKey, std::pair<std::uint64_t, std::uint64_t>>> sorted;
+    {
+        std::lock_guard lock(sitesMutex);
+        if (sites == nullptr) return {};
+        sorted.assign(sites->begin(), sites->end());
+        sites->clear();
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+    std::string report;
+    for (std::size_t i = 0; i < sorted.size() && i < limit; ++i) {
+        char text[96];
+        std::snprintf(text, sizeof(text), " [%llu allocs %.0f KiB:", static_cast<unsigned long long>(sorted[i].second.first), static_cast<double>(sorted[i].second.second) / 1024.0);
+        report += text;
+        for (const auto frame : sorted[i].first) {
+            if (frame == 0) continue;
+#ifndef _WIN32
+            Dl_info info{};
+            if (dladdr(reinterpret_cast<void*>(frame), &info) != 0 && info.dli_fname != nullptr) {
+                const char* name = std::strrchr(info.dli_fname, '/');
+                std::snprintf(text, sizeof(text), " %s+0x%llx", name != nullptr ? name + 1 : info.dli_fname, static_cast<unsigned long long>(frame - reinterpret_cast<std::uintptr_t>(info.dli_fbase)));
+                report += text;
+                continue;
+            }
+#endif
+            std::snprintf(text, sizeof(text), " 0x%llx", static_cast<unsigned long long>(frame));
+            report += text;
+        }
+        report += "]";
+    }
+    return report;
+}
+
+}
+
+// APS5_CPU_SAMPLE=1 (Linux): a CPU profile of the driver threads. A process-wide ITIMER_PROF delivers SIGPROF to the
+// thread that is using the CPU every SamplePeriodUs of the process's CPU time (as gperftools' profiler does); the
+// handler keeps the stack of a sample landing on a registered driver thread (DriverThreadClock), so the profile counts
+// only the worker's and the committer's running time, not their waits, nor this tool's own restore work (gdb sampling
+// of the replay mostly catches the driver threads idle). Samples go to APS5_CPU_SAMPLE_FILE (default
+// cpu-samples.txt) after each loop from the second on, as module offsets; tools/perf/cpu-profile.py symbolizes and
+// sums them by function (self and inclusive) per role.
+namespace ReplayCpuSamples {
+
+bool Enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_CPU_SAMPLE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+#ifndef _WIN32
+constexpr long SamplePeriodUs = 1000;
+constexpr std::size_t Frames = 32;
+constexpr std::size_t Capacity = std::size_t{1} << 17;
+
+struct Sample {
+    std::atomic<std::uint32_t> ready{0};
+    std::int32_t role = -1;
+    std::uint32_t count = 0;
+    std::array<void*, Frames> frames{};
+};
+
+Sample* samples = nullptr;
+std::atomic<std::size_t> reserved{0};
+std::atomic<std::uint64_t> dropped{0};
+std::size_t written = 0;
+FILE* output = nullptr;
+
+void Handler(int, siginfo_t*, void* context) {
+    const int role = AgcDriver::CurrentDriverThreadRole();
+    if (role < 0) return;
+    const int savedErrno = errno;
+    const auto index = reserved.fetch_add(1, std::memory_order_relaxed);
+    if (index >= Capacity) {
+        dropped.fetch_add(1, std::memory_order_relaxed);
+        errno = savedErrno;
+        return;
+    }
+    auto& sample = samples[index];
+    sample.role = role;
+    // backtrace's frames 0 and 1 are this handler and the signal trampoline, frame 2 the interrupted PC. On x86-64
+    // that PC is taken from the signal context instead, which is exact wherever the unwinder is not.
+    std::array<void*, Frames + 3> raw{};
+    const int captured = backtrace(raw.data(), static_cast<int>(raw.size()));
+    std::uint32_t count = 0;
+    int first = 2;
+#if defined(__x86_64__)
+    sample.frames[count++] = reinterpret_cast<void*>(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]);
+    first = 3;
+#else
+    static_cast<void>(context);
+#endif
+    for (int i = first; i < captured && count < Frames; ++i) sample.frames[count++] = raw[static_cast<std::size_t>(i)];
+    sample.count = count;
+    sample.ready.store(1, std::memory_order_release);
+    errno = savedErrno;
+}
+
+// Arms the timer once (the first call); later calls do nothing.
+void Start() {
+    if (!Enabled() || samples != nullptr) return;
+    samples = new Sample[Capacity];
+    void* warm[4];
+    static_cast<void>(backtrace(warm, 4)); // loads the unwinder outside the handler
+    const char* path = std::getenv("APS5_CPU_SAMPLE_FILE");
+    output = std::fopen(path != nullptr && path[0] != '\0' ? path : "cpu-samples.txt", "w");
+    if (output == nullptr) {
+        std::fprintf(stderr, "[cpu-sample] cannot open the sample file\n");
+        return;
+    }
+    std::fprintf(output, "# period_us %ld\n", SamplePeriodUs);
+    struct sigaction action{};
+    action.sa_sigaction = &Handler;
+    action.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGPROF, &action, nullptr);
+    itimerval timer{};
+    timer.it_interval.tv_usec = SamplePeriodUs;
+    timer.it_value.tv_usec = SamplePeriodUs;
+    setitimer(ITIMER_PROF, &timer, nullptr);
+    std::fprintf(stderr, "[cpu-sample] sampling the driver threads every %ld us of process CPU\n", SamplePeriodUs);
+}
+
+// Writes the samples finished since the last call: "S <role> <module>+0x<offset> ...", innermost frame first.
+void Flush(unsigned loop) {
+    if (output == nullptr) return;
+    const auto end = std::min(reserved.load(std::memory_order_relaxed), Capacity);
+    std::array<std::uint64_t, 2> byRole{};
+    while (written < end && samples[written].ready.load(std::memory_order_acquire) != 0) {
+        const auto& sample = samples[written++];
+        if (sample.role >= 0 && sample.role < 2) ++byRole[static_cast<std::size_t>(sample.role)];
+        std::fprintf(output, "S %d", sample.role);
+        for (std::uint32_t i = 0; i < sample.count; ++i) {
+            Dl_info info{};
+            if (dladdr(sample.frames[i], &info) != 0 && info.dli_fname != nullptr && info.dli_fbase != nullptr) {
+                // Return addresses point after the call: one byte back names the call's own line.
+                const auto offset = reinterpret_cast<std::uintptr_t>(sample.frames[i]) - reinterpret_cast<std::uintptr_t>(info.dli_fbase) - (i == 0 ? 0u : 1u);
+                std::fprintf(output, " %s+0x%llx", info.dli_fname, static_cast<unsigned long long>(offset));
+            } else {
+                std::fprintf(output, " ?+0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(sample.frames[i])));
+            }
+        }
+        std::fputc('\n', output);
+    }
+    std::fprintf(output, "L %u\n", loop);
+    std::fflush(output);
+    std::fprintf(stderr, "[cpu-sample] loop %u: %llu worker and %llu committer samples written (%zu in all, %llu dropped: buffer full)\n", loop, static_cast<unsigned long long>(byRole[0]), static_cast<unsigned long long>(byRole[1]), written, static_cast<unsigned long long>(dropped.load()));
+}
+#else
+void Start() {}
+void Flush(unsigned) {}
+#endif
+
+}
+
+void* operator new(std::size_t bytes) {
+    ReplayAllocations::Note(bytes);
+    if (void* pointer = std::malloc(bytes != 0 ? bytes : 1)) return pointer;
+    throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t bytes) {
+    ReplayAllocations::Note(bytes);
+    if (void* pointer = std::malloc(bytes != 0 ? bytes : 1)) return pointer;
+    throw std::bad_alloc();
+}
+
+void* operator new(std::size_t bytes, const std::nothrow_t&) noexcept {
+    ReplayAllocations::Note(bytes);
+    return std::malloc(bytes != 0 ? bytes : 1);
+}
+
+void* operator new[](std::size_t bytes, const std::nothrow_t&) noexcept {
+    ReplayAllocations::Note(bytes);
+    return std::malloc(bytes != 0 ? bytes : 1);
+}
+
+void operator delete(void* pointer) noexcept { std::free(pointer); }
+void operator delete[](void* pointer) noexcept { std::free(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
+void operator delete[](void* pointer, std::size_t) noexcept { std::free(pointer); }
+void operator delete(void* pointer, const std::nothrow_t&) noexcept { std::free(pointer); }
+void operator delete[](void* pointer, const std::nothrow_t&) noexcept { std::free(pointer); }
 
 namespace {
 
@@ -234,6 +501,7 @@ public:
         if (!ReplayPlatform::Protect(reinterpret_cast<void*>(page), ViewBytes, ReplayPlatform::ReadWrite(), &protection)) Fail("cannot open read-only guest page " + Hex(page) + " for a capture write");
         store();
         if (!ReplayPlatform::Protect(reinterpret_cast<void*>(page), ViewBytes, protection, &protection)) Fail("cannot restore guest page protection at " + Hex(page));
+        AgcDriver::GuestMemory::ForgetPageStates(static_cast<std::uintptr_t>(page), ViewBytes);
     }
 
     const std::vector<Piece>& Pieces() const { return pieces; }
@@ -304,6 +572,22 @@ private:
     void map(const Piece& piece) {
         auto* pointer = reinterpret_cast<void*>(piece.address);
         const auto bytes = static_cast<std::size_t>(piece.bytes);
+        // The driver's cached page states of the range (SetGuestPagesRange) describe what was there before.
+        struct Forget {
+            std::uint64_t address;
+            std::size_t bytes;
+            ~Forget() { AgcDriver::GuestMemory::ForgetPageStates(static_cast<std::uintptr_t>(address), bytes); }
+        } forget{piece.address, bytes};
+#ifndef _WIN32
+        // The game's direct memory is write-watched (DirectMemory registers its maps); the replay's must be too, or
+        // the driver sees every range as untracked and re-uploads and writes back each surface at every use.
+        struct Watch {
+            const Piece& piece;
+            ~Watch() {
+                if (piece.readable || piece.writable) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(piece.address), static_cast<std::size_t>(piece.bytes));
+            }
+        } watch{piece};
+#endif
         if (piece.kind == PieceKind::External) {
             if (!ReplayPlatform::Commit(pointer, bytes)) Fail("cannot commit the captured image range " + Hex(piece.address));
             return;
@@ -321,6 +605,14 @@ private:
     void unmap(const Piece& piece) {
         auto* pointer = reinterpret_cast<void*>(piece.address);
         const auto bytes = static_cast<std::size_t>(piece.bytes);
+        struct Forget {
+            std::uint64_t address;
+            std::size_t bytes;
+            ~Forget() { AgcDriver::GuestMemory::ForgetPageStates(static_cast<std::uintptr_t>(address), bytes); }
+        } forget{piece.address, bytes};
+#ifndef _WIN32
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(pointer, bytes);
+#endif
         std::erase(pendingProtections, piece);
         if (piece.kind == PieceKind::External) {
             if (!ReplayPlatform::Decommit(pointer, bytes)) Fail("cannot decommit the captured image range " + Hex(piece.address));
@@ -339,6 +631,7 @@ private:
             if (!ReplayPlatform::Protect(reinterpret_cast<void*>(cursor), static_cast<std::size_t>(bytes), protection, &previous)) Fail("cannot protect guest memory at " + Hex(cursor));
         }
         if (piece.kind == PieceKind::Direct) ReplayPlatform::ArenaSetProtection(piece.address, static_cast<std::size_t>(piece.bytes), protection);
+        AgcDriver::GuestMemory::ForgetPageStates(static_cast<std::uintptr_t>(piece.address), static_cast<std::size_t>(piece.bytes));
     }
 
     std::map<std::uint32_t, ReplayPlatform::Section> sections;
@@ -730,7 +1023,14 @@ public:
             {
                 std::lock_guard lock(flipTimesMutex);
                 cpuAtStart = DriverCpu();
+                drawPacketsAtStart = AgcDriver::DriverDrawPackets();
+                drawsCommittedAtStart = AgcDriver::DriverDrawsCommitted();
+                batchesAtStart = AgcDriver::DriverBatchesSubmitted();
+                allocsAtStart[0] = ReplayAllocations::Take(AgcDriver::DriverThread::Queue0Worker);
+                allocsAtStart[1] = ReplayAllocations::Take(AgcDriver::DriverThread::Committer);
+                static_cast<void>(ReplayAllocations::SiteReport(0));
             }
+            if (loop == 1) ReplayCpuSamples::Start();
             const auto replayStarted = Clock::now();
             pacingMs = 0;
             memoryMs = 0;
@@ -782,6 +1082,7 @@ public:
                 // between the previous flip (or the loop's start) and this one, from their own thread clocks, so
                 // an A/B run shows the driver's cost even when this tool's thread dominates the frame time.
                 const char* const roles[2] = {"queue 0 worker", "committer"};
+                std::array<double, 2> roleMs{};
                 for (std::size_t role = 0; role < 2; ++role) {
                     std::string cpu;
                     auto before = cpuAtStart[role];
@@ -799,7 +1100,24 @@ public:
                         before = at[role];
                     }
                     std::fprintf(stderr, "[replay] loop %u: %s cpu ms per frame:%s (%.1f ms in %zu frames)\n", loop, roles[role], cpu.c_str(), total, flipCpu.size());
+                    roleMs[role] = total;
                 }
+                // Per draw: the worker's CPU over the draw packets it took, the committer's over the draws it
+                // committed (both over the frames whose clocks were read).
+                const auto packets = AgcDriver::DriverDrawPackets() - drawPacketsAtStart;
+                const auto committed = AgcDriver::DriverDrawsCommitted() - drawsCommittedAtStart;
+                const auto frames = std::max<std::size_t>(flipCpu.size(), 1);
+                std::fprintf(stderr, "[replay] loop %u: draws %llu packets, %llu committed (%.0f per frame); worker %.2f us per packet, committer %.2f us per committed draw\n", loop, static_cast<unsigned long long>(packets), static_cast<unsigned long long>(committed), static_cast<double>(committed) / static_cast<double>(frames), packets != 0 ? roleMs[0] * 1000.0 / static_cast<double>(packets) : 0.0, committed != 0 ? roleMs[1] * 1000.0 / static_cast<double>(committed) : 0.0);
+                const auto batches = AgcDriver::DriverBatchesSubmitted() - batchesAtStart;
+                std::fprintf(stderr, "[replay] loop %u: %llu recorded batches submitted (%.1f per frame)\n", loop, static_cast<unsigned long long>(batches), static_cast<double>(batches) / static_cast<double>(frames));
+                if (ReplayAllocations::Enabled()) {
+                    const auto committerAllocs = ReplayAllocations::Take(AgcDriver::DriverThread::Committer);
+                    const auto workerAllocs = ReplayAllocations::Take(AgcDriver::DriverThread::Queue0Worker);
+                    const auto newCommitter = committerAllocs[0] - allocsAtStart[1][0];
+                    const auto newWorker = workerAllocs[0] - allocsAtStart[0][0];
+                    std::fprintf(stderr, "[replay] loop %u: heap: committer %.1f allocations (%.0f bytes) per committed draw, worker %.1f allocations (%.0f bytes) per draw packet; %s sites (sampled):%s\n", loop, committed != 0 ? static_cast<double>(newCommitter) / static_cast<double>(committed) : 0.0, committed != 0 ? static_cast<double>(committerAllocs[1] - allocsAtStart[1][1]) / static_cast<double>(committed) : 0.0, packets != 0 ? static_cast<double>(newWorker) / static_cast<double>(packets) : 0.0, packets != 0 ? static_cast<double>(workerAllocs[1] - allocsAtStart[0][1]) / static_cast<double>(packets) : 0.0, ReplayAllocations::SampledRole() == static_cast<int>(AgcDriver::DriverThread::Committer) ? "committer" : "worker", ReplayAllocations::SiteReport(16).c_str());
+                }
+                if (ReplayCpuSamples::Enabled()) ReplayCpuSamples::Flush(loop);
                 flipCpu.clear();
                 std::fprintf(stderr, "[replay] loop %u: memory deltas written in %.1f ms (%.1f MiB)\n", loop, memoryMs, static_cast<double>(memoryBytes) / 1048576.0);
                 flipTimes.clear();
@@ -867,6 +1185,30 @@ private:
             }
             break;
         }
+#ifndef _WIN32
+        // No guest arena here: the span of the captured non-image pieces is where the driver caches page states (the
+        // checks otherwise reread /proc/self/maps every time). Protection changes below forget them (forget()).
+        {
+            std::uint64_t first = ~0ull;
+            std::uint64_t last = 0;
+            for (std::size_t i = 0; i < prologueEnd; ++i) {
+                if (capture.events[i].type != EventType::AddressSpace) continue;
+                Reader reader(capture.events[i].payload);
+                static_cast<void>(reader.GetSpan<Backing>());
+                static_cast<void>(reader.GetSpan<Piece>());
+                for (const auto& piece : reader.GetSpan<Piece>()) {
+                    if (piece.kind == PieceKind::External) continue;
+                    first = std::min<std::uint64_t>(first, piece.address);
+                    last = std::max<std::uint64_t>(last, piece.address + piece.bytes);
+                }
+                break;
+            }
+            if (first < last) {
+                AgcDriver::GuestMemory::SetGuestPagesRange(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first));
+                std::fprintf(stderr, "[replay] guest pages %s-%s (page-state cached)\n", Hex(first).c_str(), Hex(last).c_str());
+            }
+        }
+#endif
         if (runs.empty()) return;
         const auto largest = std::max_element(runs.begin(), runs.end(), [](const auto& a, const auto& b) { return a.second - a.first < b.second - b.first; });
         AgcDriver::GuestMemory::SetImageRange(static_cast<std::uintptr_t>(largest->first), static_cast<std::size_t>(largest->second - largest->first));
@@ -1408,6 +1750,10 @@ private:
     // Per flip, and at the loop's start: the CPU ns of queue 0's worker and of the committer (-1: unknown).
     std::vector<std::array<std::int64_t, 2>> flipCpu;
     std::array<std::int64_t, 2> cpuAtStart{-1, -1};
+    std::uint64_t drawPacketsAtStart = 0;
+    std::uint64_t drawsCommittedAtStart = 0;
+    std::uint64_t batchesAtStart = 0;
+    std::array<std::array<std::uint64_t, 2>, 2> allocsAtStart{};
 
     static std::array<std::int64_t, 2> DriverCpu() {
         return {AgcDriver::DriverThreadCpuNs(AgcDriver::DriverThread::Queue0Worker), AgcDriver::DriverThreadCpuNs(AgcDriver::DriverThread::Committer)};

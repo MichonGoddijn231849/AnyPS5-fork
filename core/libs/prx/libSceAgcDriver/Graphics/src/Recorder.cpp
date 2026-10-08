@@ -1,7 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DriverThreadClock.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NullSubmit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
@@ -2852,13 +2854,73 @@ bool Recorder::writtenBackSince(std::uint64_t sequence, std::uint64_t begin, std
     return false;
 }
 
+namespace {
+
+// APS5_TRACE_SUBMITS=1 (docs/dev/NIGHT_SHIFT.md B2): where the batches end. Every Submit of an open
+// batch is counted by (queue, packet, callers above Submit), with the dispatches the batch held, and
+// the [submits] line every 10 s gives the sites by count (offsets as in the [hooksync] lines).
+bool SubmitsTraced() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_TRACE_SUBMITS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+struct SubmitSiteTotals {
+    std::uint64_t count = 0;
+    std::uint64_t work = 0;
+};
+
+struct SubmitSiteStats {
+    std::map<HookSyncKey, SubmitSiteTotals> byKey;
+    std::uint64_t count = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+// Under the GpuMutex (Submit's caller holds it).
+[[gnu::noinline]] void CountSubmitSite(std::uint64_t work) {
+    static SubmitSiteStats stats;
+    const auto packet = GuestMemory::CurrentPacket();
+    HookSyncKey key{packet.queue, packet.opcode, GuestMemory::ReadSite::Store, {}};
+    // Frame 0 is Submit itself; its callers follow.
+    GuestMemory::CaptureCallerOffsets(key.frames, 1);
+    auto& totals = stats.byKey[key];
+    ++totals.count;
+    totals.work += work;
+    ++stats.count;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - stats.lastReport < std::chrono::seconds(10)) return;
+    stats.lastReport = now;
+    std::vector<std::pair<const HookSyncKey*, const SubmitSiteTotals*>> hot;
+    for (const auto& [site, siteTotals] : stats.byKey) hot.emplace_back(&site, &siteTotals);
+    std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second->count > b.second->count; });
+    char text[320];
+    std::snprintf(text, sizeof(text), "[submits] %llu batches submitted (10 s), by queue packet callers (count, dispatches per batch):", static_cast<unsigned long long>(stats.count));
+    std::string report = text;
+    for (std::size_t i = 0; i < hot.size() && i < 16; ++i) {
+        const auto& site = *hot[i].first;
+        const auto& siteTotals = *hot[i].second;
+        std::snprintf(text, sizeof(text), " [0x%x %s +0x%llx/+0x%llx/+0x%llx/+0x%llx/+0x%llx/+0x%llx: %llu, %.1f]", site.queue, PacketName(site.opcode).c_str(), site.frames[0], site.frames[1], site.frames[2], site.frames[3], site.frames[4], site.frames[5], static_cast<unsigned long long>(siteTotals.count), static_cast<double>(siteTotals.work) / static_cast<double>(siteTotals.count));
+        report += text;
+    }
+    std::fprintf(stderr, "%s\n", report.c_str());
+    stats.byKey.clear();
+    stats.count = 0;
+}
+
+}
+
 void Recorder::Submit() {
+    const std::uint64_t work = SubmitsTraced() && open != nullptr && activeRecorder == this ? workSinceSubmit.load(std::memory_order_relaxed) : 0;
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
     // count behind, and the callers that act on it would otherwise take the mutex for nothing at
     // every packet or submission end until a real batch is next submitted.
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     if (open == nullptr) return;
+    CountDriverBatchSubmitted();
+    if (SubmitsTraced()) CountSubmitSite(work);
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
@@ -2896,7 +2958,8 @@ void Recorder::Submit() {
         submission.pSignalSemaphores = &timeline;
     }
     const auto submitStart = std::chrono::steady_clock::now();
-    Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    if (BatchSubmits()) EnqueueSubmit(context, function(queueSubmit, "vkQueueSubmit"), QueuedSubmit{batch->commands, timeline, serial, batch->fence});
+    else Check(QueueSubmit(context, context.queue, function(queueSubmit, "vkQueueSubmit"), 1, &submission, batch->fence), "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
@@ -3334,6 +3397,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
                     std::fprintf(stderr, "[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls, %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
                     std::fprintf(stderr, "[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
                     std::fprintf(stderr, "[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
+                    if (BatchSubmits()) {
+                        const auto thread = TakeSubmitThreadCounts();
+                        std::fprintf(stderr, "[recorder] submit thread: %llu batches submitted, vkQueueSubmit mean %.1f us (the line above is the committer's enqueue)\n", static_cast<unsigned long long>(thread.submits), thread.submits != 0 ? thread.submitUs / static_cast<double>(thread.submits) : 0.0);
+                    }
                     const auto reads = Recorder::ReadCounts();
                     std::fprintf(stderr, "[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.staleIgnored));
                 }
@@ -3347,6 +3414,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
+            const auto queueLock = AcquireQueue();
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
@@ -3457,6 +3525,24 @@ void Recorder::release(Batch& batch) noexcept {
     if (batch.fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, batch.fence, nullptr);
     batch.commands = VK_NULL_HANDLE;
     batch.fence = VK_NULL_HANDLE;
+}
+
+}
+
+namespace AgcDriver {
+
+namespace {
+
+std::atomic<std::uint64_t> batchesSubmitted{0};
+
+}
+
+std::uint64_t DriverBatchesSubmitted() noexcept {
+    return batchesSubmitted.load(std::memory_order_relaxed);
+}
+
+void CountDriverBatchSubmitted() noexcept {
+    batchesSubmitted.fetch_add(1, std::memory_order_relaxed);
 }
 
 }

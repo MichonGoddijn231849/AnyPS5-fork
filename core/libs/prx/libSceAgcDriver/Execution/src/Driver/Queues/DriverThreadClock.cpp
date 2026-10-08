@@ -55,9 +55,20 @@ double NsPerCycle() {
 
 }
 
+namespace {
+
+thread_local int currentRole = -1;
+
+}
+
+int CurrentDriverThreadRole() noexcept {
+    return currentRole;
+}
+
 void RegisterDriverThread(DriverThread role) noexcept {
     const auto index = static_cast<std::size_t>(role);
     if (index >= static_cast<std::size_t>(DriverThread::Count)) return;
+    currentRole = static_cast<int>(index);
     auto& registered = Threads();
 #ifdef _WIN32
     HANDLE thread = nullptr;
@@ -91,6 +102,29 @@ std::int64_t DriverThreadCpuNs(DriverThread role) noexcept {
     if (clock_gettime(registered.clocks[index], &now) != 0) return -1;
     return static_cast<std::int64_t>(now.tv_sec) * 1000000000 + now.tv_nsec;
 #endif
+}
+
+namespace {
+
+std::atomic<std::uint64_t> drawPackets{0};
+std::atomic<std::uint64_t> drawsCommitted{0};
+
+}
+
+std::uint64_t DriverDrawPackets() noexcept {
+    return drawPackets.load(std::memory_order_relaxed);
+}
+
+std::uint64_t DriverDrawsCommitted() noexcept {
+    return drawsCommitted.load(std::memory_order_relaxed);
+}
+
+void CountDriverDrawPacket() noexcept {
+    drawPackets.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountDriverDrawCommitted() noexcept {
+    drawsCommitted.fetch_add(1, std::memory_order_relaxed);
 }
 
 }

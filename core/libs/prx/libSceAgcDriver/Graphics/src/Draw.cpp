@@ -105,9 +105,32 @@ void storeClearTexels(const Context& context, const ColorTarget& color, const st
     MarkDccUncompressed(context, color.dccAddress, color.bytes);
 }
 
+// APS5_TARGET_KEY_PROOF=1: the per-draw check of the render target's DCC keys keeps a proof per key range
+// (ProvedCurrentDccKeys), so the keys (132 KiB for a 4K RGBA8 target) are scanned once per change, not on every draw.
+bool TargetKeyProof() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_TARGET_KEY_PROOF");
+        return value == nullptr || (value[0] != '\0' && value[0] != '0');
+    }();
+    return enabled;
+}
+
+DccKeys targetDccKeys(const ColorTarget& color) {
+    if (!TargetKeyProof()) return CurrentDccKeys(color.dccAddress, color.bytes);
+    // The committer's alone (the draw path holds the GPU lock); a few dozen targets live at a time.
+    thread_local std::unordered_map<std::uint64_t, std::pair<std::uint64_t, DccKeyProof>> proofs;
+    if (proofs.size() > 1024) proofs.clear();
+    auto& [bytes, proof] = proofs[color.dccAddress];
+    if (bytes != color.bytes) {
+        bytes = color.bytes;
+        proof = {};
+    }
+    return ProvedCurrentDccKeys(color.dccAddress, color.bytes, proof);
+}
+
 void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident) {
     if (color.dccAddress == 0 || resident.Descriptor().dccAddress != color.dccAddress) return;
-    if (CurrentDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
+    if (targetDccKeys(color) != DccKeys::ClearRegister) return;
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
     const char* refusal = nullptr;
     bool cleared = clearToTexel(resident, texel, color.elementBytes, refusal);
@@ -574,9 +597,11 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     append64(reinterpret_cast<std::uint64_t>(context.device));
     key.push_back(static_cast<std::uint32_t>(shaders.size()));
     for (const auto& shader : shaders) {
-        const auto part = ShaderResources::ContentKey(shader, true, MovableBuffers(), ShaderResources::MovableImages());
-        key.push_back(static_cast<std::uint32_t>(part.size()));
-        key.insert(key.end(), part.begin(), part.end());
+        // The stage's words in place, after their count (patched once they are in).
+        const auto countAt = key.size();
+        key.push_back(0u);
+        ShaderResources::AppendContentKey(key, shader, true, MovableBuffers(), ShaderResources::MovableImages());
+        key[countAt] = static_cast<std::uint32_t>(key.size() - countAt - 1u);
     }
     if (ranges) {
         append64(target.address);

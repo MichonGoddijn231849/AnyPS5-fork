@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NullSubmit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -57,7 +58,8 @@ public:
         constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         VkImageFormatProperties supported{};
         Check(context.imageFormatProperties(context.physical, target.format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0, &supported), "vkGetPhysicalDeviceImageFormatProperties multisampled target");
-        Require((supported.sampleCounts & samples) != 0 && target.extent.width <= supported.maxExtent.width && target.extent.height <= supported.maxExtent.height, "multisampled render target exceeds device image limits");
+        // APS5_NULL_SUBMIT: nothing renders into the target; NullDeviceProc makes a count lavapipe lacks at 4 samples.
+        Require(((supported.sampleCounts & samples) != 0 || NullSubmit()) && target.extent.width <= supported.maxExtent.width && target.extent.height <= supported.maxExtent.height, "multisampled render target exceeds device image limits");
         try {
             VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
             info.imageType = VK_IMAGE_TYPE_2D;

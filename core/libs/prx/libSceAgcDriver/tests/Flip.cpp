@@ -17,6 +17,9 @@
 
 namespace {
 
+// How long the test waits for a step that must happen before it calls the driver hung.
+constexpr std::chrono::seconds HangTimeout{30};
+
 void check(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(reason);
 }
@@ -124,11 +127,12 @@ void testFlipAndBoundary() {
     submitFlip();
     {
         std::unique_lock lock(output->state->mutex);
-        check(output->state->changed.wait_for(lock, std::chrono::seconds(5), [&] { return output->state->entered; }), "worker did not reach flip");
+        // A hang check, not a latency check: generous, so a loaded machine (ctest -j) does not fail it.
+        check(output->state->changed.wait_for(lock, HangTimeout, [&] { return output->state->entered; }), "worker did not reach flip");
         check(output->state->last.argument == -0x123456789abcdefLL && output->state->last.index == -2, "decoded flip arguments changed");
     }
     boundary = std::async(std::launch::async, [] { AgcDriverSuspendPoint_nid_postfix(); });
-    check(boundary.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "suspend blocked on preceding work");
+    check(boundary.wait_for(HangTimeout) == std::future_status::ready, "suspend blocked on preceding work");
     boundary.get();
     check(output->state->ready == 0, "blocked flip completed before release");
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);

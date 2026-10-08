@@ -7,6 +7,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -64,9 +67,10 @@ void DrawPipeline::push(Item item, std::unique_lock<std::mutex>& lock) {
     rethrowFailure();
     if (items.size() >= Depth()) {
         const auto start = std::chrono::steady_clock::now();
-        ++idleWaiters;
+        auto& waiters = RoomHysteresis() ? roomWaiters : idleWaiters;
+        ++waiters;
         idle.wait(lock, [&] { return items.size() < Depth(); });
-        --idleWaiters;
+        --waiters;
         fullWaitNs += elapsedNs(start);
         rethrowFailure();
     }
@@ -82,14 +86,43 @@ void DrawPipeline::push(Item item, std::unique_lock<std::mutex>& lock) {
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
 }
 
+bool DrawPipeline::RoomHysteresis() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_PIPELINE_HYSTERESIS");
+        return value == nullptr || (value[0] != '\0' && value[0] != '0');
+    }();
+    return enabled;
+}
+
+std::uint32_t DrawPipeline::CommitterSpinUs() {
+    static const std::uint32_t spin = [] {
+        const char* value = std::getenv("APS5_COMMITTER_SPIN_US");
+        return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10)) : 50u;
+    }();
+    return spin;
+}
+
+bool DrawPipeline::RetireOnWorker() {
+    static const bool retire = [] {
+        const char* value = std::getenv("APS5_RETIRE_ON_WORKER");
+        return value == nullptr || (value[0] != '\0' && value[0] != '0');
+    }();
+    return retire;
+}
+
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
+    // Declared before the lock: the commits retired by the committer are freed after it is released.
+    std::vector<Commit> freed;
     std::unique_lock lock(mutex);
     push({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), 0, nullptr}, lock);
+    freed.swap(retired);
 }
 
 std::uint64_t DrawPipeline::EnqueuePending(std::shared_ptr<PendingDraw> pending) {
+    std::vector<Commit> freed;
     std::unique_lock lock(mutex);
     push({Commit{}, {}, 0, {}, 0, std::move(pending)}, lock);
+    freed.swap(retired);
     return items.back().seq;
 }
 
@@ -169,6 +202,14 @@ void DrawPipeline::run() {
     RegisterDriverThread(DriverThread::Committer);
     for (;;) {
         Commit* commit = nullptr;
+        if (const auto spin = CommitterSpinUs(); spin != 0 && outstanding.load(std::memory_order_acquire) == 0) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(spin);
+            while (outstanding.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < until) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#endif
+            }
+        }
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
@@ -189,18 +230,29 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        // With APS5_RETIRE_ON_WORKER, the item leaves the queue under the lock and is freed after it: its commit goes
+        // to `retired` (the worker frees it at its next Enqueue), the rest here. A full `retired` (no Enqueue for a
+        // while) frees here too.
+        constexpr std::size_t RetiredLimit = 1024;
+        Item done;
         std::lock_guard lock(mutex);
+        if (RetireOnWorker()) {
+            done = std::move(items.front());
+            auto& finished = done.pending != nullptr ? done.pending->commit : done.commit;
+            if (retired.size() < RetiredLimit) retired.push_back(std::move(finished));
+        }
         items.pop_front();
         ++commits;
         commitNs += spent;
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0) idle.notify_all();
+        if (idleWaiters != 0 || (roomWaiters != 0 && items.size() <= Depth() / 2)) idle.notify_all();
     }
 }
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
+    drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
     if (!Busy()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
@@ -213,6 +265,10 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
     drainWaitNs[index] += elapsedNs(start);
     rethrowFailure();
+}
+
+std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
+    return Queue0().drainRequests[std::min<std::uint32_t>(opcode, 0x100)].load(std::memory_order_relaxed);
 }
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {

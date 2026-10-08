@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NullSubmit.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -189,9 +190,13 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
         failure = result;
         return step;
     };
+    // APS5_NULL_SUBMIT: no GPU access reaches the import, only its addresses (BDA tables, recorded copies), so a range
+    // past what lavapipe allocates (2 GiB) imports its first GiB; the addresses past it are never dereferenced.
+    constexpr std::uint64_t NullImportBytes = (2ull << 30u) - (64ull << 10u);
+    const auto importBytes = NullSubmit() ? std::min<std::uint64_t>(bytes, NullImportBytes) : bytes;
     const VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
-    info.size = bytes;
+    info.size = importBytes;
     // INDIRECT_BUFFER: DISPATCH_INDIRECT group counts are read in place (VulkanDevice::DispatchIndirect).
     info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -205,7 +210,7 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
     const VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host};
     const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
-    allocation.allocationSize = bytes;
+    allocation.allocationSize = importBytes;
     allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(types));
     if (const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &entry.memory); result != VK_SUCCESS) return failed("vkAllocateMemory", result);
     if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, entry.buffer, entry.memory, 0); result != VK_SUCCESS) return failed("vkBindBufferMemory", result);
@@ -1176,8 +1181,11 @@ ImportProbe ProbeImportWriteProtection(const Context& context) {
         if (!collect(probe.writtenAfterSubmit)) return "the collect after the submission";
         return nullptr;
     };
-    probe.failure = run();
-    if (submitted) context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+    {
+        const auto queueLock = AcquireQueue();
+        probe.failure = run();
+        if (submitted) context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+    }
     if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     if (commands != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
     if (destination != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, destination, nullptr);
@@ -2742,16 +2750,28 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
-    if (!uploaded || committed) return result;
+    InPlaceReads(result);
+    return result;
+}
+
+void GuestBufferMemory::InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& into) const {
+    into.clear();
+    if (!uploaded || committed) return;
     if (space != nullptr) {
         for (const auto& region : space->base) {
-            if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
+            if (region.direct != nullptr) into.emplace_back(region.begin, region.end);
         }
     }
     for (const auto& region : regions) {
-        if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
+        if (region.direct != nullptr) into.emplace_back(region.begin, region.end);
     }
-    return result;
+}
+
+bool GuestBufferMemory::InPlaceReadOverlaps(std::uint64_t address, std::size_t bytes) const {
+    if (!uploaded || committed) return false;
+    const auto overlaps = [&](const Region& region) { return region.direct != nullptr && address < region.end && region.begin < address + bytes; };
+    if (space != nullptr && std::any_of(space->base.begin(), space->base.end(), overlaps)) return true;
+    return std::any_of(regions.begin(), regions.end(), overlaps);
 }
 
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {

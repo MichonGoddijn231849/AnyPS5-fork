@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NullSubmit.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 
 namespace AgcDriver::Graphics {
@@ -9,6 +10,9 @@ void TextureDetiler::BeginBatch() {
     // Sets of recorded work that has not completed stay allocated; the pools are recycled once the
     // recorder is idle again.
     if (const auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) return;
+    // APS5_NULL_SUBMIT: every dispatch writes the one set allocateSet keeps (nothing executes the work), so there is
+    // nothing to recycle.
+    if (NullSubmit()) return;
     for (const auto pool : descriptorPools) {
         Check(context.Function<PFN_vkResetDescriptorPool>("vkResetDescriptorPool")(context.device, pool, 0), "vkResetDescriptorPool texture detiler");
     }
@@ -16,6 +20,10 @@ void TextureDetiler::BeginBatch() {
 }
 
 VkDescriptorSet TextureDetiler::allocateSet() {
+    // APS5_NULL_SUBMIT: one set serves every dispatch (rewritten each time; the recorded work never runs). lavapipe
+    // backs each descriptor set with a mapping of its own, so a set per dispatch filled the process with mappings
+    // (134k in 40 s of the GTA replay) and made every mapping walk crawl, which a real device does not do.
+    if (NullSubmit() && allocatedSets != 0) return firstSet;
     constexpr std::uint32_t setsPerPool = 64;
     const auto poolIndex = allocatedSets / setsPerPool;
     if (poolIndex == descriptorPools.size()) {
@@ -35,6 +43,7 @@ VkDescriptorSet TextureDetiler::allocateSet() {
     allocation.pSetLayouts = &descriptorLayout;
     VkDescriptorSet set = VK_NULL_HANDLE;
     Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocation, &set), "vkAllocateDescriptorSets texture detiler");
+    if (allocatedSets == 0) firstSet = set;
     ++allocatedSets;
     return set;
 }

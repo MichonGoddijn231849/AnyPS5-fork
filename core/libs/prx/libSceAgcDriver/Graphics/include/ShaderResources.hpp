@@ -141,7 +141,9 @@ public:
         std::size_t allocation;
         std::uint64_t address;
         std::size_t size;
-        std::vector<std::uint32_t> words;
+        // A data binding's new words: a view of the draw's compiled program (CompiledShader::program, held for the
+        // whole draw), not a copy, since the moved list lives only for that draw.
+        std::span<const std::uint32_t> words;
     };
     // A sampled image element of a template hit whose T# names another texture than the build's
     // (APS5_MOVED_IMAGES: the content key leaves texture base addresses out): the draw's own texture,
@@ -200,6 +202,8 @@ public:
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
     static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false, bool movableImages = false);
+    // ContentKey's words appended to `key` (the per-draw key without a vector per stage).
+    static void AppendContentKey(std::vector<std::uint32_t>& key, const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false, bool movableImages = false);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
     // buffer already holding the words is left alone). Returns whether anything was recorded. With

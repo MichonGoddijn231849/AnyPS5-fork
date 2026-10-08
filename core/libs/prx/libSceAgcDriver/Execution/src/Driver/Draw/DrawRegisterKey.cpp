@@ -1,8 +1,20 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 namespace AgcDriver::DriverDetail {
+
+// APS5_DRAW_KEY_MEMO skips the context ranges as a prefix of the table.
+static_assert([] {
+    bool other = false;
+    for (const auto& range : Graphics::DrawKeyRegisters) {
+        if (range.bank != Graphics::RegisterBank::Context) other = true;
+        else if (other) return false;
+    }
+    return true;
+}(), "DrawKeyRegisters lists the context ranges first");
 
 std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
@@ -32,7 +44,39 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         return offset == 0x082u || offset == 0x083u || offset == 0x102u || offset == 0x103u ? 1 : 0;
     };
     mix(deviceSerial);
-    for (const auto& range : Graphics::DrawKeyRegisters) {
+    // APS5_DRAW_KEY_MEMO=1: the context ranges come first in DrawKeyRegisters (bank order) and are most of it, so the
+    // hash state after them is kept per thread with the context bank's version; an unchanged context bank skips
+    // them. "verify" also hashes them and aborts on a difference.
+    static const char* memoSetting = std::getenv("APS5_DRAW_KEY_MEMO");
+    static const bool memo = memoSetting == nullptr || (memoSetting[0] != '\0' && memoSetting[0] != '0');
+    static const bool verify = memo && std::strcmp(memoSetting, "verify") == 0;
+    struct ContextMemo {
+        const Registers* bank = nullptr;
+        std::uint64_t version = 0;
+        std::uint64_t deviceSerial = 0;
+        std::uint64_t key = 0;
+        std::uint64_t shapeKey = 0;
+    };
+    thread_local ContextMemo contextMemo;
+    std::size_t firstRange = 0;
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> remembered;
+    if (memo && contextMemo.bank == &queue.context && contextMemo.version == queue.context.Version() && contextMemo.deviceSerial == deviceSerial) {
+        remembered.emplace(contextMemo.key, contextMemo.shapeKey);
+        if (!verify) {
+            key = contextMemo.key;
+            shapeKey = contextMemo.shapeKey;
+            while (firstRange < Graphics::DrawKeyRegisters.size() && Graphics::DrawKeyRegisters[firstRange].bank == Graphics::RegisterBank::Context) ++firstRange;
+        }
+    }
+    for (std::size_t index = firstRange; index < Graphics::DrawKeyRegisters.size(); ++index) {
+        const auto& range = Graphics::DrawKeyRegisters[index];
+        if (memo && firstRange == 0 && range.bank != Graphics::RegisterBank::Context && (index == 0 || Graphics::DrawKeyRegisters[index - 1].bank == Graphics::RegisterBank::Context)) {
+            if (remembered && (remembered->first != key || remembered->second != shapeKey)) {
+                std::fprintf(stderr, "[draw key] APS5_DRAW_KEY_MEMO verify: the context bank's hash changed at an unchanged version\n");
+                std::abort();
+            }
+            contextMemo = {&queue.context, queue.context.Version(), deviceSerial, key, shapeKey};
+        }
         const auto& bank = range.bank == Graphics::RegisterBank::Context ? queue.context : range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
         mix((static_cast<std::uint64_t>(range.bank) << 32u) | range.first);
         const auto end = range.first + range.count;

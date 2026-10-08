@@ -4,15 +4,280 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NullSubmit.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <exception>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
+
+bool NullSubmit() {
+    static const bool null = std::getenv("APS5_NULL_SUBMIT") != nullptr;
+    return null;
+}
+
+namespace {
+
+// The stub pipeline: `void main() {}` for GLCompute, local size 1.
+constexpr std::array<std::uint32_t, 35> NullPipelineCode{
+    0x07230203u, 0x00010300u, 0x00070000u, 0x00000005u, 0x00000000u, 0x00020011u, 0x00000001u, 0x0003000eu, 0x00000000u,
+    0x00000001u, 0x0005000fu, 0x00000005u, 0x00000001u, 0x6e69616du, 0x00000000u, 0x00060010u, 0x00000001u, 0x00000011u,
+    0x00000001u, 0x00000001u, 0x00000001u, 0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00050036u,
+    0x00000002u, 0x00000001u, 0x00000000u, 0x00000003u, 0x000200f8u, 0x00000004u, 0x000100fdu, 0x00010038u,
+};
+
+struct NullPipelineObjects {
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+std::mutex& nullPipelineMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::unordered_map<VkDevice, NullPipelineObjects>& nullPipelines() {
+    static std::unordered_map<VkDevice, NullPipelineObjects> pipelines;
+    return pipelines;
+}
+
+}
+
+VkPipeline NullPipeline(const Context& context) {
+    std::lock_guard lock(nullPipelineMutex());
+    auto& objects = nullPipelines()[context.device];
+    if (objects.pipeline != VK_NULL_HANDLE) return objects.pipeline;
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = NullPipelineCode.size() * sizeof(std::uint32_t);
+    moduleInfo.pCode = NullPipelineCode.data();
+    VkShaderModule module = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule null pipeline");
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &objects.layout), "vkCreatePipelineLayout null pipeline");
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineInfo.stage.module = module;
+    pipelineInfo.stage.pName = "main";
+    pipelineInfo.layout = objects.layout;
+    const auto result = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &objects.pipeline);
+    context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+    Check(result, "vkCreateComputePipelines null pipeline");
+    return objects.pipeline;
+}
+
+void ReleaseNullPipeline(const Context& context) {
+    std::lock_guard lock(nullPipelineMutex());
+    const auto found = nullPipelines().find(context.device);
+    if (found == nullPipelines().end()) return;
+    if (found->second.pipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, found->second.pipeline, nullptr);
+    if (found->second.layout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, found->second.layout, nullptr);
+    nullPipelines().erase(found);
+}
+
+namespace {
+
+std::atomic<PFN_vkGetDeviceProcAddr> realDeviceProc{nullptr};
+std::atomic<PFN_vkCreateImage> realCreateImage{nullptr};
+std::atomic<PFN_vkQueueSubmit> realQueueSubmit{nullptr};
+
+VKAPI_ATTR VkResult VKAPI_CALL nullCreateImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* allocator, VkImage* image) {
+    auto patched = *info;
+    if (patched.samples == VK_SAMPLE_COUNT_2_BIT || patched.samples == VK_SAMPLE_COUNT_8_BIT || patched.samples == VK_SAMPLE_COUNT_16_BIT) patched.samples = VK_SAMPLE_COUNT_4_BIT;
+    return realCreateImage.load(std::memory_order_relaxed)(device, &patched, allocator, image);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL nullQueueSubmit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    std::vector<VkSubmitInfo> empty(submits, submits + count);
+    for (auto& info : empty) {
+        info.commandBufferCount = 0;
+        info.pCommandBuffers = nullptr;
+    }
+    return realQueueSubmit.load(std::memory_order_relaxed)(queue, count, empty.data(), fence);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL nullDeviceProc(VkDevice device, const char* name) {
+    const auto real = realDeviceProc.load(std::memory_order_relaxed);
+    const auto function = real(device, name);
+    if (function == nullptr) return function;
+    if (std::strcmp(name, "vkCreateImage") == 0) {
+        realCreateImage.store(reinterpret_cast<PFN_vkCreateImage>(function), std::memory_order_relaxed);
+        return reinterpret_cast<PFN_vkVoidFunction>(&nullCreateImage);
+    }
+    if (std::strcmp(name, "vkQueueSubmit") == 0) {
+        realQueueSubmit.store(reinterpret_cast<PFN_vkQueueSubmit>(function), std::memory_order_relaxed);
+        return reinterpret_cast<PFN_vkVoidFunction>(&nullQueueSubmit);
+    }
+    return function;
+}
+
+}
+
+PFN_vkGetDeviceProcAddr NullDeviceProc(PFN_vkGetDeviceProcAddr real) {
+    PFN_vkGetDeviceProcAddr expected = nullptr;
+    realDeviceProc.compare_exchange_strong(expected, real, std::memory_order_relaxed);
+    return &nullDeviceProc;
+}
+
+bool BatchSubmits() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_BATCH_SUBMITS");
+        return value == nullptr || (value[0] != '\0' && value[0] != '0');
+    }();
+    return enabled;
+}
+
+namespace {
+
+VkResult SubmitToQueue(VkQueue queue, PFN_vkQueueSubmit submit, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    if (!NullSubmit()) return submit(queue, count, submits, fence);
+    // The same submissions with their waits and signals, without the command buffers.
+    std::vector<VkSubmitInfo> empty(submits, submits + count);
+    for (auto& info : empty) {
+        info.commandBufferCount = 0;
+        info.pCommandBuffers = nullptr;
+    }
+    return submit(queue, count, empty.data(), fence);
+}
+
+// The submit thread (BatchSubmits): a FIFO of recorded batches, submitted in order. `queueMutex` is held for each
+// vkQueueSubmit the thread makes and by AcquireQueue's callers; `mutex` guards the FIFO and the counts.
+class SubmitThread {
+public:
+    // Never destroyed: a static's destructor would join the worker during DLL detach at process exit, after Windows
+    // ended the thread, and the winpthreads join then waits forever (every test exited only after a ctest timeout).
+    static SubmitThread& Get() {
+        static auto* thread = new SubmitThread();
+        return *thread;
+    }
+
+    void Enqueue(const Context& context, PFN_vkQueueSubmit submit, const QueuedSubmit& work) {
+        {
+            std::lock_guard lock(mutex);
+            rethrowFailure();
+            if (!worker.joinable()) worker = std::thread([this] { run(); });
+            fifo.push_back(Item{context.queue, submit, work});
+            ++enqueued;
+        }
+        wake.notify_one();
+    }
+
+    std::unique_lock<std::mutex> Acquire() {
+        {
+            std::unique_lock lock(mutex);
+            const auto target = enqueued;
+            drained.wait(lock, [&] { return submitted >= target; });
+            rethrowFailure();
+        }
+        return std::unique_lock(queueMutex);
+    }
+
+    SubmitThreadCounts TakeCounts() {
+        std::lock_guard lock(mutex);
+        return std::exchange(counts, SubmitThreadCounts{});
+    }
+
+private:
+    struct Item {
+        VkQueue queue;
+        PFN_vkQueueSubmit submit;
+        QueuedSubmit work;
+    };
+
+    ~SubmitThread() {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        wake.notify_one();
+        if (worker.joinable()) worker.join();
+    }
+
+    void rethrowFailure() {
+        if (failure == VK_SUCCESS) return;
+        Check(std::exchange(failure, VK_SUCCESS), "vkQueueSubmit recorder (submit thread)");
+    }
+
+    void run() {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            wake.wait(lock, [&] { return stopping || !fifo.empty(); });
+            if (fifo.empty()) return;
+            const auto item = fifo.front();
+            fifo.pop_front();
+            lock.unlock();
+            VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submission.commandBufferCount = 1;
+            submission.pCommandBuffers = &item.work.commands;
+            VkTimelineSemaphoreSubmitInfoKHR timelineInfo{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+            timelineInfo.signalSemaphoreValueCount = 1;
+            timelineInfo.pSignalSemaphoreValues = &item.work.value;
+            if (item.work.timeline != VK_NULL_HANDLE) {
+                submission.pNext = &timelineInfo;
+                submission.signalSemaphoreCount = 1;
+                submission.pSignalSemaphores = &item.work.timeline;
+            }
+            const auto start = std::chrono::steady_clock::now();
+            VkResult result;
+            {
+                std::lock_guard queueLock(queueMutex);
+                result = SubmitToQueue(item.queue, item.submit, 1, &submission, item.work.fence);
+            }
+            const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+            lock.lock();
+            if (result != VK_SUCCESS && failure == VK_SUCCESS) failure = result;
+            ++submitted;
+            ++counts.submits;
+            counts.submitUs += us;
+            drained.notify_all();
+        }
+    }
+
+    std::mutex mutex;
+    std::mutex queueMutex;
+    std::condition_variable wake;
+    std::condition_variable drained;
+    std::deque<Item> fifo;
+    std::uint64_t enqueued = 0;
+    std::uint64_t submitted = 0;
+    VkResult failure = VK_SUCCESS;
+    SubmitThreadCounts counts;
+    bool stopping = false;
+    std::thread worker;
+};
+
+}
+
+void EnqueueSubmit(const Context& context, PFN_vkQueueSubmit submit, const QueuedSubmit& work) {
+    SubmitThread::Get().Enqueue(context, submit, work);
+}
+
+std::unique_lock<std::mutex> AcquireQueue() {
+    if (!BatchSubmits()) return {};
+    return SubmitThread::Get().Acquire();
+}
+
+SubmitThreadCounts TakeSubmitThreadCounts() {
+    if (!BatchSubmits()) return {};
+    return SubmitThread::Get().TakeCounts();
+}
+
+VkResult QueueSubmit(const Context&, VkQueue queue, PFN_vkQueueSubmit submit, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    const auto queueLock = AcquireQueue();
+    return SubmitToQueue(queue, submit, count, submits, fence);
+}
 
 namespace {
 
@@ -370,7 +635,10 @@ CommandBatch::~CommandBatch() {
 void CommandBatch::release() noexcept {
     if (pending) {
         auto result = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, fence);
-        if (result == VK_NOT_READY) result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+        if (result == VK_NOT_READY) {
+            const auto queueLock = AcquireQueue();
+            result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+        }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) std::terminate();
     }
     if (commands) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
@@ -394,7 +662,7 @@ void CommandBatch::Submit() {
     submission.commandBufferCount = 1;
     submission.pCommandBuffers = &commands;
     timing.Mark("command_end");
-    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    Check(QueueSubmit(context, context.queue, context.Function<PFN_vkQueueSubmit>("vkQueueSubmit"), 1, &submission, fence), "vkQueueSubmit graphics");
     timing.Mark("queue_submit");
     pending = true;
     submitted = true;

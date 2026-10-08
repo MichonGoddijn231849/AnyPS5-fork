@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NullSubmit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -173,7 +174,11 @@ public:
 
     ~Device() { release(); }
     const Context& GetContext() const { return context; }
-    void WaitQueue() const { Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle"); }
+    void WaitQueue() const {
+        // Under APS5_BATCH_SUBMITS the submit thread hands over what Submit enqueued first.
+        const auto queueLock = AcquireQueue();
+        Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle");
+    }
 
 private:
     template<typename TFunction>
@@ -495,6 +500,45 @@ void unchangedSinceTests() {
     CollectWritesUncached(address, 4);
     Require(!UnchangedSinceCollected(address, 4, generation3), "(6) a CPU write collected by another caller is not seen");
     ReleaseWatched(block, bytes);
+}
+
+// (9b) ProvedCurrentDccKeys (APS5_TARGET_KEY_PROOF's per-draw target check): the same rules as ProvedClearKeys, on
+// the keys of a range rather than a texture: scanned once, proved after, scanned again after a stamp or a CPU write.
+void currentKeyProofTests() {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t bytes = 65536;
+    void* block = AllocateWatched(bytes, bytes);
+    if (block == nullptr) {
+        std::cout << "no write watching: current key proofs not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    constexpr std::size_t keyCount = 1024;
+    constexpr std::uint64_t surfaceBytes = keyCount * 256;
+    auto* keys = static_cast<std::uint8_t*>(block);
+    std::memset(keys, 0x20, keyCount);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    DccKeyProof proof;
+    auto before = KeyProofCounts();
+    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::ClearRegister, "(9b) 0x20 keys are not a register clear");
+    auto after = KeyProofCounts();
+    Require(after.scanned == before.scanned + 1 && after.proved == before.proved, "(9b) the first call did not scan");
+    if (!KeyFastPath()) return;
+    Require(proof.generation != 0 && proof.keys == DccKeys::ClearRegister, "(9b) a stable scan left no proof");
+    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::ClearRegister, "(9b) the proof answers other keys");
+    before = KeyProofCounts();
+    Require(before.proved == after.proved + 1 && before.scanned == after.scanned, "(9b) the second call scanned");
+    const auto generation = proof.generation;
+    MarkWritten(address, keyCount);
+    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::ClearRegister, "(9b) unchanged bytes read differently");
+    after = KeyProofCounts();
+    Require(after.scanned == before.scanned + 1 && proof.generation > generation, "(9b) a stamped key range was proved");
+    std::memset(keys, 0xff, keyCount);
+    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::Uncompressed, "(9b) a CPU write of the keys was not seen");
+    Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::Uncompressed, "(9b) the new keys changed");
 }
 
 // (9) ProvedClearKeys: a surface's DCC keys are scanned once and answered from the proof after,
@@ -2927,6 +2971,7 @@ int main() {
         unchangedSinceTests();
         closeRaceTests(device, recorder);
         keyProofTests(device, recorder);
+        currentKeyProofTests();
         resourceReadTests(device, recorder);
         misalignedSnapshotTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);

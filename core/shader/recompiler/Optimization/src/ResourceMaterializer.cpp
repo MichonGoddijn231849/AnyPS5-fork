@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -555,6 +556,153 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     }
 }
 
+// APS5_SRT_EVAL_MEMO=1: memoizes the SRT evaluation of materializeSnapshot per thread, keyed by
+// the plan, the runtime user data, shader base and readers. Each entry records every word the
+// evaluation read (reader, address, success, value) in order; a hit re-reads them in the same
+// order through the current runtime's readers and is used only when every read returns the same
+// result, so the evaluation (a pure function of the key and those reads) would repeat exactly.
+// APS5_SRT_EVAL_MEMO=verify also evaluates fresh on every hit and aborts on any difference.
+enum class SrtEvalMemoMode { Off, On, Verify };
+
+SrtEvalMemoMode srtEvalMemoMode() {
+    static const SrtEvalMemoMode mode = [] {
+        const char* value = std::getenv("APS5_SRT_EVAL_MEMO");
+        if (value == nullptr || *value == '\0' || std::string_view(value) == "0") return SrtEvalMemoMode::Off;
+        if (std::string_view(value) == "verify") return SrtEvalMemoMode::Verify;
+        return SrtEvalMemoMode::On;
+    }();
+    return mode;
+}
+
+struct SrtEvalRead {
+    std::uint64_t address = 0;
+    std::uint32_t value = 0;
+    std::uint8_t reader = 0;
+    bool ok = false;
+};
+
+struct SrtEvalRecorder {
+    SrtMemoryReader readers[2] = {};
+    void* context = nullptr;
+    std::vector<SrtEvalRead>* reads = nullptr;
+};
+
+template<std::uint8_t Reader>
+bool srtEvalRecordingRead(void* user, std::uint64_t address, std::uint32_t* value) {
+    auto& recorder = *static_cast<SrtEvalRecorder*>(user);
+    const bool ok = recorder.readers[Reader](recorder.context, address, value);
+    recorder.reads->push_back({address, ok ? *value : 0u, Reader, ok});
+    return ok;
+}
+
+struct SrtEvalKey {
+    const IrResourcePlan* plan = nullptr;
+    std::uint64_t shaderBase = 0;
+    SrtMemoryReader readMemory = nullptr;
+    SrtMemoryReader readSpecializationMemory = nullptr;
+    std::size_t descriptorSources = 0;
+    std::size_t pureFlatSlots = 0;
+    std::vector<std::uint32_t> userData;
+    std::vector<std::uint32_t> sources;
+    std::vector<std::uint8_t> cleanFlatSlots;
+
+    bool operator==(const SrtEvalKey&) const = default;
+};
+
+struct SrtEvalKeyHash {
+    std::size_t operator()(const SrtEvalKey& key) const {
+        std::uint64_t hash = 1469598103934665603ull;
+        const auto mix = [&hash](std::uint64_t value) {
+            hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+        };
+        mix(reinterpret_cast<std::uintptr_t>(key.plan));
+        mix(key.shaderBase);
+        mix(reinterpret_cast<std::uintptr_t>(key.readMemory));
+        mix(reinterpret_cast<std::uintptr_t>(key.readSpecializationMemory));
+        mix(key.descriptorSources);
+        mix(key.pureFlatSlots);
+        for (const auto word : key.userData) mix(word);
+        mix(key.userData.size());
+        for (const auto source : key.sources) mix(source);
+        mix(key.sources.size());
+        for (const auto clean : key.cleanFlatSlots) mix(clean);
+        mix(key.cleanFlatSlots.size());
+        return static_cast<std::size_t>(hash);
+    }
+};
+
+struct SrtEvalEntry {
+    std::vector<SrtEvalRead> reads;
+    std::vector<DescriptorValue> values;
+    std::vector<std::uint32_t> flat;
+    std::vector<std::uint8_t> activeSources;
+};
+
+constexpr std::size_t SrtEvalMemoCapacity = 16384;
+
+bool srtEvalReadsUnchanged(const std::vector<SrtEvalRead>& reads, const SrtRuntime& runtime) {
+    const SrtMemoryReader readers[2] = {runtime.readMemory, runtime.readSpecializationMemory};
+    for (const auto& read : reads) {
+        std::uint32_t word = 0;
+        const bool ok = readers[read.reader](runtime.userContext, read.address, &word);
+        if (ok != read.ok || (ok && word != read.value)) return false;
+    }
+    return true;
+}
+
+void evaluateMaterializationSources(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, std::vector<DescriptorValue>& values, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) {
+    const auto mode = srtEvalMemoMode();
+    if (mode == SrtEvalMemoMode::Off || runtime.readTrace != nullptr || runtime.readMemory == nullptr || runtime.readSpecializationMemory == nullptr || !values.empty() || !flat.empty() || !activeSources.empty()) {
+        walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, flat, plan.cleanFlatSlots, activeSources);
+        return;
+    }
+    thread_local std::unordered_map<SrtEvalKey, SrtEvalEntry, SrtEvalKeyHash> memo;
+    SrtEvalKey key;
+    key.plan = &plan;
+    key.shaderBase = runtime.shaderBase;
+    key.readMemory = runtime.readMemory;
+    key.readSpecializationMemory = runtime.readSpecializationMemory;
+    key.descriptorSources = plan.descriptorSources.size();
+    key.pureFlatSlots = plan.pureFlatSlots.size();
+    key.userData.assign(runtime.userData.begin(), runtime.userData.end());
+    key.sources.assign(plan.materializationSources.begin(), plan.materializationSources.end());
+    key.cleanFlatSlots.assign(plan.cleanFlatSlots.begin(), plan.cleanFlatSlots.end());
+    if (const auto found = memo.find(key); found != memo.end() && srtEvalReadsUnchanged(found->second.reads, runtime)) {
+        const auto& entry = found->second;
+        if (mode == SrtEvalMemoMode::Verify) {
+            std::vector<DescriptorValue> freshValues;
+            std::vector<std::uint32_t> freshFlat;
+            std::vector<std::uint8_t> freshActive;
+            walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, freshValues, freshFlat, plan.cleanFlatSlots, freshActive);
+            if (freshValues != entry.values || freshFlat != entry.flat || freshActive != entry.activeSources) {
+                std::fprintf(stderr, "APS5_SRT_EVAL_MEMO=verify: memoized SRT evaluation differs from a fresh evaluation (plan %p, values %zu/%zu, flat %zu/%zu, active %zu/%zu, %zu recorded reads)\n", static_cast<const void*>(&plan), entry.values.size(), freshValues.size(), entry.flat.size(), freshFlat.size(), entry.activeSources.size(), freshActive.size(), entry.reads.size());
+                std::fflush(stderr);
+                std::abort();
+            }
+        }
+        values = entry.values;
+        flat = entry.flat;
+        activeSources = entry.activeSources;
+        return;
+    }
+    SrtEvalEntry entry;
+    SrtEvalRecorder recorder;
+    recorder.readers[0] = runtime.readMemory;
+    recorder.readers[1] = runtime.readSpecializationMemory;
+    recorder.context = runtime.userContext;
+    recorder.reads = &entry.reads;
+    SrtRuntime recording = runtime;
+    recording.userContext = &recorder;
+    recording.readMemory = &srtEvalRecordingRead<0>;
+    recording.readSpecializationMemory = &srtEvalRecordingRead<1>;
+    walker.EvaluateRuntimeSources(plan, plan.materializationSources, recording, values, flat, plan.cleanFlatSlots, activeSources);
+    entry.values = values;
+    entry.flat = flat;
+    entry.activeSources = activeSources;
+    if (memo.size() >= SrtEvalMemoCapacity && memo.find(key) == memo.end()) memo.clear();
+    memo.insert_or_assign(std::move(key), std::move(entry));
+}
+
 void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, ResourceSnapshot& snapshot, std::vector<TableResolution>& tables) {
     snapshot = ResourceSnapshot{};
     if (plan.uniformFill.fill.kind != UniformFillKind::None) {
@@ -580,7 +728,7 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
     std::vector<DescriptorValue> values;
     std::vector<std::uint8_t> activeSources;
     const auto evaluateStarted = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources);
+    evaluateMaterializationSources(plan, runtime, walker, values, snapshot.flattenedSrt, activeSources);
     if (MaterializeProfiled()) evaluateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - evaluateStarted).count()), std::memory_order_relaxed);
 
     std::size_t cursor = 0;

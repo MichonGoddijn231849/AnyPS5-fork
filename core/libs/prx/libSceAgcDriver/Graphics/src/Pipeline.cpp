@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NullSubmit.hpp"
 #include <cstring>
 #include <algorithm>
 #include <array>
@@ -242,8 +243,13 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         pipelineInfo.pDynamicState = &dynamic;
         pipelineInfo.layout = layout;
         pipelineInfo.renderPass = renderPass;
-        Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
-        LogPipelineStatistics_nid_no_patch(context, pipeline);
+        if (NullSubmit()) {
+            pipeline = NullPipeline(context);
+            stub = true;
+        } else {
+            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+            LogPipelineStatistics_nid_no_patch(context, pipeline);
+        }
     } catch (...) {
         release();
         throw;
@@ -256,7 +262,7 @@ Pipeline::~Pipeline() {
 
 void Pipeline::release() noexcept {
     framebuffers.clear();
-    if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+    if (pipeline && !stub) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
     if (renderPass) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, renderPass, nullptr);
     if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
     for (auto module : _modules) {

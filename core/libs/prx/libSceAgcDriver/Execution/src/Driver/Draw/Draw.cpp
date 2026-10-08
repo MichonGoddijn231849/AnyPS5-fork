@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/DriverThreadClock.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -216,6 +217,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
 DrawVerdict Driver::drawTail(DrawTail& t) {
     PerformanceTimer timing("Driver.DrawTail");
+    CountDriverDrawPacket();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& phaseMs = *t.phaseMs;
     auto& phaseLap = *t.phaseLap;
@@ -665,6 +667,7 @@ void Driver::runDrawTailOnHelper(DrawTail& tail, std::uint64_t seq, std::uint64_
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    CountDriverDrawCommitted();
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
     struct SubmitDue {
         Driver& driver;

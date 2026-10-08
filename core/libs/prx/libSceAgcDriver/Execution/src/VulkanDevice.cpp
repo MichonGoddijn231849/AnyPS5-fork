@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NullSubmit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
@@ -156,8 +157,10 @@ struct ComputePipelineObjects {
     VkShaderModule module = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    // APS5_NULL_SUBMIT: `pipeline` is the device's shared stub (Graphics::NullPipeline), not this variant's own.
+    bool stub = false;
     ~ComputePipelineObjects() {
-        if (pipeline != VK_NULL_HANDLE) destroyPipeline(device, pipeline, nullptr);
+        if (pipeline != VK_NULL_HANDLE && !stub) destroyPipeline(device, pipeline, nullptr);
         if (layout != VK_NULL_HANDLE) destroyLayout(device, layout, nullptr);
         if (module != VK_NULL_HANDLE) destroyModule(device, module, nullptr);
     }
@@ -490,6 +493,7 @@ struct VulkanDevice::State {
     ~State() {
         contextReady = false;
         if (device != VK_NULL_HANDLE) {
+            const auto queueLock = Graphics::AcquireQueue();
             const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             // Resident images kept for unfinished presentations go before the caches they came from.
@@ -543,6 +547,7 @@ struct VulkanDevice::State {
             colorTransfer.reset();
             scaler.reset();
             pipelineCache.reset();
+            Graphics::ReleaseNullPipeline(context);
             // Buffers still held elsewhere come back after the device is gone: the pool drops them
             // without Vulkan calls from here on.
             if (bufferPool) bufferPool->Retire();
@@ -630,6 +635,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         APS5_LOG_OUT("Vulkan surface created surface=%p window=%p", reinterpret_cast<void*>(state->surface), state->window);
     }
     state->deviceProc = state->InstanceFunction<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
+    if (Graphics::NullSubmit()) state->deviceProc = Graphics::NullDeviceProc(state->deviceProc);
     const auto enumerate = state->InstanceFunction<PFN_vkEnumeratePhysicalDevices>("vkEnumeratePhysicalDevices");
     std::uint32_t count = 0;
     check(enumerate(state->instance, &count, nullptr), "vkEnumeratePhysicalDevices");
@@ -699,6 +705,22 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
     state->properties = properties.properties;
     state->physical = selected;
+    if (Graphics::NullSubmit()) {
+        // The day machine's (NVIDIA) multisampling: nothing renders, and NullDeviceProc makes the images lavapipe lacks
+        // at 4 samples.
+        auto& limits = state->properties.limits;
+        constexpr VkSampleCountFlags counts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+        limits.framebufferColorSampleCounts |= counts;
+        limits.framebufferDepthSampleCounts |= counts;
+        limits.framebufferStencilSampleCounts |= counts;
+        limits.framebufferNoAttachmentsSampleCounts |= counts;
+        // Nothing the recompiler emits runs (APS5_NULL_SUBMIT): it targets the day machine's 32-wide subgroups in
+        // every stage, so the shaders and their costs are NVIDIA's rather than lavapipe's (8 lanes, no vertex stage).
+        state->subgroup.subgroupSize = 32u;
+        state->subgroup.supportedStages = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
+        state->subgroup.supportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT | VK_SUBGROUP_FEATURE_CLUSTERED_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT;
+        state->subgroup.quadOperationsInAllStages = VK_TRUE;
+    }
     if ((state->subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) != 0) {
         state->capabilities.push_back(spv::CapabilityGroupNonUniform);
         if ((state->subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT) != 0) state->capabilities.push_back(spv::CapabilityGroupNonUniformBallot);
@@ -865,6 +887,20 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     enabled.fragmentStoresAndAtomics = VK_TRUE;
     enabled.tessellationShader = available.tessellationShader;
     state->tessellationShader = enabled.tessellationShader == VK_TRUE;
+    if (Graphics::NullSubmit() && !state->tessellationShader) {
+        // Rect lists go through tessellation stages; under APS5_NULL_SUBMIT no pipeline is compiled, so the driver
+        // prepares them as on the day machine without the device feature (and with NVIDIA's limits where lavapipe
+        // reports none).
+        state->tessellationShader = true;
+        auto& limits = state->properties.limits;
+        limits.maxTessellationPatchSize = std::max(limits.maxTessellationPatchSize, 32u);
+        limits.maxTessellationControlPerVertexInputComponents = std::max(limits.maxTessellationControlPerVertexInputComponents, 128u);
+        limits.maxTessellationControlPerVertexOutputComponents = std::max(limits.maxTessellationControlPerVertexOutputComponents, 128u);
+        limits.maxTessellationControlPerPatchOutputComponents = std::max(limits.maxTessellationControlPerPatchOutputComponents, 120u);
+        limits.maxTessellationControlTotalOutputComponents = std::max(limits.maxTessellationControlTotalOutputComponents, 4216u);
+        limits.maxTessellationEvaluationInputComponents = std::max(limits.maxTessellationEvaluationInputComponents, 128u);
+        limits.maxTessellationEvaluationOutputComponents = std::max(limits.maxTessellationEvaluationOutputComponents, 128u);
+    }
     if (state->tessellationShader) state->capabilities.push_back(3);
     require(available.samplerAnisotropy && available.textureCompressionBC, "device lacks sampler anisotropy or BC texture compression support required for texture sampling");
     enabled.samplerAnisotropy = VK_TRUE;
@@ -884,6 +920,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->depthBounds = enabled.depthBounds == VK_TRUE;
     enabled.depthBiasClamp = available.depthBiasClamp;
     state->depthBiasClamp = enabled.depthBiasClamp == VK_TRUE;
+    if (Graphics::NullSubmit()) {
+        // NVIDIA has both; under APS5_NULL_SUBMIT no pipeline uses them, so the draws are prepared as on the day machine.
+        state->depthBounds = true;
+        state->depthBiasClamp = true;
+    }
     enabled.occlusionQueryPrecise = available.occlusionQueryPrecise;
     state->occlusionQueryPrecise = enabled.occlusionQueryPrecise == VK_TRUE;
     // Recompiled storage-image access declares no format (the guest descriptor decides it).
@@ -1235,6 +1276,7 @@ void VulkanDevice::WaitIdle() {
         if (!state->recorder->Idle()) Graphics::Recorder::CountSync(0, __builtin_return_address(0));
         state->recorder->Sync();
     }
+    const auto queueLock = Graphics::AcquireQueue();
     check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle complete");
 }
@@ -2309,7 +2351,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    {
+        const auto queueLock = Graphics::AcquireQueue();
+        check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    }
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");
@@ -2431,7 +2476,10 @@ void VulkanDevice::QueuePresent() {
     present.swapchainCount = 1;
     present.pSwapchains = &state->swapchain;
     present.pImageIndices = &index;
-    const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present);
+    const auto presented = [&] {
+        const auto queueLock = Graphics::AcquireQueue();
+        return state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present);
+    }();
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
     else check(presented, "vkQueuePresentKHR");
     timing.Mark("queue_present");
@@ -3542,8 +3590,13 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         if (state->computeWave32 && shader.hostSubgroupSize == 32u) pipelineInfo.stage.pNext = &requiredSubgroup;
         pipelineInfo.layout = objects->layout;
         if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
-        check(state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(state->device, context.pipelineCache, 1, &pipelineInfo, nullptr, &objects->pipeline), "vkCreateComputePipelines");
-        Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
+        if (Graphics::NullSubmit()) {
+            objects->pipeline = Graphics::NullPipeline(context);
+            objects->stub = true;
+        } else {
+            check(state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(state->device, context.pipelineCache, 1, &pipelineInfo, nullptr, &objects->pipeline), "vkCreateComputePipelines");
+            Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
+        }
         timing.Mark("pipeline_create");
         if (pipelineKey != 0) {
             // Find-or-insert: objects another dispatch of the variant mapped meanwhile serve this

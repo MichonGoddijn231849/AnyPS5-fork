@@ -575,6 +575,42 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
     return keys;
 }
 
+DccKeys ProvedCurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes, DccKeyProof& proof) {
+    auto& counters = Proofs();
+    const auto count = static_cast<std::size_t>(surfaceBytes / KeyBytes);
+    if (!KeyFastPath() || metaAddress == 0 || count == 0) {
+        proof = {};
+        return CurrentDccKeys(metaAddress, surfaceBytes);
+    }
+    // A store still pending on the GPU: no proof across it (CurrentDccKeys answers from the store or waits for it).
+    if (GuestMemory::GpuMutex().HeldByThisThread()) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
+            proof = {};
+            counters.scanned.fetch_add(1, std::memory_order_relaxed);
+            counters.unstable.fetch_add(1, std::memory_order_relaxed);
+            return CurrentDccKeys(metaAddress, surfaceBytes);
+        }
+    } else if (Recorder::SnapshotWriteOverlaps(metaAddress, count)) {
+        proof = {};
+        counters.scanned.fetch_add(1, std::memory_order_relaxed);
+        counters.unstable.fetch_add(1, std::memory_order_relaxed);
+        return CurrentDccKeys(metaAddress, surfaceBytes);
+    }
+    // As ProvedClearKeys: the collect precedes the scan.
+    const auto collected = GuestMemory::CollectWrites(metaAddress, count);
+    if (proof.generation != 0 && collected != 0 && GuestMemory::UnchangedSince(metaAddress, count, proof.generation)) {
+        counters.proved.fetch_add(1, std::memory_order_relaxed);
+        return proof.keys;
+    }
+    bool memoized = false;
+    const auto keys = readDccKeys(metaAddress, surfaceBytes, memoized);
+    const bool stable = collected != 0 && !memoized;
+    proof = stable ? DccKeyProof{keys, collected} : DccKeyProof{};
+    counters.scanned.fetch_add(1, std::memory_order_relaxed);
+    if (!stable) counters.unstable.fetch_add(1, std::memory_order_relaxed);
+    return keys;
+}
+
 DccKeyProofCounts KeyProofCounts() {
     const auto& counters = Proofs();
     return {counters.proved.load(std::memory_order_relaxed), counters.scanned.load(std::memory_order_relaxed), counters.unstable.load(std::memory_order_relaxed)};

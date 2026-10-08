@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NullSubmit.hpp"
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
@@ -418,7 +419,10 @@ void Driver::execute(const Submission& submission) {
             return;
         }
         if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
-            DrawPipeline::Queue0().Enqueue([this] { submitOpenWork(); }, {});
+            // A segment whose tail the guest already released ends nothing the guest observes: under
+            // APS5_BATCH_SUBMITS the batch stays open into the tail (labels, waits, the cap and the
+            // deadline still end it).
+            if (!Graphics::BatchSubmits()) DrawPipeline::Queue0().Enqueue([this] { submitOpenWork(); }, {});
             executeRewindTail(submission);
             return;
         }

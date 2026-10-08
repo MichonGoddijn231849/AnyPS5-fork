@@ -24,6 +24,8 @@
 
 namespace AgcDriver::DriverDetail {
 
+extern bool (*CpuReadTraceProtectionHook)(std::uintptr_t address, unsigned long* protection);
+
 #ifdef _WIN32
 namespace {
 
@@ -129,7 +131,10 @@ void Driver::cpuReadTraceTick() {
     const auto flips = flipsCounted.load(std::memory_order_acquire);
     auto previous = last.load(std::memory_order_relaxed);
     if (flips < previous + every || !last.compare_exchange_strong(previous, flips)) return;
-    static const bool installed = [] { return AddVectoredExceptionHandler(1, &OnFault) != nullptr; }();
+    static const bool installed = [] {
+        CpuReadTraceProtectionHook = &CpuReadTraceProtection;
+        return AddVectoredExceptionHandler(1, &OnFault) != nullptr;
+    }();
     if (!installed) return;
     auto& trace = State();
     // Report the previous round, then arm the next.

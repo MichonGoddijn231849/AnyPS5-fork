@@ -66,6 +66,8 @@ private:
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    // APS5_NULL_SUBMIT: `pipeline` is the device's shared stub (NullPipeline), never destroyed here.
+    bool stub = false;
     std::size_t attachments = 0;
     std::size_t colorAttachments = 0;
     bool depthBounds = false;

@@ -49,6 +49,9 @@ public:
     std::uint64_t EnqueuePending(std::shared_ptr<PendingDraw> pending);
     void Publish(const std::shared_ptr<PendingDraw>& pending, Commit commit, std::vector<Range> writes);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
+    // The Drain calls so far (any reason) for a packet with this opcode (0x100: any other), whether or not the pipeline
+    // had items to wait for. Cumulative: the 10 s report does not reset it. For tests.
+    static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
     // Waits until every item before `seq` is committed.
     void DrainBefore(std::uint64_t seq);
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
@@ -58,6 +61,16 @@ public:
     // The value the newest in-flight write of [address, address + bytes) stores, when that write is
     // a label covering the whole range (bytes <= 8, little endian).
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
+    // APS5_RETIRE_ON_WORKER=1: a committed item's commit, which owns the draw's prepared state (programs, captures,
+    // shader memory pages, cache entries it replaced), is freed by the thread of the next Enqueue (the queue worker)
+    // instead of by the committer under the pipeline's mutex.
+    static bool RetireOnWorker();
+    // APS5_PIPELINE_HYSTERESIS=1: an Enqueue waiting for room in a full pipeline is woken when it has drained to half
+    // its depth, not after every commit (one futex wake per draw, the two threads trading places draw by draw).
+    static bool RoomHysteresis();
+    // APS5_COMMITTER_SPIN_US=<n>: an idle committer polls for the next item for up to n microseconds before it blocks
+    // (no futex wait / wake pair when the worker is a few microseconds behind). 0 (default): it blocks at once.
+    static std::uint32_t CommitterSpinUs();
 
 private:
     struct Item {
@@ -79,9 +92,12 @@ private:
     std::condition_variable wake;
     std::condition_variable idle;
     std::deque<Item> items;
+    std::vector<Commit> retired;
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
     std::uint32_t idleWaiters = 0;
+    // Enqueues waiting for room, under APS5_PIPELINE_HYSTERESIS (otherwise they count as idleWaiters).
+    std::uint32_t roomWaiters = 0;
     bool committerWaiting = false;
     std::uint64_t nextSeq = 1;
     std::thread thread;
@@ -97,6 +113,7 @@ private:
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drains{};
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drainWaitNs{};
     std::array<std::uint64_t, 257> drainOpcodes{};
+    std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
     std::uint64_t depthSum = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };

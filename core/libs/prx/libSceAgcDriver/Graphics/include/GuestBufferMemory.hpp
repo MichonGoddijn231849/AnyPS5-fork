@@ -251,6 +251,10 @@ public:
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    // The same ranges into `into` (cleared first), so a per-draw caller reuses its storage; and whether one overlaps
+    // [address, address + bytes) without building them.
+    void InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& into) const;
+    bool InPlaceReadOverlaps(std::uint64_t address, std::size_t bytes) const;
 
 private:
     struct Region {

@@ -121,6 +121,11 @@ constexpr std::uint8_t BlockWritten = 1;
 constexpr std::uint8_t BlockMaybeWritten = 2;
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu = {});
 void SetImageRange(std::uintptr_t base, std::size_t bytes);
+// Where no guest arena exists (Linux), the range whose page states Accessible/CheckRange cache, as they cache the
+// arena's (set before guest memory is first checked; the frame replay names its captured address space). A host that
+// changes protections in it without the guest allocation registry calls ForgetPageStates after each change.
+void SetGuestPagesRange(std::uintptr_t base, std::size_t bytes);
+void ForgetPageStates(std::uintptr_t address, std::size_t bytes);
 void SetCaptureDirtyPages(bool enabled);
 std::vector<std::uint64_t> TakeCaptureDirtyPages();
 

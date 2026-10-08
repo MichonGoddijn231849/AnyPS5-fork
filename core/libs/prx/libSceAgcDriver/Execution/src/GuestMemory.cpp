@@ -25,14 +25,17 @@
 #endif
 #include <windows.h>
 #else
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <fstream>
 #include <pthread.h>
 #include <sstream>
 #endif
 
 namespace AgcDriver::DriverDetail {
-// CpuReadTrace.cpp: the protection of a page the CPU read trace armed (false when it is not armed).
-bool CpuReadTraceProtection(std::uintptr_t address, unsigned long* protection);
+// Set by CpuReadTrace.cpp once the CPU read trace is installed: the protection of a page it armed (false when it
+// is not armed). A hook rather than a call, so targets without the trace link GuestMemory.cpp alone.
+bool (*CpuReadTraceProtectionHook)(std::uintptr_t address, unsigned long* protection) = nullptr;
 }
 
 namespace AgcDriver::GuestMemory {
@@ -262,9 +265,19 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
     }
     return captured;
 #else
-    static_cast<void>(skip);
-    frames[0] = ModuleOffset(__builtin_return_address(0));
-    return 1;
+    // glibc's backtrace walks the unwind tables as RtlCaptureStackBackTrace does; frame 0 of its
+    // capture is this function, so the caller is 1. Each frame is an offset into the object that
+    // holds it (dladdr), symbolized with addr2line against that object.
+    void* raw[24];
+    const auto wanted = static_cast<int>(std::min<std::size_t>(frames.size() + 1 + skip, std::size(raw)));
+    const int captured = backtrace(raw, wanted);
+    std::size_t written = 0;
+    for (int i = 1 + static_cast<int>(skip); i < captured && written < frames.size(); ++i) {
+        Dl_info info{};
+        const auto address = reinterpret_cast<std::uintptr_t>(raw[i]);
+        frames[written++] = dladdr(raw[i], &info) != 0 && info.dli_fbase != nullptr ? address - reinterpret_cast<std::uintptr_t>(info.dli_fbase) : 0;
+    }
+    return written;
 #endif
 }
 
@@ -421,6 +434,7 @@ struct PageStates {
 };
 
 std::pair<std::uintptr_t, std::size_t> imageOverride{0, 0};
+std::pair<std::uintptr_t, std::size_t> guestPagesOverride{0, 0};
 
 PageStates& Pages() {
     static PageStates pages;
@@ -451,9 +465,20 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     forgetSerial.fetch_add(1, std::memory_order_release);
 }
 
+// APS5_NO_LINUX_PAGE_CACHE=1: every Linux check reads /proc/self/maps again, as before the page cache served them
+// (SetGuestPagesRange and the image range are ignored).
+bool PagesQueriedEachTime() {
+    static const bool each = std::getenv("APS5_NO_LINUX_PAGE_CACHE") != nullptr;
+    return each;
+}
+
 void PageStates::initialize() {
     std::call_once(once, [&] {
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
+        if (arena.size == 0 && guestPagesOverride.second != 0 && !PagesQueriedEachTime()) {
+            arena.base = guestPagesOverride.first;
+            arena.size = guestPagesOverride.second;
+        }
         const bool arenaCached = arena.allocate();
         bool imageCached = false;
 #ifdef _WIN32
@@ -474,6 +499,15 @@ void PageStates::initialize() {
             }
             image.base = start;
             image.size = cursor - start;
+            imageCached = image.allocate();
+        }
+#else
+        // The image range a host named (the frame replay names the capture's largest external run); the Linux checks
+        // cache their answers there as VirtualQuery's are.
+        static const bool noImageCache = std::getenv("APS5_NO_IMAGE_PAGE_CACHE") != nullptr;
+        if (imageOverride.second != 0 && !noImageCache && !PagesQueriedEachTime()) {
+            image.base = imageOverride.first;
+            image.size = imageOverride.second;
             imageCached = image.allocate();
         }
 #endif
@@ -527,7 +561,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         // Pages the CPU read trace (APS5_TRACE_CPU_READS) made inaccessible keep their real protection here.
         if (memory.Protect == PAGE_NOACCESS) {
             unsigned long armed = 0;
-            if (DriverDetail::CpuReadTraceProtection(cursor, &armed)) memory.Protect = armed;
+            if (DriverDetail::CpuReadTraceProtectionHook != nullptr && DriverDetail::CpuReadTraceProtectionHook(cursor, &armed)) memory.Protect = armed;
         }
         const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
         if (memory.RegionSize > std::numeric_limits<std::uintptr_t>::max() - base || base + memory.RegionSize <= cursor) return false;
@@ -550,6 +584,11 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         if (!emit(PageRun{cursor, next, readable, writable})) return true;
         cursor = next;
 #else
+        // As VirtualQuery's answers above, the mapping's run is stored in the page cache (the guest's own protection
+        // changes go through the registry and forget it; the write watch is userfaultfd's and leaves the mapping's
+        // permissions alone). Without it every check reread the whole maps file: with the GTA replay's ~5000
+        // mappings that was most of the committer's time.
+        const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         std::ifstream maps("/proc/self/maps");
         if (!maps.is_open()) return false;
         std::string line;
@@ -569,8 +608,20 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 found = true;
                 break;
             }
+            const bool readable = permissions[0] == 'r';
+            const bool writable = readable && permissions[1] == 'w';
+            if (readable && !PagesQueriedEachTime()) {
+                for (PageSpan* span : {&pages.arena, &pages.image}) {
+                    if (span->size == 0 || last <= span->base || first >= span->base + span->size) continue;
+                    const std::uint8_t value = PageReadable | (writable ? PageWritable : 0u);
+                    const auto from = std::max(first, span->base);
+                    const auto to = std::min(last, span->base + span->size);
+                    for (auto at = from; at < to; at += PageBytes) span->store(at, value);
+                    if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) span->forget(from, static_cast<std::size_t>(to - from));
+                }
+            }
             const auto next = std::min(end, last);
-            if (!emit(PageRun{cursor, next, permissions[0] == 'r', permissions[0] == 'r' && permissions[1] == 'w'})) return true;
+            if (!emit(PageRun{cursor, next, readable, writable})) return true;
             cursor = next;
             found = true;
             break;
@@ -995,6 +1046,21 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #endif
 }
 
+// APS5_COLLECT_GRANULE_KIB=<n> (a power of two, at least 4): a memoized collect walks the whole aligned n KiB granule
+// around its range when the tracker covers it and the walk completes, and memoizes that, so the next ranges inside the
+// granule in the same epoch (a ring of per-draw constants, neighbouring buffers) are memo hits instead of walks of
+// their own (one GetWriteWatch / write-watch ioctl each). Walking more pages only stamps writes there earlier.
+std::uint64_t collectGranule() {
+    static const std::uint64_t granule = [] {
+        const char* text = std::getenv("APS5_COLLECT_GRANULE_KIB");
+        if (text == nullptr) return std::uint64_t{64} * 1024u;
+        const auto kib = std::strtoull(text, nullptr, 10);
+        if (kib < 4 || (kib & (kib - 1)) != 0 || kib > (1u << 20u)) return std::uint64_t{0};
+        return static_cast<std::uint64_t>(kib) * 1024u;
+    }();
+    return granule;
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
@@ -1014,6 +1080,13 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation.load(std::memory_order_relaxed);
+            }
+            // A granule walked around another range (APS5_COLLECT_GRANULE_KIB) is keyed by the granule's start.
+            if (const auto granule = collectGranule(); granule != 0) {
+                if (const auto found = map.ranges.find(first & ~(granule - 1)); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.begin <= first && stop <= found->second.end) {
+                    collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                    return tracker.generation.load(std::memory_order_relaxed);
+                }
             }
         }
         for (const auto& entry : threadCollectMemo.entries) {
@@ -1039,16 +1112,28 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const TimedAccess timed(CounterCollect, bytes);
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+    auto walkFirst = first;
+    auto walkStop = stop;
+    bool walked = false;
+    if (const auto granule = collectGranule(); granule != 0 && useMemo) {
+        const auto wideFirst = first & ~(granule - 1);
+        const auto wideStop = stop > std::numeric_limits<std::uint64_t>::max() - granule ? stop : (stop + granule - 1) & ~(granule - 1);
+        if ((wideFirst != first || wideStop != stop) && tracker.covers(wideFirst, static_cast<std::size_t>(wideStop - wideFirst)) && walkWrites(tracker, wideFirst, wideStop, StampKind::Cpu)) {
+            walkFirst = wideFirst;
+            walkStop = wideStop;
+            walked = true;
+        }
+    }
+    if (!walked && !walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
-        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
+        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {walkFirst, walkStop, epoch, serial};
         else {
-            threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
+            threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {walkFirst, walkStop, epoch, serial};
             if (epochCollectMapEnabled()) {
-                auto& entry = epochCollectMap(epoch).ranges[first];
-                if (entry.unwatched != serial || entry.end < stop) entry = {first, stop, epoch, serial};
+                auto& entry = epochCollectMap(epoch).ranges[walkFirst];
+                if (entry.unwatched != serial || entry.end < walkStop) entry = {walkFirst, walkStop, epoch, serial};
             }
         }
     }
@@ -1296,6 +1381,15 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
 void SetImageRange(std::uintptr_t base, std::size_t bytes) {
     require(Pages().arena.pages == nullptr && Pages().image.pages == nullptr, "the image range must be set before guest memory is first checked");
     imageOverride = {base, bytes};
+}
+
+void SetGuestPagesRange(std::uintptr_t base, std::size_t bytes) {
+    require(Pages().arena.pages == nullptr && Pages().image.pages == nullptr, "the guest pages range must be set before guest memory is first checked");
+    guestPagesOverride = {base, bytes};
+}
+
+void ForgetPageStates(std::uintptr_t address, std::size_t bytes) {
+    ForgetPages(address, bytes);
 }
 
 void SetCaptureDirtyPages(bool enabled) {

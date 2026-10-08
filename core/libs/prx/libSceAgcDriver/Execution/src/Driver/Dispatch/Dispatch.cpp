@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -193,6 +194,50 @@ void CheckBvh(std::uint64_t pointer, bool linksOnly = false) {
 
 }
 
+namespace {
+
+// APS5_PIPELINE_DISPATCH=1 (with APS5_PIPELINED_DRAWS=1): a direct dispatch that is a cache hit with a recipe is a commit
+// item of the draw pipeline instead of a drain before it. Everything else drains as before.
+bool DispatchItemsEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_PIPELINE_DISPATCH");
+        return text != nullptr && text[0] != '\0' && text[0] != '0';
+    }();
+    return enabled;
+}
+
+// Why a direct dispatch on a pipelined queue 0 drained instead of becoming a commit item.
+enum class ItemFallback : std::size_t { Miss, Reads, NoRecipe, Writes, Verify, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(ItemFallback::Count)> ItemFallbackNames{"miss", "reads", "no recipe", "writes", "verify"};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ItemFallback::Count)> itemFallbacks{};
+std::atomic<std::uint64_t> itemCommits{0};
+std::atomic<std::uint64_t> itemRebuilds{0};
+
+void NoteItemFallback(ItemFallback reason) {
+    itemFallbacks[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// APS5_PROFILE_DRAW: one [dispatch-item] line per 10 s (the worker's dispatches are the only callers).
+void ReportDispatchItems(bool profile) {
+    static auto lastReport = std::chrono::steady_clock::now();
+    if (!profile) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    std::string drained;
+    for (std::size_t i = 0; i < ItemFallbackNames.size(); ++i) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s %llu", ItemFallbackNames[i], static_cast<unsigned long long>(itemFallbacks[i].load(std::memory_order_relaxed)));
+        drained += item;
+    }
+    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str());
+}
+
+}
+
+// Defined in WrittenBuffers.cpp.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded);
+
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     auto it = submission.shaders->upper_bound(address);
@@ -328,8 +373,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         return;
     }
     // A pipelined queue 0 keeps its draws in flight through DISPATCH_DIRECT packets only for the fill
-    // HLE above (an ordered commit item); every other dispatch waits for them here.
-    if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+    // HLE above (an ordered commit item); every other dispatch waits for them here. With APS5_PIPELINE_DISPATCH=1, a
+    // direct dispatch that is not a copy keeps them in flight through the cache lookup (below), which decides whether
+    // it is a commit item; otherwise, or when the lookup's reads could see a pending write, it drains as before.
+    const bool pipelineCandidate = DispatchItemsEnabled() && DrawPipeline::Active() && indirectArguments == 0 && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
+    if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
     if (indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
         pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
         return;
@@ -458,7 +506,45 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
     if (!stampValidate()) mix(reinterpret_cast<std::uintptr_t>(it->second.get()));
     phaseTiming.Phase(PhaseKey);
+    // The lookup validates the entry against guest memory, where the pipeline's pending writes are not yet. A candidate
+    // reads the entry's regions first: an overlap with a pending write, or no entry to validate, drains as before.
+    bool readsClear = false;
+    if (pipelineCandidate) {
+        std::vector<ShaderRecompiler::MemoryRegion> reads;
+        bool entryFound = false;
+        {
+            std::lock_guard cacheLock(dispatchCacheMutex);
+            if (const auto found = dispatchCache.find(key); found != dispatchCache.end()) {
+                entryFound = true;
+                for (const auto& variant : found->second->variants) appendEntryRegions(*variant, reads);
+            }
+        }
+        if (!entryFound || noDispatchCache || stampValidate()) {
+            NoteItemFallback(ItemFallback::Miss);
+        } else if (verifyDataHits()) {
+            NoteItemFallback(ItemFallback::Verify);
+        } else {
+            readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
+            if (!readsClear) NoteItemFallback(ItemFallback::Reads);
+        }
+        if (!readsClear) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+    }
     lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+    // A candidate whose reads were clear is a commit item only as a hit with a recipe whose writes can be ranged; the
+    // rest drains here, before the capture and the device call (the lookup read nothing pending).
+    std::vector<DrawPipeline::Range> itemWrites;
+    bool pipelined = false;
+    if (readsClear) {
+        if (cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr) {
+            bool bounded = false;
+            itemWrites = DispatchWriteRanges(*compiledResult, bounded);
+            pipelined = bounded;
+            if (!bounded) NoteItemFallback(ItemFallback::Writes);
+        } else {
+            NoteItemFallback(ItemFallback::NoRecipe);
+        }
+        if (!pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+    }
     if (cached) {
         captureMs += phaseTiming.Elapsed();
     } else {
@@ -548,6 +634,66 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         throw std::runtime_error(where + std::string(error.what()));
     };
     phaseTiming.Phase(PhaseSnapshots);
+
+    if (pipelined) {
+        // The commit item: the recipe pre-check, the GPU lock, the labels and the device call (DispatchRecipe; the full
+        // dispatch when the recipe is rebuilt), on the committer after the items before it, as the drained path runs them.
+        const auto recipe = keepVariant->recipe.load(std::memory_order_acquire);
+        const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        const auto queueId = submission.queue;
+        itemCommits.fetch_add(1, std::memory_order_relaxed);
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), groups, address, queueId, recipe, keepVariant, dataHit, epoch] {
+            DrawPipeline::FollowEpoch(epoch);
+            GuestMemory::SetCurrentPacket(0x15, queueId);
+            const auto& compiledCommit = *result;
+            const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
+            try {
+                std::shared_ptr<RecipeHit> recipeHit = localDevice->PrepareRecipe(recipe, false);
+                std::shared_ptr<const Recipe> builtRecipe;
+                bool writersNoted = false;
+                for (;;) {
+                    std::shared_ptr<PreparedDispatch> prepared;
+                    if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) prepared = localDevice->PrepareDispatch(compiledCommit, snapshots);
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    recordLabelsForPacket(localDevice.get(), queueId);
+                    if (noteWrites && writerKeyedEvidence() && !writersNoted) {
+                        noteWrittenBuffers(address, queueId, compiledCommit);
+                        writersNoted = true;
+                    }
+                    if (recipeHit != nullptr) {
+                        VulkanDevice::IndirectOutcome outcome{0, 0};
+                        const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit);
+                        if (recipeResult == RecipeOutcome::Rebuild) {
+                            recipeHit = nullptr;
+                            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
+                            itemRebuilds.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                    } else {
+                        localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), &builtRecipe);
+                    }
+                    break;
+                }
+                if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
+                if (builtRecipe != nullptr) {
+                    if (dataHit) {
+                        auto own = std::make_shared<Recipe>(*builtRecipe);
+                        own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, keepVariant->compiled.get(), 0});
+                        builtRecipe = std::move(own);
+                    }
+                    keepVariant->recipe.store(std::move(builtRecipe), std::memory_order_release);
+                    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
+                }
+            } catch (const std::exception& error) {
+                char where[64];
+                std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
+                throw std::runtime_error(where + std::string(error.what()));
+            }
+        }, std::move(itemWrites));
+        ReportDispatchItems(profile);
+        return;
+    }
 
     std::shared_ptr<RecipeHit> recipeHit;
     if (cached && keepVariant != nullptr && !stampValidate()) {

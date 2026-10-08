@@ -120,6 +120,28 @@ void testRegisterFile() {
         threw = true;
     }
     check(threw, "register file read an unset register");
+    // Versions (APS5_DRAW_KEY_MEMO): const reads keep it; every access that can write, and every copy, changes it.
+    const auto& constant = registers;
+    auto version = registers.Version();
+    static_cast<void>(constant.at(0x10));
+    static_cast<void>(constant.find(0x41));
+    check(registers.Version() == version, "register file version changed on a const read");
+    const auto step = [&](const char* what, auto&& access) {
+        access();
+        check(registers.Version() != version, (std::string("register file version unchanged after ") + what).c_str());
+        version = registers.Version();
+    };
+    step("operator[]", [&] { registers[0x10] = 8; });
+    step("insert_or_assign", [&] { registers.insert_or_assign(0x10, 9); });
+    step("emplace", [&] { registers.emplace(0x500, 1); });
+    step("at", [&] { registers.at(0x10) = 10; });
+    step("erase", [&] { registers.erase(0x500); });
+    auto other = registers;
+    check(other.Version() != registers.Version(), "register file copy kept the version");
+    const auto before = other.Version();
+    other = registers;
+    check(other.Version() != before && other.Version() != registers.Version(), "register file copy assignment kept a version");
+    step("clear", [&] { registers.clear(); });
 }
 
 void testContextAndBases() {

@@ -70,6 +70,11 @@ struct DccKeyProof {
 // their record), which makes the proof exactly as sound as UnchangedSince over the texels.
 // APS5_NO_KEY_FAST_PATH=1 scans on every call and stores nothing.
 DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes, DccKeyProof& proof);
+// CurrentDccKeys (the keys as the GPU will see them, pending GPU stores included) with the same proof: while the key
+// range is unchanged since the proof's scan the scan is skipped. A pending GPU store over the keys answers as
+// CurrentDccKeys does and drops the proof. The committer's render-target check uses it per draw
+// (APS5_TARGET_KEY_PROOF, Draw.cpp materializeRegisterClear). Counted with ProvedClearKeys' outcomes.
+DccKeys ProvedCurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes, DccKeyProof& proof);
 bool KeyFastPath();
 // Cumulative outcomes of ProvedClearKeys: calls answered by a proof, scans made, and scans not kept.
 struct DccKeyProofCounts {

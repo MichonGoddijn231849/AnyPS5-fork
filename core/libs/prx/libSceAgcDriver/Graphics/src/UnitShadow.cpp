@@ -490,8 +490,13 @@ bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {
     const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
     auto& registry = Registry();
     std::lock_guard lock(registry.mutex);
-    for (const auto& shadow : overlapping(registry, address, end)) {
-        if (shadow->liveUnits == 0) continue;
+    // overlapping()'s walk without its vector: called per draw resource.
+    if (end <= address || registry.byBase.empty()) return false;
+    auto it = registry.byBase.upper_bound(address);
+    if (it != registry.byBase.begin()) --it;
+    for (; it != registry.byBase.end() && it->first < end; ++it) {
+        const auto& shadow = it->second;
+        if (address >= shadow->ImportEnd() || shadow->importBase >= end || shadow->liveUnits == 0) continue;
         const auto begin = std::max(address, shadow->importBase);
         const auto stop = std::min(end, shadow->ImportEnd());
         for (auto unit = shadow->UnitOf(begin); unit <= shadow->UnitOf(stop - 1); ++unit) {

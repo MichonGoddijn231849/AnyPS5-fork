@@ -50,6 +50,8 @@ namespace AgcDriver::Graphics {
         VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick);
         void release() noexcept;
         VkDescriptorSet allocateSet();
+        // The first set of the pools (APS5_NULL_SUBMIT reuses it for every dispatch).
+        VkDescriptorSet firstSet = VK_NULL_HANDLE;
 
         const Context context;
         VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
