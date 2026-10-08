@@ -514,6 +514,7 @@ State DecodeState(const QueueState& queue) {
     }
     zero(cx, 0x207, ~(LayerExports | ClipCullExports), "layer, viewport or auxiliary vertex exports");
     Require(std::popcount(read(cx, 0x207) & 0xffffu) <= 8, "more than eight clip and cull distances are unsupported");
+    result.paClVsOutCntl = read(cx, 0x207);
     {
         const auto depthControl = read(cx, 0x200);
         if ((depthControl & 0xbu) != 0 && depthSurfaceBound(cx)) {
