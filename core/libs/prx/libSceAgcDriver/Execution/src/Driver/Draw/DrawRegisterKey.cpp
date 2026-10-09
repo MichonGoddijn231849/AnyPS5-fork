@@ -49,7 +49,7 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     // them. "verify" also hashes them and aborts on a difference.
     static const char* memoSetting = std::getenv("APS5_DRAW_KEY_MEMO");
     static const bool memo = memoSetting == nullptr || (memoSetting[0] != '\0' && memoSetting[0] != '0');
-    static const bool verify = memo && std::strcmp(memoSetting, "verify") == 0;
+    static const bool verify = memo && memoSetting != nullptr && std::strcmp(memoSetting, "verify") == 0;
     struct ContextMemo {
         const Registers* bank = nullptr;
         std::uint64_t version = 0;
