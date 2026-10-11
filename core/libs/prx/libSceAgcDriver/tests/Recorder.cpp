@@ -4896,6 +4896,13 @@ void pipelineLibraryTests(const Device& device) {
     state.colors.front().format = VK_FORMAT_R16G16B16A16_SFLOAT;
     static_cast<void>(lookup());
     Require(counters().built == std::array<std::uint64_t, 4>{2, 2, 3, 3}, "another target format rebuilt more than the fragment output library");
+    state.samples = 4;
+    state.colors.front().samples = 4;
+    const auto multisampled = lookup();
+    Require(counters().built == std::array<std::uint64_t, 4>{2, 2, 4, 4}, "a 4x pipeline shared the 1x fragment shader or fragment output library");
+    state.samples = 1;
+    state.colors.front().samples = 1;
+    Require(lookup() != multisampled && counters().built == std::array<std::uint64_t, 4>{2, 2, 4, 4}, "the 1x pipeline after a 4x one built its libraries again");
     WaitForOptimizedPipelines(context.device);
     const auto lto = std::getenv("APS5_NO_PIPELINE_LTO") == nullptr && context.pipelineLinkTimeOptimization;
     Require(counters().optimized == (lto ? counters().linked : 0u), "a linked pipeline was not optimized in the background");
