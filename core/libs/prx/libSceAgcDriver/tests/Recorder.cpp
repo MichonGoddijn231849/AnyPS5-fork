@@ -4451,6 +4451,110 @@ void singleCubeTests(const Device& device, Recorder& recorder) {
     }
 }
 
+void depthPlaneArrayBaseSliceTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    constexpr std::uint32_t side = 128;
+    constexpr std::uint32_t lastArray = 2;
+    constexpr std::array<float, lastArray + 1> sliceDepths{0.25f, 0.5f, 0.75f};
+    const VkExtent2D extent{side, side};
+    const auto sliceBytes = std::max<std::uint64_t>(DepthSliceBytes(extent, 4), 65536);
+    const auto bytes = static_cast<std::size_t>(sliceBytes * (lastArray + 2));
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the depth plane array block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            ClearDepthSurfaces(context.device);
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } unregister{base, block};
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    const auto tsharp = [&](std::uint32_t type, std::uint32_t last, std::uint32_t baseArray) {
+        return std::array<std::uint32_t, 8>{
+            static_cast<std::uint32_t>(address >> 8u),
+            static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (22u << 20u) | (((side - 1u) & 3u) << 30u),
+            ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+            0xfacu | (0x18u << 20u) | (type << 28u),
+            last | (baseArray << 16u),
+            0u,
+            0u,
+            0u,
+        };
+    };
+    const auto arrayWords = tsharp(13, lastArray, 0);
+    const auto geometry = DescribeSurface(DecodeTextureResource(arrayWords));
+    Require(geometry.layers == lastArray + 1 && geometry.guestBytes <= bytes, "the depth plane array test surface has an unexpected layout");
+    for (std::uint32_t layer = 1; layer <= lastArray; ++layer) {
+        auto* slice = static_cast<std::byte*>(block) + geometry.GuestLayerOffset(layer);
+        for (std::uint64_t offset = 0; offset + sizeof(float) <= geometry.layerBytes; offset += sizeof(float)) std::memcpy(slice + offset, &sliceDepths[layer], sizeof(float));
+    }
+    Require(DepthSurfaceView(context, {address, 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0}) != VK_NULL_HANDLE, "the depth surface has no view");
+    const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+    SampleProgram arrayProgram(context, recorder, SAMPLE_ARRAY_SPV);
+    SampleProgram flatProgram(context, recorder);
+    for (std::uint32_t baseArray = 1; baseArray <= lastArray; ++baseArray) {
+        const auto words = tsharp(13, lastArray, baseArray);
+        const auto resource = DecodeTextureResource(words);
+        Require(resource.dimension == TextureDimension::k2DArray && resource.baseArray == baseArray && resource.depthOrLastArray == lastArray, "the depth plane array T# decoded incorrectly");
+        const auto texture = DepthSurfaceTexture(context, words, resource, identity);
+        Require(texture != nullptr, "a depth plane array from base slice " + std::to_string(baseArray) + " was not sampled from the depth surface");
+        for (std::uint32_t layer = 0; baseArray + layer <= lastArray; ++layer) {
+            const auto what = "a depth plane array from base slice " + std::to_string(baseArray) + " read the wrong slice at layer " + std::to_string(layer);
+            expectRed(arrayProgram.Red(texture->View(), texture->Layout(), 0.0f, static_cast<float>(layer)), sliceDepths[baseArray + layer], what.c_str());
+        }
+        Require(texture->FirstLayerView() != VK_NULL_HANDLE, "a depth plane array has no one-slice view");
+        const auto what = "a 2D binding of a depth plane array from base slice " + std::to_string(baseArray) + " did not read that slice";
+        expectRed(flatProgram.Red(texture->FirstLayerView(), texture->Layout(), 0.0f), sliceDepths[baseArray], what.c_str());
+    }
+    const auto refused = [&](const std::array<std::uint32_t, 8>& words, const GuestTextureResource& resource, const char* what) {
+        std::string message;
+        try {
+            static_cast<void>(DepthSurfaceTexture(context, words, resource, identity));
+        } catch (const std::exception& error) {
+            message = error.what();
+        }
+        Require(message.find("is not implemented") != std::string::npos, std::string(what) + (message.empty() ? " was sampled" : " threw another error: " + message));
+    };
+    auto pastLast = DecodeTextureResource(arrayWords);
+    pastLast.baseArray = lastArray + 1;
+    refused(arrayWords, pastLast, "a depth plane array whose base slice is past its last slice");
+    const auto cubeWords = tsharp(11, 0, 0);
+    auto cube = DecodeTextureResource(cubeWords);
+    Require(cube.dimension == TextureDimension::kCube, "the depth plane cube T# decoded incorrectly");
+    cube.baseArray = 1;
+    refused(cubeWords, cube, "a depth plane cube from a later base slice");
+    const auto flatWords = tsharp(9, 0, 0);
+    auto flat = DecodeTextureResource(flatWords);
+    Require(flat.dimension == TextureDimension::k2D, "the depth plane 2D T# decoded incorrectly");
+    flat.baseArray = 1;
+    refused(flatWords, flat, "a 2D depth plane from a later base slice");
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+}
+
 void firstLayerViewTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     TextureDetiler detiler(context);
@@ -4933,6 +5037,11 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--depth-plane-array-only") {
+            depthPlaneArrayBaseSliceTests(device, recorder);
+            std::cout << "Depth plane array base slice tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
             singleCubeTests(device, recorder);
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
@@ -5030,6 +5139,7 @@ int main(int argc, char** argv) {
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
         singleCubeTests(device, recorder);
+        depthPlaneArrayBaseSliceTests(device, recorder);
         atomicViewTests(device, recorder);
         metadataPassTests(device, recorder);
         cmaskPassTests(device, recorder);
