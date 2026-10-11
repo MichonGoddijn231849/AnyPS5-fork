@@ -1,3 +1,4 @@
+#include <shared_mutex>
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -165,6 +166,41 @@ private:
     }
 };
 
+struct GuardedRange {
+    VkDevice device;
+    std::uint64_t address;
+    std::uint64_t bytes;
+    std::uint32_t samples;
+};
+
+std::shared_mutex& guardedMutex() {
+    static std::shared_mutex mutex;
+    return mutex;
+}
+
+std::vector<GuardedRange>& guarded() {
+    static std::vector<GuardedRange> ranges;
+    return ranges;
+}
+
+std::atomic<bool>& anyGuarded() {
+    static std::atomic<bool> any{false};
+    return any;
+}
+
+void guardReads(std::uint64_t address, std::size_t bytes) {
+    RequireNoMultisampleTarget(address, bytes, "a CPU read");
+}
+
+void guard(const Context& context, const ColorTarget& target) {
+    const auto bytes = std::max<std::uint64_t>(target.bytes, static_cast<std::uint64_t>(target.extent.width) * target.extent.height * target.elementBytes * target.samples);
+    std::unique_lock lock(guardedMutex());
+    guarded().push_back({context.device, target.address, bytes, target.samples});
+    anyGuarded().store(true, std::memory_order_release);
+    static std::once_flag installed;
+    std::call_once(installed, [] { GuestMemory::SetReadGuard(&guardReads); });
+}
+
 std::mutex& targetsMutex() {
     static std::mutex mutex;
     return mutex;
@@ -183,6 +219,7 @@ MultisampleTarget& acquire(const Context& context, const ColorTarget& use) {
         return *target;
     }
     targets().push_back(std::make_unique<MultisampleTarget>(context, use));
+    guard(context, use);
     auto& created = *targets().back();
     if (use.cmaskFastClear) created.cmask.SeedKeys(CurrentDccKeys(use.cmaskAddress, static_cast<std::uint64_t>(use.cmaskBytes) * 256u));
     created.ApplyFastClear(use);
@@ -276,6 +313,20 @@ void NoteColorMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
 void ClearMultisampleTargets(VkDevice device) {
     std::lock_guard lock(targetsMutex());
     std::erase_if(targets(), [&](const auto& target) { return target->context.device == device; });
+    std::unique_lock guardLock(guardedMutex());
+    std::erase_if(guarded(), [&](const auto& range) { return range.device == device; });
+    anyGuarded().store(!guarded().empty(), std::memory_order_release);
+}
+
+void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access) {
+    if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire)) return;
+    std::shared_lock lock(guardedMutex());
+    for (const auto& range : guarded()) {
+        if (address >= range.address + range.bytes || range.address >= address + bytes) continue;
+        char text[256];
+        std::snprintf(text, sizeof(text), "AGC graphics: %s of 0x%llx+0x%zx overlaps multisampled color target 0x%llx+0x%llx (%u samples), whose samples are only on the host: guest access to it is not implemented", access, static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(range.address), static_cast<unsigned long long>(range.bytes), range.samples);
+        throw std::runtime_error(text);
+    }
 }
 
 }

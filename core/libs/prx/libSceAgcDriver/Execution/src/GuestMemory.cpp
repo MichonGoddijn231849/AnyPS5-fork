@@ -1736,12 +1736,19 @@ void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {
     flushHook.store(hook, std::memory_order_release);
 }
 
+std::atomic<void (*)(std::uint64_t, std::size_t)> readGuard{nullptr};
+
+void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
+    readGuard.store(guard, std::memory_order_release);
+}
+
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
     if (destination.empty()) return;
+    if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
@@ -1758,6 +1765,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
+    if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));

@@ -61,6 +61,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         }
     }
     if (opcode == 0x50 && packet.size() >= 7) {
+        if (Pm4::DmaSource(packet) == 0 || Pm4::DmaSource(packet) == 3) Graphics::RequireNoMultisampleTarget(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), packet[6] & 0x3ffffffu, "a DMA copy");
         if (Pm4::DmaSource(packet) == 2 && Pm4::DmaDestination(packet) != 1) {
             const auto address = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
             Graphics::NoteDepthMetadataFill(address, packet[6] & 0x3ffffffu, packet[2]);

@@ -34,6 +34,7 @@ VkImageView MultisampleTargetView(const Context& context, const ColorTarget& tar
 void ResolveMultisampleTarget(const Context& context, const ColorTarget& source, StorageTexture& destination, VkImageView destinationView);
 void NoteColorMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern);
 void ClearMultisampleTargets(VkDevice device);
+void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access);
 
 }
 
