@@ -1690,6 +1690,16 @@ void multisampleTests() {
     queue.context[0x3b9] = queue.context[0x3b8];
     auto pass = DecodeColorMetadataPass(queue);
     Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::Resolve && pass->source.has_value() && pass->source->samples == 2 && pass->targets.size() == 1 && pass->targets[0].samples == 1, "a CB resolve of a multisampled target did not decode");
+    std::vector<std::byte> resolvedBlock(2u * 65536u);
+    const auto resolvedAddress = (reinterpret_cast<std::uintptr_t>(resolvedBlock.data()) + 65535u) / 65536u * 65536u;
+    for (const auto mode : {AgcDriver::Graphics::ColorTileMode::Standard4KB, AgcDriver::Graphics::ColorTileMode::Standard64KB, AgcDriver::Graphics::ColorTileMode::RenderTarget}) {
+        auto tiled = queue;
+        tiled.context[0x327] = static_cast<std::uint32_t>(resolvedAddress >> 8u);
+        tiled.context[0x391] = static_cast<std::uint32_t>(resolvedAddress >> 40u);
+        tiled.context[0x3b9] = (tiled.context[0x3b9] & ~(0x1fu << 14u)) | (static_cast<std::uint32_t>(mode) << 14u);
+        const auto tiledPass = DecodeColorMetadataPass(tiled);
+        Require(tiledPass.has_value() && tiledPass->mode == ColorMetadataPass::Mode::Resolve && tiledPass->targets.size() == 1 && tiledPass->targets[0].tileMode == mode && tiledPass->targets[0].samples == 1, "a CB resolve into a tile mode " + std::to_string(static_cast<std::uint32_t>(mode)) + " destination did not decode");
+    }
     queue.context[0x32b] = queue.context[0x31c] ^ (1u << 8u);
     expectFailure([&] { DecodeColorMetadataPass(queue); }, "different formats or extents");
     queue = multisampled();

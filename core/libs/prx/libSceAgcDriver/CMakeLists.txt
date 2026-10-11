@@ -787,8 +787,10 @@ if(BUILD_TESTING)
     set_tests_properties(agc_unit_shadow PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
     add_test(NAME agc_descriptor_pool_recycling COMMAND agc_driver_recorder_tests --descriptor-pool-only)
     set_tests_properties(agc_descriptor_pool_recycling PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME agc_tiled_resolve COMMAND agc_driver_recorder_tests --tiled-resolve-only)
+    set_tests_properties(agc_tiled_resolve PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_host_import_unmap agc_unit_shadow agc_descriptor_pool_recycling PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_host_import_unmap agc_unit_shadow agc_descriptor_pool_recycling agc_tiled_resolve PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

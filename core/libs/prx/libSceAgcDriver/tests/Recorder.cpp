@@ -4272,6 +4272,103 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
     std::cout << "Multisampled target guest access tests passed\n";
 }
 
+void tiledResolveTests(const Device& device, Recorder& recorder) {
+    namespace GuestMemory = AgcDriver::GuestMemory;
+    auto context = device.GetContext();
+    if ((context.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || !device.Graphics()) {
+        std::cout << "4x color targets or graphics unavailable: CB resolves into tiled targets not tested\n";
+        return;
+    }
+    context.hostImportAlignment = 0;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    constexpr std::uint32_t side = 128;
+    constexpr std::size_t targetBytes = side * side * 4u;
+    constexpr std::size_t sourceBytes = targetBytes * 4u;
+    constexpr std::size_t bytes = targetBytes + sourceBytes + 65536u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the tiled resolve block");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Release {
+        const Context& context;
+        void* block;
+        ~Release() {
+            ClearMultisampleTargets(context.device);
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } release{context, block};
+    ColorTarget source{};
+    source.address = address + targetBytes;
+    source.surfaceAddress = source.address;
+    source.extent = {side, side};
+    source.surfaceExtent = source.extent;
+    source.format = VK_FORMAT_R8G8B8A8_UNORM;
+    source.bytes = targetBytes;
+    source.componentMapping = 0xe4u;
+    source.tileMode = ColorTileMode::RenderTarget;
+    source.samples = 4;
+    source.cmaskAddress = address + targetBytes + sourceBytes;
+    source.cmaskBytes = 4096;
+    source.cmaskFastClear = true;
+    const std::array<std::pair<ColorTileMode, std::uint32_t>, 3> modes{{{ColorTileMode::Standard4KB, 0x80402010u}, {ColorTileMode::Standard64KB, 0x10204080u}, {ColorTileMode::RenderTarget, 0x40801020u}}};
+    for (const auto& [mode, clear] : modes) {
+        const auto name = std::to_string(static_cast<std::uint32_t>(mode));
+        std::memset(block, 0x55, targetBytes);
+        std::memset(static_cast<std::byte*>(block) + targetBytes + sourceBytes, 0, 4096);
+        ColorTarget destination{};
+        destination.address = address;
+        destination.surfaceAddress = address;
+        destination.extent = {side, side};
+        destination.surfaceExtent = destination.extent;
+        destination.format = VK_FORMAT_R8G8B8A8_UNORM;
+        destination.bytes = targetBytes;
+        destination.componentMapping = 0xe4u;
+        destination.tileMode = mode;
+        source.clearWords = {clear, 0};
+        RunColorMetadataPass(context, {ColorMetadataPass::Mode::Resolve, {destination}, source});
+        std::vector<std::uint32_t> resolved(targetBytes / 4);
+        GuestMemory::Read(address, std::as_writable_bytes(std::span(resolved)));
+        const auto texels = std::ranges::count(resolved, clear);
+        Require(texels == static_cast<std::ptrdiff_t>(resolved.size()), "a CB resolve into a tile mode " + name + " target left " + std::to_string(resolved.size() - static_cast<std::size_t>(texels)) + " texels without the resolved color");
+        recorder.Sync();
+        ClearMultisampleTargets(context.device);
+        ClearCachedTextures(context.device);
+    }
+    {
+        ColorTarget destination{};
+        destination.address = address;
+        destination.extent = {side, side};
+        destination.format = VK_FORMAT_R8G8B8A8_UNORM;
+        destination.bytes = targetBytes;
+        destination.tileMode = ColorTileMode::Linear;
+        std::string message;
+        try {
+            RunColorMetadataPass(context, {ColorMetadataPass::Mode::Resolve, {destination}, source});
+        } catch (const std::exception& error) {
+            message = error.what();
+        }
+        Require(message.find("without a resident image is not implemented") != std::string::npos, "a CB resolve into a linear target did not throw: " + message);
+    }
+    recorder.Sync();
+}
+
 void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (!device.NullDescriptors()) {
@@ -5044,6 +5141,15 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--tiled-resolve-only") {
+            if ((device.GetContext().limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || !device.Graphics()) {
+                std::cout << "skipped, the device lacks 4x color targets or a graphics queue\n";
+                return 77;
+            }
+            tiledResolveTests(device, recorder);
+            std::cout << "CB resolves into tiled targets tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
             singleCubeTests(device, recorder);
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
@@ -5109,6 +5215,7 @@ int main(int argc, char** argv) {
         readWrittenStagingTests(device, recorder);
         depthSurfaceProofTests(device, recorder);
         multisampleGuestAccessTests(device, recorder);
+        tiledResolveTests(device, recorder);
         misalignedSnapshotTests(device, recorder);
         misalignedRegionTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
