@@ -34,6 +34,7 @@ struct HostImport {
     bool unwatched = false;
     bool dmaBuf = false;
     std::shared_ptr<void> chunk;
+    mutable std::uint64_t lastUse = 0;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
@@ -65,6 +66,10 @@ bool WatchedImportsStampPages();
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
 void SetHostImportWindow(std::uint64_t bytes);
+// Tests: the window of one large registered range (64 MiB) and the import budget (0: the configured one).
+void SetHostImportRangeWindow(std::uint64_t bytes);
+void SetHostImportBudget(std::uint64_t bytes);
+std::uint64_t HostImportLiveBytes();
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
@@ -384,6 +389,7 @@ private:
     // Import registry epoch when `direct` pointers were taken at acquire time; they are reused while
     // no import was destroyed since.
     std::uint64_t importsEpoch = 0;
+    std::uint64_t importFloor = 0;
     std::vector<Region> regions;
     // Whether `regions` is in ascending address order (true right after AcquireRegistered, whose
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.
