@@ -2,6 +2,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -53,6 +54,7 @@ struct Fiber {
     void* savedStack;
     char name[FIBER_MAX_NAME_LENGTH + 1];
     bool contextSizeCheck;
+    bool contextHostWrite;
 };
 static_assert(sizeof(Fiber) <= FIBER_OBJECT_SIZE, "guest reserves 0x100 bytes for SceFiber");
 
@@ -340,6 +342,7 @@ int32_t APS5_VABI _sceFiberInitializeImpl_nid_postfix(FiberObject* object, const
     fiber->contextSize = size_context;
     std::strncpy(fiber->name, name, FIBER_MAX_NAME_LENGTH);
     fiber->contextSizeCheck = g_contextSizeCheck.load(std::memory_order_relaxed);
+    fiber->contextHostWrite = GuestArena::GuestArenaBeginHostWrite_nid_postfix(addr_context, size_context);
     if (fiber->contextSizeCheck) {
         auto* words = static_cast<std::uint64_t*>(addr_context);
         std::fill(words, words + size_context / sizeof(std::uint64_t), FIBER_CONTEXT_FILL);
@@ -354,6 +357,8 @@ int32_t APS5_VABI sceFiberFinalize(FiberObject* object) {
     if (!fiber) return object ? SCE_FIBER_ERROR_INVALID : SCE_FIBER_ERROR_NULL;
     const auto state = fiber->state.load(std::memory_order_acquire);
     if (state == FiberState::Running || state == FiberState::Suspending) return SCE_FIBER_ERROR_STATE;
+    if (fiber->contextHostWrite) GuestArena::GuestArenaEndHostWrite_nid_postfix(fiber->context, fiber->contextSize);
+    fiber->contextHostWrite = false;
     fiber->magic = 0;
     UnpinStack(fiber->context, fiber->contextSize);
     return SCE_OK;

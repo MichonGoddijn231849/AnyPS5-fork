@@ -20,6 +20,7 @@ public:
 
 private:
     void publish();
+    void applyInputFile(PadInputState& state);
     void setMouseMode(bool enabled);
     void openFirstAvailableController();
     void openController(int deviceIndex);

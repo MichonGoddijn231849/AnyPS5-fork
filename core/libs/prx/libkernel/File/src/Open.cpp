@@ -10,7 +10,10 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "SceTypes.hpp"
 
+#include <atomic>
 #include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -106,6 +109,19 @@ static int SceErrorFromErrno(int error) {
     return static_cast<int>(0x80020000u | static_cast<unsigned>(guest));
 }
 
+static void ReportApplicationFile(const char* path, const std::filesystem::path& native, int fd, int error) {
+    if (path == nullptr || std::strncmp(path, "/app0/", 6) != 0) return;
+    if (fd >= 0) {
+        std::error_code sizeError;
+        const auto size = std::filesystem::file_size(native, sizeError);
+        if (sizeError || size != 0) return;
+    }
+    static std::atomic<int> reported{0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+    if (fd < 0) std::fprintf(stderr, "[open] %s failed: errno %d\n", path, error);
+    else std::fprintf(stderr, "[open] %s is empty\n", path);
+}
+
 extern "C" {
 
 int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
@@ -127,8 +143,10 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
         }
     }
 #endif
+    const int error = errno;
+    ReportApplicationFile(path, native, fd, error);
     if (fd < 0) {
-        return SceErrorFromErrno(errno);
+        return SceErrorFromErrno(error);
     }
     if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY || (flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC)))
         RecordWrittenPath_nid_no_patch(native);
@@ -163,6 +181,7 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
     if (n < 0) {
         throw std::runtime_error(std::string(__func__) + ": read failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
     }
+    TraceReadVolume(n);
     return static_cast<std::int64_t>(n);
 }
 

@@ -38,6 +38,9 @@ DescriptorKind PhysicalKindFor(DescriptorBindingKind kind) {
     if (kind == DescriptorBindingKind::Samplers) {
         return DescriptorKind::Sampler;
     }
+    if (RuntimeAbi::IsWideImages(kind)) {
+        return DescriptorKind::SampledImage;
+    }
     const ImageResourceClass imageClass = ImageBindingResourceClass(kind);
     if (imageClass == ImageResourceClass::Sampled) {
         return DescriptorKind::SampledImage;
@@ -70,7 +73,10 @@ DescriptorRole RoleFor(DescriptorBindingKind kind) {
     if (kind == DescriptorBindingKind::ShaderData) {
         return DescriptorRole::ShaderData;
     }
-    if (ImageBindingResourceClass(kind) != ImageResourceClass::None) {
+    if (kind == DescriptorBindingKind::WideFeedback) {
+        return DescriptorRole::WideFeedback;
+    }
+    if (RuntimeAbi::IsWideImages(kind) || ImageBindingResourceClass(kind) != ImageResourceClass::None) {
         return DescriptorRole::GuestImages;
     }
     fail("DescriptorBindingBuilder::Populate binding kind has no descriptor role");
@@ -119,6 +125,7 @@ std::vector<std::uint32_t> GuestBuffersDescriptor(const std::vector<std::uint32_
 std::vector<std::uint32_t> GuestSamplersDescriptor(const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot) {
     std::vector<std::uint32_t> result;
     std::uint32_t dwordCount = 0;
+    std::uint32_t occurrence = 0;
     for (std::size_t i = 0; i < resources.size(); i++) {
         const std::uint32_t r = resources[i];
         if (r >= snapshot.samplers.size()) {
@@ -130,12 +137,11 @@ std::vector<std::uint32_t> GuestSamplersDescriptor(const std::vector<std::uint32
         }
         if (i == 0u) {
             dwordCount = value.dwordCount;
+            result.reserve(resources.size() * dwordCount);
         } else if (value.dwordCount != dwordCount) {
             fail("DescriptorBindingBuilder::Populate guest sampler descriptors have inconsistent widths");
         }
-        for (std::uint32_t dword = 0; dword < value.dwordCount; dword++) {
-            result.push_back(value.dwords[dword]);
-        }
+        result.insert(result.end(), value.dwords.begin(), value.dwords.begin() + value.dwordCount);
     }
     return result;
 }
@@ -248,6 +254,15 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
     allocation.specialization = std::move(plan.specialization);
 }
 
+std::uint32_t WideImageElements(std::size_t entries) {
+    // The count is a specialization constant: every step is a new pipeline of a large shader (2-8 s to create), and
+    // the bound entries grow with the feedback, so the steps are coarse (16, 256, 4096, the capacity).
+    std::uint32_t count = 16u;
+    while (count < entries && count < RuntimeAbi::WideImageCapacity) count = std::min(count << 4u, RuntimeAbi::WideImageCapacity);
+    if (entries > count) throw std::runtime_error("wide bindless tables exceed the WideImages binding");
+    return count;
+}
+
 DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings) const {
     if (stage == IrShaderStage::Pixel && exportMappings.size() != 8u) fail("fragment runtime export mappings are missing");
     if (info.images.size() > ShaderInfo::MaxImages) fail("runtime image count exceeds the static capacity");
@@ -329,7 +344,42 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         for (std::uint32_t mode = 0; mode < modes.size(); ++mode) plan.specialization.push_back({PipelineSpecialization::ImageModeBase + resource * PipelineSpecialization::ImageModeStride + mode, active[mode] ? 1u : 0u});
     }
     plan.bindings.reserve(layout.descriptors.size());
+    bool wideCounted = false;
     for (const auto& logical : layout.descriptors) {
+        if (RuntimeAbi::IsWideImages(logical.kind)) {
+            // Every wide table's entries of this binding's class, at the base each table's flattened SRT header
+            // gives; the key indexes them without a per-element specialization. The roots share the image type.
+            if (logical.resources.empty()) fail("wide image binding has no table root");
+            const auto count = WideImageElements(snapshot.wideImages.size());
+            if (!wideCounted) plan.specialization.push_back({PipelineSpecialization::WideImageCount, count});
+            wideCounted = true;
+            const auto root = logical.resources.front();
+            const auto wideKind = static_cast<std::uint32_t>(logical.kind) - static_cast<std::uint32_t>(DescriptorBindingKind::WideImages);
+            const auto wideClass = wideKind % RuntimeAbi::WideImageClasses;
+            const auto modeIndex = ResourceMaterializer::WideModes(info.images.at(root)).at(wideClass);
+            if (modeIndex == UINT32_MAX) fail("wide image binding has no mode of its class");
+            const auto& mode = info.runtimeImageModes.at(root).at(modeIndex);
+            PreparedDescriptorBinding entry{};
+            entry.wideImages = true;
+            entry.wideKind = wideKind;
+            auto& physical = entry.descriptor;
+            physical.descriptorSet = RuntimeAbi::DescriptorSet;
+            physical.binding = NativeBinding(stage, logical.kind);
+            physical.count = count;
+            physical.kind = DescriptorKind::SampledImage;
+            physical.role = DescriptorRole::GuestImages;
+            physical.imageShape = ImageShapeForResource(mode);
+            entry.identityImageSwizzle.assign(count, false);
+            physical.imageWritten.assign(count, false);
+            physical.imageDepthCompare.assign(count, mode.depthCompare);
+            physical.imageAtomic.assign(count, false);
+            physical.imageUnnormalized.assign(count, false);
+            physical.imageSamplers.assign(count, 0u);
+            physical.imageAtomic64.assign(count, false);
+            entry.resources.assign(count, root);
+            plan.bindings.push_back(std::move(entry));
+            continue;
+        }
         const bool imageHeap = ImageBindingResourceClass(logical.kind) != ImageResourceClass::None;
         const bool samplerHeap = logical.kind == DescriptorBindingKind::Samplers;
         IrDescriptorBinding compact{logical.kind, {}};
@@ -391,7 +441,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 physical.imageUnnormalized.push_back(unnormalized.images.at(resource));
                 physical.imageSamplers.push_back(0u);
                 physical.imageAtomic64.push_back(image.atomic64);
-                if (layout.runtimeImageCount == 0u || image.indirectRoot == ImageResource::NoIndirectImage) continue;
+                if (layout.runtimeImageCount == 0u || image.indirectRoot == ImageResource::NoIndirectImage || image.wideTable) continue;
                 if (resource >= layout.runtimeImageCount) fail("runtime image metadata exceeds compact layout");
                 const auto& descriptor = snapshot.images.at(resource);
                 RuntimeAbi::ResourceMetadata metadata{};
@@ -476,6 +526,18 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             break;
         case DescriptorRole::GuestImages:
             physical.guestDescriptor.reserve(entry.resources.size() * 8u);
+            if (entry.wideImages) {
+                // An entry is bound in the array of its class and null in the others.
+                if (snapshot.wideImages.size() > physical.count || snapshot.wideKinds.size() != snapshot.wideImages.size()) fail("wide image entries exceed the prepared WideImages binding");
+                physical.guestDescriptor.assign(static_cast<std::size_t>(physical.count) * 8u, 0u);
+                for (std::size_t element = 0; element < snapshot.wideImages.size(); ++element) {
+                    const auto& descriptor = snapshot.wideImages[element];
+                    if (descriptor.dwordCount != 8u) fail("invalid wide image descriptor width");
+                    if (snapshot.wideKinds[element] != entry.wideKind) continue;
+                    std::copy(descriptor.dwords.begin(), descriptor.dwords.begin() + 8, physical.guestDescriptor.begin() + static_cast<std::ptrdiff_t>(element * 8u));
+                }
+                break;
+            }
             for (std::size_t element = 0; element < entry.resources.size(); ++element) {
                 const auto& descriptor = snapshot.images.at(entry.resources[element]);
                 if (descriptor.dwordCount != 8u) fail("invalid runtime image descriptor width");
@@ -503,6 +565,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
         case DescriptorRole::Gds:
         case DescriptorRole::BdaPagetable:
         case DescriptorRole::FaultBuffer:
+        case DescriptorRole::WideFeedback:
             break;
         }
 

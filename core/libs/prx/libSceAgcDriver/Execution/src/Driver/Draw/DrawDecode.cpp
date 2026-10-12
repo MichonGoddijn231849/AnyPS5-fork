@@ -2,6 +2,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
+#include <atomic>
+#include <cstdio>
+#include <optional>
 
 namespace AgcDriver::DriverDetail {
 
@@ -12,6 +16,37 @@ std::uint32_t ReadGraphicsRegister(const Registers& registers, std::uint32_t off
     return found == registers.end() ? 0u : found->second;
 }
 
+}
+
+void Driver::readUserWords(const QueueState& queue, DrawProgram& program) {
+    Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, program.resourceRegister);
+    const auto resources = program.nullPixel && !queue.shader.contains(program.resourceRegister) ? 0u : readRegister(queue.shader, program.resourceRegister);
+    const auto userCount = ((resources >> 1u) & 0x1fu) | (((resources >> 27u) & 1u) << 5u);
+    require(userCount <= 32, "graphics user SGPR count exceeds the register bank");
+    program.userData.clear();
+    for (std::uint32_t i = 0; i < userCount; ++i) {
+        Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, program.userDataBase + i);
+        program.userData.push_back(readUserData(queue.shader, program.userDataBase + i));
+    }
+}
+
+void Driver::initializeMerged(const QueueState& queue, DrawProgram& program, std::uint32_t pointerBase, bool pointerRequired) {
+    program.merged = true;
+    program.mergedPointer = pointerBase;
+    program.mergedPointerRequired = pointerRequired;
+    program.firstUserSgpr = 0;
+    program.userData.insert(program.userData.begin(), 8, 0);
+    Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase);
+    Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase + 1);
+    if (!pointerRequired && !queue.shader.contains(pointerBase) && !queue.shader.contains(pointerBase + 1)) return;
+    const auto low = readRegister(queue.shader, pointerBase);
+    const auto high = readRegister(queue.shader, pointerBase + 1);
+    const auto address = static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32u);
+    require(address != 0 || !pointerRequired, "merged shader user-data address is null");
+    if (address == 0) return;
+    GuestMemory::CheckRange(reinterpret_cast<const void*>(address), 8, 4);
+    program.userData[0] = low;
+    program.userData[1] = high;
 }
 
 void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const ShaderRegistry& registry, bool staticAbi, bool includeFragment) {
@@ -32,7 +67,11 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
         require(it != registry.begin(), "graphics program does not belong to a registered shader");
         --it;
         const auto& snapshot = *it->second;
-        require(address - snapshot.codeAddress < snapshot.code.size() * sizeof(std::uint32_t), "graphics program is outside registered shader code");
+        if (address - snapshot.codeAddress >= snapshot.code.size() * sizeof(std::uint32_t)) {
+            char text[200];
+            std::snprintf(text, sizeof(text), "graphics program 0x%llx (stage %d) is outside registered shader code (nearest 0x%llx+0x%zx, %zu snapshots)", static_cast<unsigned long long>(address), static_cast<int>(stage), static_cast<unsigned long long>(snapshot.codeAddress), snapshot.code.size() * sizeof(std::uint32_t), registry.size());
+            require(false, text);
+        }
         require((address - snapshot.codeAddress) % sizeof(std::uint32_t) == 0, "graphics entry point is not dword aligned");
         require(snapshot.type == type, "graphics program refers to an incompatible shader binary type");
         if (!nullPixel) Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, rsrc2);
@@ -49,6 +88,9 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
             it->second,
             codeOffset
         };
+        result.binary.codeHash = SnapshotCodeHash(snapshot, codeOffset);
+        result.resourceRegister = rsrc2;
+        result.nullPixel = nullPixel;
         for (std::uint32_t i = 0; i < userCount; ++i) {
             Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, userDataBase + i);
             result.userData.push_back((staticAbi ? ReadGraphicsRegister(queue.shader, userDataBase + i) : readUserData(queue.shader, userDataBase + i)));
@@ -67,6 +109,9 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
         };
         const auto initializeMerged = [&](DrawProgram& program, std::uint32_t pointerBase, bool pointerRequired) {
             program.firstUserSgpr = 0;
+            program.merged = true;
+            program.mergedPointer = pointerBase;
+            program.mergedPointerRequired = pointerRequired;
             program.userData.insert(program.userData.begin(), 8, 0);
             Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase);
             Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase + 1);
@@ -111,7 +156,28 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
     }
 }
 
-std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission) {
+// APS5_PS_STATE_FROM_SHADER (ShaderInputState.hpp): a copy of the queue state with the pixel shader header's
+// context registers when the context lacks the interpolants the header declares; empty otherwise.
+static std::optional<QueueState> pixelHeaderState(const QueueState& queue, const Submission& submission) {
+    if (!Graphics::PixelStateFromShaderEnabled() || submission.shaders == nullptr || !queue.shader.contains(0x008)) return std::nullopt;
+    const auto address = (static_cast<std::uint64_t>(queue.shader.find(0x008)->second) << 8u) | (static_cast<std::uint64_t>(queue.shader.contains(0x009) ? queue.shader.find(0x009)->second & 0xffu : 0u) << 40u);
+    auto it = submission.shaders->upper_bound(address);
+    if (address == 0 || it == submission.shaders->begin()) return std::nullopt;
+    --it;
+    const auto& snapshot = *it->second;
+    if (snapshot.type != 1 || address - snapshot.codeAddress >= snapshot.code.size() * sizeof(std::uint32_t)) return std::nullopt;
+    auto context = queue.context;
+    if (!Graphics::ApplyPixelHeaderRegisters(context, snapshot.header, snapshot.headerAddress)) return std::nullopt;
+    static std::atomic<std::uint32_t> reports{0};
+    if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[gpu] pixel shader 0x%llx: the context lacks its header's registers (SPI_PS_IN_CONTROL 0x%x); using the header's\n", static_cast<unsigned long long>(snapshot.codeAddress), queue.context.contains(0x1b6) ? queue.context.find(0x1b6)->second : 0u);
+    std::optional<QueueState> result(queue);
+    result->context = std::move(context);
+    return result;
+}
+
+std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& liveQueue, const Submission& submission) {
+    const auto patched = pixelHeaderState(liveQueue, submission);
+    const QueueState& queue = patched.has_value() ? *patched : liveQueue;
     auto product = std::make_shared<DrawDecode>();
     product->state = Graphics::DecodeState(queue);
     DecodeGraphicsPrograms(*product, queue, *submission.shaders, false, true);

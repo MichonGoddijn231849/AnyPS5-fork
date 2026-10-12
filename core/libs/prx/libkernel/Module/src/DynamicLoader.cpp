@@ -108,7 +108,19 @@ static std::filesystem::path RelinkedModulePath(const std::filesystem::path& pat
     auto relinked = path;
     relinked += ".guest.prx";
     std::error_code error;
-    return std::filesystem::is_regular_file(relinked, error) ? relinked : path;
+    if (std::filesystem::is_regular_file(relinked, error)) return relinked;
+    // The relinker writes bundled modules into a module directory of app0 (Wolverine loads /app0/libcohtml.Prospero.prx,
+    // relinked as /app0/sce_module/libcohtml.Prospero.prx.guest.prx); the same path returns the already loaded image.
+    auto name = path.filename();
+    name += ".guest.prx";
+    const std::filesystem::path roots[] = {path.parent_path(), ResolvePath_nid_no_patch("/app0")};
+    for (const auto& root : roots) {
+        for (const char* directory : {"sce_module", "sce_modules", "prx"}) {
+            const auto candidate = root / directory / name;
+            if (std::filesystem::is_regular_file(candidate, error)) return candidate;
+        }
+    }
+    return path;
 }
 
 void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {

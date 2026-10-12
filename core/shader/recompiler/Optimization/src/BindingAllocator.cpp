@@ -104,7 +104,7 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     if (std::ranges::any_of(next.userDataRegisters, [](auto reg) { return reg >= RuntimeAbi::UserDataCapacity; })) fail("shader user data exceeds runtime ABI capacity");
     if (std::ranges::any_of(info.images, [](const auto& image) { return image.indirectRoot != ImageResource::NoIndirectImage; })) next.runtimeImageCount = static_cast<std::uint32_t>(info.images.size());
     const auto pushSize = layout.pushConstantSizeBytes / 4u;
-    next.pushDataStartDword = next.runtimeImageCount == 0u && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= pushSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
+    next.pushDataStartDword = next.runtimeImageCount == 0u && !next.dispatchThreadLimit && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= pushSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
 
     if (!info.buffers.empty()) {
         std::vector<std::uint32_t> resources(info.buffers.size());
@@ -150,6 +150,22 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
             addBinding(next, static_cast<DescriptorBindingKind>(FirstImageBinding + i), std::move(imageGroups[i]));
         }
     }
+    // Wide bindless table roots bind the WideImages arrays of their dimension, one per numeric class their native
+    // modes have; roots of one dimension share them.
+    std::array<std::vector<std::uint32_t>, RuntimeAbi::WideImageKinds> wideRoots;
+    bool anyWide = false;
+    for (std::uint32_t i = 0; i < info.images.size(); i++) {
+        if (!info.images[i].wideTable) continue;
+        anyWide = true;
+        const auto wide = ResourceMaterializer::WideModes(info.images[i]);
+        for (std::uint32_t c = 0; c < wide.size(); c++) {
+            if (wide[c] != UINT32_MAX) wideRoots.at(ResourceMaterializer::WideKind(info.images[i], c)).push_back(i);
+        }
+    }
+    for (std::uint32_t kind = 0; kind < wideRoots.size(); kind++) {
+        if (!wideRoots[kind].empty()) addBinding(next, static_cast<DescriptorBindingKind>(static_cast<std::uint32_t>(DescriptorBindingKind::WideImages) + kind), std::move(wideRoots[kind]));
+    }
+    if (anyWide) addBinding(next, DescriptorBindingKind::WideFeedback);
 
     if (!info.samplers.empty()) {
         if (info.samplers.size() > RuntimeAbi::SamplerHeapCapacity / 2u) fail("shader sampler pairs exceed runtime heap capacity");
@@ -171,7 +187,7 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
 
     const bool usesFlattenedRuntime = !program.Resources().srtReads.empty() ||
         std::ranges::any_of(info.images, [](const ImageResource& image) {
-            return image.indirectSearchIterations != 0u;
+            return image.indirectSearchIterations != 0u || image.wideTable;
         });
     if (usesFlattenedRuntime) {
         addBinding(next, DescriptorBindingKind::FlattenedSrt);

@@ -1,6 +1,7 @@
 #include "ControlFlow/Structurizer.hpp"
 #include "ControlFlow/ControlFlowHelpers.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -181,6 +182,16 @@ bool isolateSemanticLoopHeader(ControlFlowGraph& graph, std::uint32_t oldHeader,
     rebuildPredecessors(graph);
     recompute(graph);
     return true;
+}
+
+// On by default since the 2026-10-09 day check (gta-perf-3: frames identical, registration 166 s -> 21 s);
+// APS5_FAST_STRUCTURIZER=0 turns it off.
+bool FastStructurizer() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_FAST_STRUCTURIZER");
+        return value == nullptr || (value[0] != '\0' && value[0] != '0');
+    }();
+    return enabled;
 }
 
 const NaturalLoop* findInnermostContainingLoop(const ControlFlowGraph& graph, std::uint32_t blockId) {
@@ -578,12 +589,7 @@ bool splitOneReturnJoin(ControlFlowGraph& graph) {
             continue;
         }
         const auto returns = [&](std::uint32_t target) { return graph.Dominates(block.id, target) && hasLinearPathToTerminal(graph, target); };
-        const auto joinsEnclosing = [&](std::uint32_t target) {
-            const auto& predecessors = graph.FindBlock(target).predecessors;
-            return !graph.Dominates(block.id, target) && std::all_of(predecessors.begin(), predecessors.end(), [&](std::uint32_t predecessor) {
-                return graph.Dominates(block.id, predecessor) || graph.Dominates(predecessor, block.id);
-            });
-        };
+        const auto joinsEnclosing = [&](std::uint32_t target) { return !graph.Dominates(block.id, target); };
         const auto trueTarget = block.terminator.trueBlock;
         const auto falseTarget = block.terminator.falseBlock;
         const auto join = returns(trueTarget) && joinsEnclosing(falseTarget) ? falseTarget : returns(falseTarget) && joinsEnclosing(trueTarget) ? trueTarget : InvalidControlFlowId;
@@ -627,6 +633,7 @@ constexpr std::uint32_t CloneWordLimit = 1024u;
 constexpr std::uint32_t CloneWordFloor = 256u;
 constexpr std::uint32_t CloneShareDivisor = 8u;
 constexpr std::uint32_t CloneBudgetDivisor = 4u;
+constexpr std::uint32_t SharedExitWordLimit = 256u;
 
 struct SplitBudget {
     std::uint32_t programWords = 0;
@@ -838,6 +845,22 @@ std::optional<ControlFlowGraph> privatizeMergeTail(const ControlFlowGraph& graph
     }
     cost = estimatedSpirvWords(graph, tail);
     return candidate;
+}
+
+bool privatizeSharedExits(ControlFlowGraph& graph) {
+    bool privatized = false;
+    for (std::uint32_t blockId = 0; blockId < graph.blocks.size(); ++blockId) {
+        const auto& block = graph.FindBlock(blockId);
+        if (!block.successors.empty() || block.predecessors.size() < 2u || block.estimatedSpirvWords > SharedExitWordLimit) {
+            continue;
+        }
+        const auto predecessors = block.predecessors;
+        for (std::size_t i = 1; i < predecessors.size(); ++i) {
+            cloneBlocks(graph, {blockId}, {{predecessors[i], blockId}});
+        }
+        privatized = true;
+    }
+    return privatized;
 }
 
 std::vector<Edge> loopEdges(const ControlFlowGraph& graph) {
@@ -1182,23 +1205,7 @@ struct TarjanState {
     std::vector<StronglyConnectedComponent> components;
 };
 
-void tarjanVisit(TarjanState& state, std::uint32_t blockId) {
-    state.index[blockId] = state.nextIndex;
-    state.lowlink[blockId] = state.nextIndex;
-    ++state.nextIndex;
-    state.stack.push_back(blockId);
-    state.onStack[blockId] = true;
-
-    const auto& block = state.graph->FindBlock(blockId);
-    for (const auto successor : block.successors) {
-        if (state.index[successor] == InvalidControlFlowId) {
-            tarjanVisit(state, successor);
-            state.lowlink[blockId] = std::min(state.lowlink[blockId], state.lowlink[successor]);
-        } else if (state.onStack[successor]) {
-            state.lowlink[blockId] = std::min(state.lowlink[blockId], state.index[successor]);
-        }
-    }
-
+void tarjanFinish(TarjanState& state, std::uint32_t blockId) {
     if (state.lowlink[blockId] != state.index[blockId]) {
         return;
     }
@@ -1232,6 +1239,44 @@ void tarjanVisit(TarjanState& state, std::uint32_t blockId) {
     state.components.push_back(std::move(component));
 }
 
+// Iterative over an explicit frame stack, in the recursive form's order: a program's control flow can chain
+// thousands of blocks, which overflowed the calling thread's stack (Wolverine's streaming shaders).
+void tarjanVisit(TarjanState& state, std::uint32_t root) {
+    struct Frame {
+        std::uint32_t block;
+        std::size_t next;
+    };
+    std::vector<Frame> frames;
+    const auto enter = [&](std::uint32_t blockId) {
+        state.index[blockId] = state.nextIndex;
+        state.lowlink[blockId] = state.nextIndex;
+        ++state.nextIndex;
+        state.stack.push_back(blockId);
+        state.onStack[blockId] = true;
+        frames.push_back({blockId, 0u});
+    };
+    enter(root);
+    while (!frames.empty()) {
+        const auto blockId = frames.back().block;
+        const auto& successors = state.graph->FindBlock(blockId).successors;
+        if (frames.back().next < successors.size()) {
+            const auto successor = successors[frames.back().next++];
+            if (state.index[successor] == InvalidControlFlowId) {
+                enter(successor);
+            } else if (state.onStack[successor]) {
+                state.lowlink[blockId] = std::min(state.lowlink[blockId], state.index[successor]);
+            }
+            continue;
+        }
+        frames.pop_back();
+        tarjanFinish(state, blockId);
+        if (!frames.empty()) {
+            const auto parent = frames.back().block;
+            state.lowlink[parent] = std::min(state.lowlink[parent], state.lowlink[blockId]);
+        }
+    }
+}
+
 }
 
 void Structurizer::Structurize(ControlFlowGraph& graph) const {
@@ -1240,7 +1285,16 @@ void Structurizer::Structurize(ControlFlowGraph& graph) const {
         structurize(graph, false);
     } catch (const std::runtime_error&) {
         graph = original;
-        structurize(graph, true);
+        try {
+            structurize(graph, true);
+        } catch (const std::runtime_error&) {
+            auto privatized = original;
+            if (!privatizeSharedExits(privatized)) {
+                throw;
+            }
+            structurize(privatized, false);
+            graph = std::move(privatized);
+        }
     }
 }
 
@@ -1411,6 +1465,29 @@ void Structurizer::computePostDominators(ControlFlowGraph& graph) const {
     }
 
     bool changed = true;
+    if (FastStructurizer()) {
+        while (changed) {
+            changed = false;
+            for (auto block = graph.blocks.rbegin(); block != graph.blocks.rend(); ++block) {
+                if (block->successors.empty()) {
+                    continue;
+                }
+                auto next = graph.blocks[block->successors.front()].postDominators;
+                for (std::size_t i = 1; i < block->successors.size(); ++i) {
+                    next = intersectSorted(next, graph.blocks[block->successors[i]].postDominators);
+                }
+                const auto at = std::lower_bound(next.begin(), next.end(), block->id);
+                if (at == next.end() || *at != block->id) {
+                    next.insert(at, block->id);
+                }
+                if (next != block->postDominators) {
+                    block->postDominators = std::move(next);
+                    changed = true;
+                }
+            }
+        }
+        return;
+    }
     while (changed) {
         changed = false;
         for (const auto id : order) {
@@ -1569,6 +1646,28 @@ void Structurizer::splitSharedMergeBlocks(ControlFlowGraph& graph) const {
 
 void Structurizer::isolateSemanticLoopHeaders(ControlFlowGraph& graph) const {
     const auto isolationBudget = graph.naturalLoops.size() + 1u;
+    if (FastStructurizer()) {
+        for (std::size_t round = 0; round < isolationBudget; ++round) {
+            std::vector<std::uint32_t> headers;
+            for (const auto& loop : graph.naturalLoops) {
+                const auto& header = graph.FindBlock(loop.headerBlock);
+                if (header.instructionBegin != header.instructionEnd) {
+                    headers.push_back(loop.headerBlock);
+                }
+            }
+            sortUnique(headers);
+            if (headers.empty()) {
+                return;
+            }
+            for (auto header = headers.rbegin(); header != headers.rend(); ++header) {
+                if (!isolateSemanticLoopHeader(graph, *header, [](ControlFlowGraph&) {})) {
+                    throw std::runtime_error("failed to isolate semantic loop header " + std::to_string(*header));
+                }
+            }
+            recomputeAnalyses(graph);
+        }
+        throw std::runtime_error("CFG semantic loop-header isolation exceeded rewrite budget");
+    }
     for (std::size_t isolation = 0; isolation < isolationBudget; ++isolation) {
         const auto loop = std::find_if(graph.naturalLoops.begin(), graph.naturalLoops.end(), [&](const NaturalLoop& value) {
             const auto& header = graph.FindBlock(value.headerBlock);

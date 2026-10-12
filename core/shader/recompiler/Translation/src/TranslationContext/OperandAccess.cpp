@@ -447,6 +447,8 @@ IrU32 TranslationContext::readRawU32(const RdnaOperand& operand) {
             const IrU32 zero(ir.Constant(0u));
             return IrU32(ir.Select(ir.IEqual(mask.Value(), zero.Value()), ir.Constant(1u), zero.Value()));
         }
+        case RdnaOperandKind::ApertureRegister:
+            throw std::runtime_error("TranslationContext::readRawU32: a 32-bit read of aperture source code " + std::to_string(operand.reg) + " (which half it reads is unverified) is unsupported");
         default: throw std::runtime_error("TranslationContext::readRawU32 invalid decoded operand used as a raw U32 source");
     }
 }

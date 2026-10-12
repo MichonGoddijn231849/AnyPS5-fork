@@ -22,9 +22,21 @@ foreach(agcTarget IN ITEMS libSceAgcDriver agc_driver_visual_test agc_driver_gra
     endif()
 endforeach()
 
+set(agcThreadGroupsSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/ThreadGroups.comp)
+set(agcThreadGroupsSpv ${agcTextureDetileGeneratedDir}/ThreadGroups.spv)
+set(agcThreadGroupsHeader ${agcTextureDetileGeneratedDir}/ThreadGroups_spv.h)
+add_custom_command(
+    OUTPUT "${agcThreadGroupsHeader}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+    COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcThreadGroupsSpv}" "${agcThreadGroupsSource}"
+    COMMAND ${CMAKE_COMMAND} -DINPUT=${agcThreadGroupsSpv} -DOUTPUT=${agcThreadGroupsHeader} -DSYMBOL=THREAD_GROUPS_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+    DEPENDS "${agcThreadGroupsSource}" glslang-standalone
+    VERBATIM
+)
+
 foreach(agcTarget IN ITEMS libSceAgcDriver agc_driver_visual_test agc_driver_graphics_tests agc_driver_bda_device_tests agc_driver_mesh_tests)
     if(TARGET ${agcTarget})
-        target_sources(${agcTarget} PRIVATE Graphics/src/GpuColorTransfer.cpp ${agcColorTransferHeader})
+        target_sources(${agcTarget} PRIVATE Graphics/src/GpuColorTransfer.cpp ${agcColorTransferHeader} ${agcThreadGroupsHeader})
     endif()
 endforeach()
 

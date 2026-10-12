@@ -9,6 +9,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace AgcDriver {
@@ -20,12 +21,35 @@ public:
         return enabled;
     }
 
+    // APS5_TRACE_IMAGE=<hex address>[,<hex address>...]: every trace event naming one of those addresses goes to
+    // stderr as [trace-image] (live debugging of one surface; the capture trace itself stays off).
+    static const std::string& ImageFilter() {
+        static const std::string filter = [] { const char* text = std::getenv("APS5_TRACE_IMAGE"); return text != nullptr ? std::string(text) : std::string(); }();
+        return filter;
+    }
+
     template<typename... TArgs>
     static void Log(const char* format, TArgs... args) {
-        if (!Enabled()) return;
+        const auto& filter = ImageFilter();
+        if (!Enabled() && filter.empty()) return;
         std::array<char, 2048> line{};
         const auto size = std::snprintf(line.data(), line.size(), format, args...);
         if (size < 0 || static_cast<std::size_t>(size) >= line.size()) throw std::runtime_error("Capture trace event exceeds 2047 bytes");
+        if (!filter.empty()) {
+            std::size_t start = 0;
+            while (start < filter.size()) {
+                const auto comma = filter.find(',', start);
+                const auto needle = filter.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                if (!needle.empty() && std::string_view(line.data(), static_cast<std::size_t>(size)).find(needle) != std::string_view::npos) {
+                    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                    std::fprintf(stderr, "[trace-image] %lld %.*s\n", static_cast<long long>(now), size, line.data());
+                    break;
+                }
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+        }
+        if (!Enabled()) return;
         static CaptureTrace& trace = instance();
         trace.append(std::string(line.data(), static_cast<std::size_t>(size)));
     }

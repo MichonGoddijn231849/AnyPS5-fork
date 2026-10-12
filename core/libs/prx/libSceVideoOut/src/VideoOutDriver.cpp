@@ -498,6 +498,8 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             request.gpuComplete = true;
             request.cfg->vblankCond.notify_all();
         };
+        static std::uint64_t flipCount = 0;
+        if (std::getenv("APS5_TRACE_FLIPS") != nullptr && (flipCount++ % 50u) == 0u) std::fprintf(stderr, "[flip] #%llu index %d buffer %p\n", static_cast<unsigned long long>(flipCount), req.index, reinterpret_cast<const void*>(req.index >= 0 ? req.buffer.dataAddress : 0));
         if (req.index >= 0 && !req.unregistered) {
             const auto display = DescribeVideoOutBuffer(req.buffer, req.group);
             AgcDriverPresentBuffer_nid_postfix(target, display, gpuReady, &req);

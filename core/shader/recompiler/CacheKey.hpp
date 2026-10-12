@@ -4,6 +4,8 @@
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "ControlFlow/SubroutineCalls.hpp"
+#include <cstring>
 #include <cstdlib>
 #include <stdexcept>
 #include <type_traits>
@@ -22,7 +24,7 @@ public:
         static const bool hashedCode = std::getenv("APS5_NO_CODE_HASH_KEY") == nullptr;
         if (hashedCode) {
             append(key, request.shader.code.size());
-            append(key, HashCode(request.shader.code));
+            append(key, request.shader.codeHash != 0 ? request.shader.codeHash : HashCode(request.shader.code));
         } else {
             append(key, request.shader.code);
         }
@@ -54,6 +56,7 @@ public:
         append(key, request.context.floatMode);
         appendMesh(key, request);
         appendTessellation(key, request);
+        appendCalls(key, request);
         std::uint64_t hash = 0xcbf29ce484222325ull;
         for (const auto value : key) {
             hash ^= value;
@@ -86,10 +89,58 @@ private:
         append(key, request.context.floatMode);
         appendMesh(key, request);
         appendTessellation(key, request);
+        appendCalls(key, request);
         append(key, request.target);
         append(key, DebugProbeActive());
         append(key, RayTracingStrict());
         append(key, RayTracingMiss());
+    }
+
+    // Subroutine calls (InlineSubroutineCalls, compute programs under APS5_SUBROUTINE_CALLS=1): a program with an
+    // s_swappc_b64 word inlines the callees its user data and function tables point at, so its key holds those values.
+    // Once the code was inlined, only the user data words and memory words its call targets were traced to
+    // (CallUserData); a word the calls never read must not make each dispatch a new program. Until then, all its user
+    // data. The callees are registered code (the driver adds them to the request), fixed while registered.
+    static void appendCalls(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
+        if (request.shader.stage != ShaderStage::Compute || !SubroutineCallsEnabled()) return;
+        bool calls = false;
+        for (const auto word : request.shader.code) {
+            if ((word & 0xff80ff00u) == 0xbe802100u) {
+                calls = true;
+                break;
+            }
+        }
+        append(key, calls);
+        if (!calls) return;
+        struct CallIndexStorage {};
+        struct CallAddressStorage {};
+        auto& indices = HostThreadLocal<std::vector<std::uint32_t>, CallIndexStorage>();
+        auto& addresses = HostThreadLocal<std::vector<std::uint64_t>, CallAddressStorage>();
+        if (!CallUserData(request.shader.codeAddress, request.shader.code, indices, addresses)) {
+            for (const auto value : request.context.userData) append(key, value);
+            return;
+        }
+        // The marker keeps the two key forms apart.
+        append(key, 0xca11u);
+        append(key, indices.size());
+        for (const auto index : indices) {
+            append(key, index);
+            append(key, index < request.context.userData.size() ? static_cast<std::uint64_t>(request.context.userData[index]) : (1ull << 32u));
+        }
+        // The memory words a call's target was read from (absent from the request: a marker).
+        append(key, addresses.size());
+        for (const auto address : addresses) {
+            std::uint64_t value = 1ull << 32u;
+            for (const auto& region : request.context.memory) {
+                if (address < region.guestAddress || address - region.guestAddress + sizeof(std::uint32_t) > region.bytes.size()) continue;
+                std::uint32_t word = 0;
+                std::memcpy(&word, region.bytes.data() + (address - region.guestAddress), sizeof(word));
+                value = word;
+                break;
+            }
+            append(key, address);
+            append(key, value);
+        }
     }
 
     static void appendMesh(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
@@ -174,6 +225,8 @@ private:
         append(key, value.sampleMaskExportEnable);
         append(key, value.earlyZ);
         append(key, value.executeOnNoop);
+        append(key, value.quadPixelMask);
+        append(key, value.stencilExportEnable);
         append(key, value.conservativeZExport);
         append(key, value.orderedPixelShader);
         append(key, value.targetOutputMode);
@@ -190,6 +243,7 @@ private:
         append(key, value.fetchAttribReg);
         append(key, value.fetchBufferReg);
         append(key, value.fetchEmbedded);
+        append(key, value.paClVsOutCntl);
         if (value.resourcesNum > value.resources.size()) throw std::runtime_error("Shader cache: invalid vertex resource count");
         append(key, value.resourcesNum);
         for (std::uint32_t i = 0; i < value.resourcesNum; ++i) {

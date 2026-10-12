@@ -48,7 +48,8 @@ enum class StageOutputKind {
     ClipDistance,
     CullDistance,
     Layer,
-    ViewportIndex
+    ViewportIndex,
+    StencilRef
 };
 
 struct PositionExportComponent {

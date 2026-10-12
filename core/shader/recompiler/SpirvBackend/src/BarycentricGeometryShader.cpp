@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -196,7 +199,30 @@ RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, co
     RecompileResult result;
     result.spirv = emitter.Emit(passed, perVertex, layout);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-    result.spirv = ValidateAndOptimizeSpirv(result.spirv, target.vulkanVersion, target.spirvVersion);
+    struct Built {
+        std::vector<std::uint32_t> spirv;
+        std::uint64_t variantId;
+    };
+    struct Memo {
+        std::mutex mutex;
+        std::map<std::pair<std::pair<std::uint32_t, std::uint32_t>, std::vector<std::uint32_t>>, std::shared_ptr<const Built>> built;
+    };
+    static Memo memo;
+    auto key = std::pair{std::pair{target.vulkanVersion, target.spirvVersion}, result.spirv};
+    {
+        std::lock_guard lock(memo.mutex);
+        if (const auto found = memo.built.find(key); found != memo.built.end()) {
+            result.spirv = found->second->spirv;
+            result.variantId = found->second->variantId;
+            return result;
+        }
+    }
+    auto built = std::make_shared<const Built>(Built{ValidateAndOptimizeSpirv(result.spirv, target.vulkanVersion, target.spirvVersion), NewVariantId()});
+    result.spirv = built->spirv;
+    result.variantId = built->variantId;
+    std::lock_guard lock(memo.mutex);
+    if (memo.built.size() >= 1024) memo.built.clear();
+    memo.built.emplace(std::move(key), std::move(built));
 #endif
     return result;
 }

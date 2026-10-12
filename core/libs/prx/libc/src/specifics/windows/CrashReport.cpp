@@ -252,13 +252,7 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     }
     const auto* context = info->ContextRecord;
     char line[MAX_PATH + 64];
-    char threadName[128] = "";
-    PWSTR description = nullptr;
-    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)) && description) {
-        WideCharToMultiByte(CP_UTF8, 0, description, -1, threadName, sizeof(threadName), nullptr, nullptr);
-        LocalFree(description);
-    }
-    Report("\nFATAL: unhandled exception 0x%08lx on thread %lu '%s'\n", record->ExceptionCode, GetCurrentThreadId(), threadName);
+    Report("\nFATAL: unhandled exception 0x%08lx on thread %lu\n", record->ExceptionCode, GetCurrentThreadId());
     DescribeAddress(context->Rip, line, sizeof(line));
     Report("  rip %s\n", line);
     if (record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
@@ -276,6 +270,15 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     Report("  rsi %016llx rdi %016llx rbp %016llx rsp %016llx\n", context->Rsi, context->Rdi, context->Rbp, context->Rsp);
     Report("  r8  %016llx r9  %016llx r10 %016llx r11 %016llx\n", context->R8, context->R9, context->R10, context->R11);
     Report("  r12 %016llx r13 %016llx r14 %016llx r15 %016llx\n", context->R12, context->R13, context->R14, context->R15);
+    // Read after the registers: GetThreadDescription allocates, and with a corrupted process heap the report must
+    // already hold the fault before anything allocates.
+    char threadName[128] = "";
+    PWSTR description = nullptr;
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)) && description) {
+        WideCharToMultiByte(CP_UTF8, 0, description, -1, threadName, sizeof(threadName), nullptr, nullptr);
+        LocalFree(description);
+    }
+    Report("  thread '%s'\n", threadName);
     // The words each register points at, to recognise which structure a bad pointer came from.
     {
         const std::pair<const char*, std::uint64_t> pointers[] = {{"rax", context->Rax}, {"rbx", context->Rbx}, {"rcx", context->Rcx}, {"rdx", context->Rdx}, {"rsi", context->Rsi}, {"rdi", context->Rdi}, {"r12", context->R12}, {"r13", context->R13}, {"r14", context->R14}, {"r15", context->R15}};
@@ -283,6 +286,20 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
             if (value < 0x10000 || (value & 7) != 0 || !IsReadable(value) || !IsReadable(value + 0x38)) continue;
             const auto* words = reinterpret_cast<const std::uint64_t*>(value);
             Report("  [%s] %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", name, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+        }
+    }
+    if (const char* dumps = std::getenv("APS5_CRASH_DUMP")) {
+        const auto image = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
+        for (const char* cursor = dumps; *cursor != '\0';) {
+            char* end = nullptr;
+            const auto rva = std::strtoull(cursor, &end, 16);
+            const auto bytes = *end == ':' ? std::strtoull(end + 1, &end, 16) : 0x40ull;
+            for (std::uint64_t at = image + rva; at < image + rva + bytes && IsReadable(at) && IsReadable(at + 0x1f); at += 0x20) {
+                const auto* words = reinterpret_cast<const std::uint64_t*>(at);
+                Report("  dump eboot+0x%llx: %016llx %016llx %016llx %016llx\n", static_cast<unsigned long long>(at - image), words[0], words[1], words[2], words[3]);
+            }
+            cursor = *end == ',' ? end + 1 : end;
+            if (end == cursor && *cursor != '\0') break;
         }
     }
     Report("  frame pointer chain:\n");

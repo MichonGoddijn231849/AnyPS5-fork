@@ -87,6 +87,9 @@ struct ImageResource {
     bool constantSwizzleCompatible = true;
     bool flatVolumeCompatible = true;
     bool flatLineCompatible = true;
+    // A wide table root (APS5_WIDE_BINDLESS): its entries are elements of the WideImages binding at the base the
+    // flattened SRT holds at indirectMappingOffset (with the entry count after it), indexed by the key.
+    bool wideTable = false;
     std::uint32_t byElements = 0;
     std::uint32_t byComponents = 0;
     IrBufferFormat packedFormat = IrBufferFormat::Invalid;

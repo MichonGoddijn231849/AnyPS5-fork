@@ -8,10 +8,15 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <vector>
 
 namespace ShaderRecompiler {
 namespace {
@@ -394,7 +399,26 @@ RectListShaders BuildRectListShaders(const RecompileResult& vertex, const Recomp
     }
     const auto components = static_cast<std::uint32_t>((parameters.size() + 1) * 4);
     require(limits.maxPatchSize >= 4 && components <= limits.maxControlPerVertexInputComponents && components <= limits.maxControlPerVertexOutputComponents && components <= limits.maxEvaluationInputComponents && components <= limits.maxEvaluationOutputComponents && limits.maxControlPerPatchOutputComponents >= 6 && components * 4 + 6 <= limits.maxControlTotalOutputComponents, "tessellation interface exceeds device limits");
-    const auto faultBinding = RuntimeAbi::BindingNumber(RuntimeAbi::Stage::TessellationControl, RuntimeAbi::Binding::FaultBuffer);
+    // The control stage's own runtime-ABI fault slot: the vertex and fragment stages number theirs in their own groups,
+    // so it never collides. (The slot after their highest binding was 0 for results rebuilt from prepared artifacts,
+    // which carry no binding list, and collided with the vertex stage's buffers: GTA V's characters were dropped.)
+    const std::uint32_t faultBinding = RuntimeAbi::BindingNumber(RuntimeAbi::Stage::TessellationControl, RuntimeAbi::Binding::FaultBuffer);
+    for (const auto* shader : {&vertex, &fragment}) {
+        for (const auto& binding : shader->bindings) require(binding.binding != faultBinding, "rect-list fault binding is taken by a guest stage");
+    }
+    // The two modules depend only on the parameters, the fault binding and the SPIR-V/Vulkan versions, and the driver
+    // builds them for every rect-list draw (with SPIR-V Tools validation and optimization): the result is kept by that
+    // key (bounded) and copied out. APS5_NO_RECT_LIST_MEMO=1 builds every time.
+    static const bool memoize = std::getenv("APS5_NO_RECT_LIST_MEMO") == nullptr;
+    using Key = std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::vector<std::array<std::uint32_t, 4>>>;
+    static std::mutex memoMutex;
+    static std::map<Key, RectListShaders> memo;
+    Key key{target.spirvVersion, target.vulkanVersion, faultBinding, {}};
+    if (memoize) {
+        for (const auto& parameter : parameters) std::get<3>(key).push_back({parameter.inputLocation, parameter.outputLocation, parameter.flat ? 1u : 0u, parameter.missing ? 1u : 0u});
+        std::lock_guard lock(memoMutex);
+        if (const auto found = memo.find(key); found != memo.end()) return found->second;
+    }
     RectListEmitter control(parameters, spv::ExecutionModelTessellationControl, target.spirvVersion, faultBinding);
     RectListEmitter evaluation(parameters, spv::ExecutionModelTessellationEvaluation, target.spirvVersion, faultBinding);
     RectListShaders shaders;
@@ -406,6 +430,11 @@ RectListShaders BuildRectListShaders(const RecompileResult& vertex, const Recomp
     shaders.control.spirv = ValidateAndOptimizeSpirv(shaders.control.spirv, target.vulkanVersion, target.spirvVersion);
     shaders.evaluation.spirv = ValidateAndOptimizeSpirv(shaders.evaluation.spirv, target.vulkanVersion, target.spirvVersion);
 #endif
+    if (memoize) {
+        std::lock_guard lock(memoMutex);
+        if (memo.size() >= 256) memo.clear();
+        memo.emplace(std::move(key), shaders);
+    }
     return shaders;
 }
 

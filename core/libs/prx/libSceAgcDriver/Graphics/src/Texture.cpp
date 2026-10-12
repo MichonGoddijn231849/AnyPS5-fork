@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -11,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -25,6 +27,7 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <map>
 #include <limits>
 #include <exception>
@@ -53,7 +56,13 @@ struct TextureProfile {
     // batch of their own (APS5_NO_RECORDED_CLEAR=1, or no recorder).
     std::uint64_t storageRecordedClears = 0;
     std::uint64_t storageWaitedClears = 0;
+    std::uint64_t storageUnwaitedClears = 0;
 };
+
+bool UnwaitedClears() {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_UNWAITED_CLEARS"); return text != nullptr && std::strcmp(text, "0") != 0; }();
+    return enabled;
+}
 
 TextureProfile& Profile() {
     static TextureProfile profile;
@@ -83,7 +92,7 @@ std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWrit
 // whose selected pending units were dropped because their memory is no longer registered (see
 // writeBackLayers), and pending units a DCC clear -> uncompressed key flip kept as the texels
 // (Refresh).
-std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKept{0};
+std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKept{0}, staleKeysKept{0};
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
@@ -286,7 +295,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory texture");
+        Check(AllocateGpuMemory(context, allocation, owned->memory, GpuMemoryKind::Texture, "texture", requirements.memoryTypeBits), "vkAllocateMemory texture");
+        owned->bytes = allocation.allocationSize;
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
 
         {
@@ -323,9 +333,9 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             VkCommandBuffer commands = VK_NULL_HANDLE;
             if (recorder != nullptr) {
                 commands = recorder->Commands();
-                recorder->Keep(staging, static_cast<std::size_t>(guestBytes));
-                recorder->Keep(tiled, static_cast<std::size_t>(guestBytes));
-                recorder->Keep(linear, static_cast<std::size_t>(linearBytes));
+                recorder->KeepTransient(staging, static_cast<std::size_t>(guestBytes));
+                recorder->KeepTransient(tiled, static_cast<std::size_t>(guestBytes));
+                recorder->KeepTransient(linear, static_cast<std::size_t>(linearBytes));
                 recorder->Keep(owned);
             } else {
                 batch = std::make_unique<CommandBatch>(context);
@@ -457,6 +467,14 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
     }
 }
 
+OwnedImage::~OwnedImage() {
+    if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
+    if (memory) {
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        CountGpuMemory(GpuMemoryKind::Texture, -static_cast<std::int64_t>(bytes));
+    }
+}
+
 bool Texture::CanCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor) {
     const auto& from = source.Descriptor();
     if (IsBlockCompressed(descriptor.format) || IsBlockCompressed(from.format)) return false;
@@ -504,16 +522,22 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
     }
 }
 
-Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components) : context(context) {
+Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType, std::uint32_t baseLayer) : context(context) {
     layout = VK_IMAGE_LAYOUT_GENERAL;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = depthImage;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.viewType = viewType;
     viewInfo.format = depthFormat;
     viewFormat = depthFormat;
     viewInfo.components = components;
-    viewInfo.subresourceRange = {aspect, 0, 1, 0, 1};
+    viewInfo.subresourceRange = {aspect, 0, 1, baseLayer, viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : VK_REMAINING_ARRAY_LAYERS};
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth plane");
+    if (viewType == VK_IMAGE_VIEW_TYPE_2D_ARRAY) {
+        // A 2D binding of the array reads its base slice.
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.subresourceRange.layerCount = 1;
+        Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &firstLayerView), "vkCreateImageView depth plane first layer");
+    }
     viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
 }
 
@@ -746,7 +770,8 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         allocation.allocationSize = requirements.size;
         memoryBytes = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory storage texture");
+        Check(AllocateGpuMemory(context, allocation, memory, GpuMemoryKind::StorageImage, "storage texture", requirements.memoryTypeBits), "vkAllocateMemory storage texture");
+        memoryBytes = allocation.allocationSize;
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
         uploadReason = "first";
         upload();
@@ -761,7 +786,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
             auto& totals = Profile();
             totals.storageCreate += timer.lap();
             totals.storageBytes += guestBytes;
-            if (++totals.storageCount % 50 == 0) std::fprintf(stderr, "[texture] %llu storage images (%.0f MiB): create %.0f ms, write-back %.0f ms (alloc %.0f, host copy %.0f, gpu %.0f, store %.0f), %llu reused, %llu direct uploads, %llu direct write-backs, clears %llu recorded / %llu waited\n", static_cast<unsigned long long>(totals.storageCount), totals.storageBytes / 1048576.0, totals.storageCreate, totals.storageWriteBack, totals.storageAlloc, totals.storageHostCopy, totals.storageGpu, totals.storageStore, static_cast<unsigned long long>(totals.storageReused), static_cast<unsigned long long>(totals.storageDirectUploads), static_cast<unsigned long long>(totals.storageDirectWriteBacks), static_cast<unsigned long long>(totals.storageRecordedClears), static_cast<unsigned long long>(totals.storageWaitedClears));
+            if (++totals.storageCount % 50 == 0) std::fprintf(stderr, "[texture] %llu storage images (%.0f MiB): create %.0f ms, write-back %.0f ms (alloc %.0f, host copy %.0f, gpu %.0f, store %.0f), %llu reused, %llu direct uploads, %llu direct write-backs, clears %llu recorded / %llu waited / %llu unwaited\n", static_cast<unsigned long long>(totals.storageCount), totals.storageBytes / 1048576.0, totals.storageCreate, totals.storageWriteBack, totals.storageAlloc, totals.storageHostCopy, totals.storageGpu, totals.storageStore, static_cast<unsigned long long>(totals.storageReused), static_cast<unsigned long long>(totals.storageDirectUploads), static_cast<unsigned long long>(totals.storageDirectWriteBacks), static_cast<unsigned long long>(totals.storageRecordedClears), static_cast<unsigned long long>(totals.storageWaitedClears), static_cast<unsigned long long>(totals.storageUnwaitedClears));
         }
     } catch (...) {
         release();
@@ -816,7 +841,7 @@ private:
 
 // Storage images whose results have not reached guest memory yet.
 struct PendingWrites {
-    std::mutex mutex;
+    SlimMutex mutex;
     PendingList textures;
     // Images taken out of `textures` by a FlushPending still storing them (see adjacentPendingUnchanged).
     std::vector<StorageTexture*> flushing;
@@ -1001,6 +1026,10 @@ bool AdjacentGenerationEnabled() {
     return !disabled;
 }
 
+}
+
+bool ClearColorForTexel(VkFormat format, std::uint32_t elementBytes, std::span<const std::uint32_t, 4> pattern, VkClearColorValue& clear) {
+    return FillClearColor(format, elementBytes, pattern, clear);
 }
 
 bool ClearKeepsDenormals(const Context& context, VkFormat format) {
@@ -1335,7 +1364,23 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
+namespace {
+
+std::atomic<std::uint64_t> targetProofMisses{0};
+
+}
+
+std::array<std::uint64_t, 3> StorageTexture::ClearCounts() {
+    const auto& profile = Profile();
+    return {profile.storageRecordedClears, profile.storageWaitedClears, profile.storageUnwaitedClears};
+}
+
+std::pair<std::uint64_t, std::uint64_t> StorageTexture::TargetProofCounts() {
+    return {refreshesProved.load(std::memory_order_relaxed), targetProofMisses.load(std::memory_order_relaxed)};
+}
+
 bool StorageTexture::Refresh() {
+    if (unwaitedClear != nullptr && unwaitedClear->Finished()) unwaitedClear.reset();
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (refreshProved()) {
@@ -1344,6 +1389,7 @@ bool StorageTexture::Refresh() {
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
         return true;
     }
+    targetProofMisses.fetch_add(1, std::memory_order_relaxed);
     refreshProof = {};
     struct Exempt {
         const StorageTexture* previous;
@@ -1414,6 +1460,14 @@ bool StorageTexture::Refresh() {
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         keys = ProvedKeys();
         if (profile && descriptor.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, keysStart);
+        // A clear code whose key bytes nobody wrote since this image's content (its generation) predates
+        // that content: the title cleared, then rendered into the image. The recorded keys were stale; the
+        // rendered results stay instead of being dropped as dead. Opt-in (APS5_KEYS_SINCE_IMAGE=1): it did not cure GTA V's bloom blobs.
+        static const bool keysSinceImage = [] { const char* text = std::getenv("APS5_KEYS_SINCE_IMAGE"); return text != nullptr && std::strcmp(text, "0") != 0; }();
+        if (keysSinceImage && keys != uploadedKeys && IsDccClear(keys) && descriptor.dccAddress != 0 && generation != 0 && anyLayerPending() && GuestMemory::UnchangedSince(descriptor.dccAddress, static_cast<std::size_t>(std::max<std::uint64_t>(guestBytes / 256, 1)), generation)) {
+            staleKeysKept.fetch_add(1, std::memory_order_relaxed);
+            uploadedKeys = keys;
+        }
         if (keys != uploadedKeys) {
             changed.assign(trackedLayers, true);
             unchanged = false;
@@ -1523,8 +1577,11 @@ bool StorageTexture::Refresh() {
     // with their results, which are stored first, as the layer model does; new keys that are a
     // clear code make every result dead on hardware too. Without a generation (no tracking) a
     // unit's stamps say nothing, so it is stored.
+    // Debug aid: APS5_NO_UNIT_DROP=1 stores a changed unit's results instead of dropping them for the CPU's bytes.
+    static const bool noUnitDrop = std::getenv("APS5_NO_UNIT_DROP") != nullptr;
     const auto droppable = [&](std::uint32_t unit) {
         if (keysChanged && IsDccClear(keys)) return true;
+        if (noUnitDrop) return false;
         if (compared) return stampedBlocks.at(unit) == GuestMemory::BlockWritten;
         if (!tracked || layerGeneration[unit] == 0 || unit >= stampedBlocks.size() || stampedBlocks[unit] != GuestMemory::BlockWritten) return false;
         const auto begin = layerBegin(unit);
@@ -1574,7 +1631,9 @@ bool StorageTexture::Refresh() {
     if (anyStored && !keysChanged && descriptor.dccAddress != 0 && IsDccClear(uploadedKeys)) stored.assign(trackedLayers, true);
     if (pendingResults) {
         static std::atomic<int> reports{0};
-        if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] storage image 0x%llx: guest memory changed while GPU results were pending; keeping the CPU's blocks\n", static_cast<unsigned long long>(descriptor.baseAddress));
+        // APS5_TRACE_FLUSH reports every image, with why its memory counts as changed.
+        static const bool traceAll = std::getenv("APS5_TRACE_FLUSH") != nullptr;
+        if (traceAll || reports.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] storage image 0x%llx: guest memory changed while GPU results were pending; keeping the CPU's blocks (cpu wrote %d, dirty %d, keys changed %d, tracked %d)\n", static_cast<unsigned long long>(descriptor.baseAddress), cpuWrote ? 1 : 0, dirty ? 1 : 0, keysChanged ? 1 : 0, tracked ? 1 : 0);
     }
     if (anyStored) {
         const auto previous = std::exchange(flushReason, "refresh");
@@ -1743,6 +1802,19 @@ constexpr std::uint64_t GenerationBaselineBytes = 1ull << 20;
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
+    // Debug aid: APS5_TRACE_STALE_UPLOADS=1 names every other image whose results are still pending in the
+    // memory this upload reads (once per pair): the upload would read guest bytes those results replace.
+    static const bool traceStale = std::getenv("APS5_TRACE_STALE_UPLOADS") != nullptr;
+    if (traceStale) {
+        static std::mutex staleMutex;
+        static std::set<std::pair<std::uint64_t, std::uint64_t>> reported;
+        for (const auto& other : overlappingPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+            if (other.get() == this) continue;
+            std::lock_guard lock(staleMutex);
+            if (!reported.insert({descriptor.baseAddress ^ (static_cast<std::uint64_t>(descriptor.format) << 48u), other->descriptor.baseAddress ^ (static_cast<std::uint64_t>(other->descriptor.format) << 48u)}).second) continue;
+            std::fprintf(stderr, "[stale-upload] storage image 0x%llx+0x%llx %ux%u fmt %u tile %u mips %u (%s) uploads over pending results of 0x%llx+0x%llx %ux%u fmt %u tile %u mips %u\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, static_cast<unsigned>(descriptor.format), static_cast<unsigned>(descriptor.tileMode), descriptor.mipCount, uploadReason, static_cast<unsigned long long>(other->descriptor.baseAddress), static_cast<unsigned long long>(other->guestBytes), other->descriptor.width, other->descriptor.height, static_cast<unsigned>(other->descriptor.format), static_cast<unsigned>(other->descriptor.tileMode), other->descriptor.mipCount);
+        }
+    }
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto elementBytes = BytesPerElement(descriptor.format);
@@ -1776,7 +1848,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         // The clear is recorded into the open batch like a direct upload (the image kept by it): a
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
         // under the GPU mutex at the movie stage. APS5_NO_RECORDED_CLEAR=1 waits as before.
-        captureGuestBytes(nullptr);
+        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) originalValid = false;
+        else captureGuestBytes(nullptr);
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
         static const bool recordClear = std::getenv("APS5_NO_RECORDED_CLEAR") == nullptr;
@@ -1795,9 +1868,11 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 recorder->NoteAccess(Recorder::CommandClass::DccClear, Recorder::Access{{}, {}, std::span(&cleared, 1), VK_PIPELINE_STAGE_TRANSFER_BIT});
             }
         } else {
+            unwaitedClear.reset();
             batch = std::make_unique<CommandBatch>(context);
             commands = batch->Handle();
-            ++Profile().storageWaitedClears;
+            if (UnwaitedClears()) ++Profile().storageUnwaitedClears;
+            else ++Profile().storageWaitedClears;
         }
         VkImageMemoryBarrier toClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         toClear.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1816,8 +1891,14 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
-        if (batch) batch->SubmitAndWait();
-        else recorder->EndGpuTiming(timing, guestBytes);
+        if (batch && UnwaitedClears()) {
+            batch->Submit();
+            unwaitedClear = std::move(batch);
+        } else if (batch) {
+            batch->SubmitAndWait();
+        } else {
+            recorder->EndGpuTiming(timing, guestBytes);
+        }
         countStorageUpload(0, guestBytes);
         ++version;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadClear, start);
@@ -1873,7 +1954,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             recorder->FlushStoresOverlapping(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
             commands = recorder->Commands();
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
-            if (linear) recorder->Keep(linear, linear->Size());
+            if (linear) recorder->KeepTransient(linear, static_cast<std::size_t>(linearBytes));
             // The image itself must outlive the recorded copy: the cache may evict it right after.
             if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
             // The detile reads the tiled bytes from the import when the batch runs.
@@ -2626,7 +2707,10 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         }
         if (superseded) source->reconcilePending();
     }
-    if (eager) {
+    // APS5_EAGER_LINEAR_WRITEBACK=1 (ported from wolverine-capture fd90b7b1d): linear images are stored at once. The
+    // CPU reads such results straight from memory (Wolverine's occlusion depth readback), which no flush hook sees.
+    static const bool linearEager = std::getenv("APS5_EAGER_LINEAR_WRITEBACK") != nullptr;
+    if (eager || (linearEager && descriptor.tileMode == TextureTileMode::kLinear)) {
         WriteBack();
         return;
     }
@@ -2858,6 +2942,16 @@ std::vector<std::shared_ptr<StorageTexture>> StorageTexture::overlappingPending(
     return overlapping;
 }
 
+std::vector<std::string> StorageTexture::DescribePendingOverlaps(std::uint64_t address, std::size_t bytes) {
+    std::vector<std::string> result;
+    for (const auto& texture : overlappingPending(address, bytes)) {
+        char text[200];
+        std::snprintf(text, sizeof(text), "0x%llx+0x%llx %ux%u fmt %u tile %u mips %u", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), texture->descriptor.width, texture->descriptor.height, static_cast<unsigned>(texture->descriptor.format), static_cast<unsigned>(texture->descriptor.tileMode), texture->descriptor.mipCount);
+        result.emplace_back(text);
+    }
+    return result;
+}
+
 bool StorageTexture::blocksKept(std::span<const std::shared_ptr<StorageTexture>> images, std::uint64_t address, std::size_t bytes) {
     // The stamps are read outside the registry mutex (the tracker lock is never taken under it);
     // per pending layer, as the keep decision of writeBackLayers reads them.
@@ -3010,9 +3104,11 @@ bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
         query.found = nullptr;
         if (query.end <= query.begin) continue;
         const auto bytes = static_cast<std::size_t>(query.end - query.begin);
-        for (const auto* texture : pending.textures) {
-            if (query.found == nullptr && texture->descriptor.baseAddress == query.begin && texture->guestBytes >= bytes) query.found = texture;
-            if (texture != query.except && texture->overlaps(query.begin, bytes)) query.overlaps = true;
+        if (pending.textures.MayOverlap(query.begin, bytes)) {
+            for (const auto* texture : pending.textures) {
+                if (query.found == nullptr && texture->descriptor.baseAddress == query.begin && texture->guestBytes >= bytes) query.found = texture;
+                if (texture != query.except && texture->overlaps(query.begin, bytes)) query.overlaps = true;
+            }
         }
         for (const auto* texture : pending.flushing) {
             if (texture != query.except && texture->overlaps(query.begin, bytes)) query.overlaps = true;
@@ -3753,6 +3849,8 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    static const bool traceBindings = std::getenv("APS5_TRACE_STORAGE_BINDINGS") != nullptr;
+    if (traceBindings) std::fprintf(stderr, "[storage-binding] write-back 0x%llx format %u view %p object %p reason %s\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.format, reinterpret_cast<void*>(view), static_cast<void*>(this), flushReason);
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -4131,6 +4229,7 @@ StorageTexture::~StorageTexture() {
 }
 
 void StorageTexture::release() noexcept {
+    unwaitedClear.reset();
     for (const auto& [mip, extra] : extraViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, extra, nullptr);
     extraViews.clear();
     for (const auto& [mip, extra] : firstLayerViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, extra, nullptr);
@@ -4150,7 +4249,10 @@ void StorageTexture::release() noexcept {
     if (proxyMemory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, proxyMemory, nullptr);
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) {
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        CountGpuMemory(GpuMemoryKind::StorageImage, -static_cast<std::int64_t>(memoryBytes));
+    }
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {

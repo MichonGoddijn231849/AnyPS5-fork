@@ -265,7 +265,7 @@ void ZeroReusedPhysical(std::uint64_t start, std::size_t bytes) {
 
 class PhysicalBacking {
 public:
-    PhysicalBacking(std::size_t bytes, int memoryType, std::uint64_t start) : memoryType(memoryType), bytes(bytes) {
+    PhysicalBacking(std::size_t bytes, int memoryType, std::uint64_t start) : start(start), bytes(bytes), memoryType(memoryType) {
 #ifdef _WIN32
         static_cast<void>(start);
         const auto size = static_cast<std::uint64_t>(bytes);
@@ -284,6 +284,8 @@ public:
     }
 
     int MemoryType() const { return memoryType; }
+    std::uint64_t Start() const { return start; }
+    std::size_t Bytes() const { return bytes; }
 
 #if defined(__linux__)
     int File() const { return file; }
@@ -319,8 +321,9 @@ public:
     }
 
 private:
-    int memoryType;
+    std::uint64_t start;
     std::size_t bytes;
+    int memoryType;
 #ifdef _WIN32
     HANDLE section = nullptr;
 #else
@@ -495,7 +498,7 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
     ValidateRange(addr, len, PS5_PAGE_SIZE);
     Trace("remap fixed %p+0x%zx prot=0x%x phys=0x%llx", addr, len, prot, static_cast<long long>(physStart));
     const auto nativeProtection = LinuxProtFromSce(prot);
-    mutation.Protect(addr, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
+    mutation.Protect(addr, len, (nativeProtection & PROT_READ) != 0, (nativeProtection & PROT_WRITE) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
         const auto address = reinterpret_cast<std::uintptr_t>(addr);
         std::lock_guard lock(g_directLock);
         if (physStart >= 0) {
@@ -510,7 +513,7 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
             GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(addr, len);
 #endif
         }
-    });
+    }, prot);
     return true;
 }
 
@@ -778,10 +781,11 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     ReplaceFixedOverlap(mutation, *addr, len, flags);
     std::lock_guard lock(g_directLock);
     ValidatePhysicalRange(static_cast<std::uint64_t>(physStart), len);
+    const auto nativeProtection = LinuxProtFromSce(prot);
     void* mapped = MapAligned(*addr, len, PROT_NONE, flags, alignment);
     try {
-        AddMapping(reinterpret_cast<std::uintptr_t>(mapped), len, static_cast<std::uint64_t>(physStart), LinuxProtFromSce(prot));
-        mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0);
+        AddMapping(reinterpret_cast<std::uintptr_t>(mapped), len, static_cast<std::uint64_t>(physStart), nativeProtection);
+        mutation.Add(mapped, len, (nativeProtection & PROT_READ) != 0, (nativeProtection & PROT_WRITE) != 0, (prot & GuestProtGpuReadWrite) != 0, prot);
     } catch (...) {
         EraseMappings(reinterpret_cast<std::uintptr_t>(mapped), reinterpret_cast<std::uintptr_t>(mapped) + len);
         Unmap(mapped, len);
@@ -805,9 +809,10 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment) {
         return 0;
     }
     ReplaceFixedOverlap(mutation, *addr, len, flags);
-    void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, alignment);
+    const auto nativeProtection = LinuxProtFromSce(prot);
+    void* mapped = MapAligned(*addr, len, nativeProtection, flags, alignment);
     try {
-        mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0);
+        mutation.Add(mapped, len, (nativeProtection & PROT_READ) != 0, (nativeProtection & PROT_WRITE) != 0, (prot & GuestProtGpuReadWrite) != 0, prot);
     } catch (...) {
         Unmap(mapped, len);
         throw;
@@ -860,9 +865,9 @@ int DoMprotect(const void* addr, size_t len, int prot) {
 #else
     mutation.RegisterMainImage();
 #endif
-    mutation.Protect(pointer, bytes, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
+    mutation.Protect(pointer, bytes, (nativeProtection & PROT_READ) != 0, (nativeProtection & PROT_WRITE) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
         if (mprotect(const_cast<void*>(pointer), bytes, nativeProtection) != 0) throw std::system_error(errno, std::generic_category(), "mprotect failed");
-    });
+    }, prot);
     RecordProtection(pointer, bytes, prot);
     return 0;
 }
@@ -918,9 +923,27 @@ int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
     }
     if (fixed) mutation.RequireAvailable(*addr, len);
     constexpr int GuestMapNoCoalesce = 0x400000;
-    void* mapped = MapAligned(fixed ? *addr : nullptr, len, PROT_NONE, fixed ? GuestMapFixedFlag | (flags & GuestMapNoCoalesce) : 0, alignment);
+    static const bool honorHint = std::getenv("APS5_RESERVE_HONOR_HINT") != nullptr;
+    bool hinted = false;
+    if (!fixed && honorHint && *addr != nullptr && (reinterpret_cast<std::uintptr_t>(*addr) % (alignment != 0 ? alignment : PS5_PAGE_SIZE)) == 0) {
+        try {
+            mutation.RequireAvailable(*addr, len);
+            hinted = true;
+        } catch (const std::exception&) {
+            hinted = false;
+        }
+    }
+    void* mapped = nullptr;
+    if (hinted) {
+        try {
+            mapped = MapAligned(*addr, len, PROT_NONE, GuestMapFixedFlag | (flags & GuestMapNoCoalesce), alignment);
+        } catch (const std::exception&) {
+            mapped = nullptr;
+        }
+    }
+    if (mapped == nullptr) mapped = MapAligned(fixed ? *addr : nullptr, len, PROT_NONE, fixed ? GuestMapFixedFlag | (flags & GuestMapNoCoalesce) : 0, alignment);
     try {
-        mutation.Add(mapped, len, false, false, false);
+        mutation.Add(mapped, len, false, false, false, 0);
     } catch (...) {
         Unmap(mapped, len);
         throw;
@@ -992,6 +1015,13 @@ bool QueryDirectMapping(std::uintptr_t address, std::uintptr_t* start, std::uint
     *offset = it->second.phys;
     *memoryType = it->second.memoryType;
     return true;
+}
+
+extern "C" void DirectMemoryMappings_nid_postfix(std::vector<DirectMappingInfo>* mappings) {
+    std::lock_guard lock(g_directLock);
+    mappings->clear();
+    mappings->reserve(g_directMappings.size());
+    for (const auto& [address, mapping] : g_directMappings) mappings->push_back({address, mapping.end, mapping.phys, mapping.memoryType, mapping.backing.get(), mapping.phys - mapping.backing->Start(), mapping.backing->Bytes()});
 }
 
 std::vector<DirectMemoryView> DirectMemoryViews(int64_t start, size_t len) {

@@ -2,18 +2,48 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Capture/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NullSubmit.hpp"
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
+#include <string_view>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+bool orderedFills() {
+    static const bool ordered = std::getenv("APS5_PIPELINE_DRAIN_FILLS") == nullptr;
+    return ordered;
+}
+
+bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode) {
+    if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
+    if (Pm4::DrawOpcode(opcode)) return true;
+    switch (opcode) {
+        case 0x11: case 0x12: case 0x13: case 0x26: case 0x2a: case 0x2f: case 0x42: case 0x58: case 0x59: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: return true;
+        case 0x46: return packet.size() >= 2 && (packet[1] & 0x3fu) != 0x39u;
+        case 0x15: return orderedFills();
+        case 0x63: case 0x64: case 0x9f:
+            return packet.size() >= 5 && !DrawPipeline::Queue0().Overlaps(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u), static_cast<std::size_t>(packet[4]) * 8);
+        case 0x10: {
+            const auto operation = (header >> 2u) & 0x3fu;
+            return operation == 0 || operation == 0x09 || operation == 0x0b || operation == 0x0c || operation == 0x1a;
+        }
+        default: return false;
+    }
+}
+
+}
 
 template <typename TWork>
 void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
@@ -29,7 +59,69 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
     }
 }
 
+template <typename TWork>
+void Driver::tolerateDispatch(TWork&& work) {
+    static const bool enabled = std::getenv("APS5_NO_TOLERATE_DISPATCH") == nullptr;
+    if (!enabled) {
+        work();
+        return;
+    }
+    try {
+        work();
+    } catch (const std::exception& error) {
+        const std::string_view what = error.what();
+        if (what.find("compute shader 0x") == std::string_view::npos) throw;
+        reportSkip("dispatch", error.what());
+    }
+}
+
+bool Driver::relieveMemory(std::uint64_t failures, const std::exception& error, bool throttled) {
+    if (Graphics::OutOfMemoryFailures() == failures || GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    const std::string_view what = error.what();
+    const auto result = what.rfind("Vulkan result -");
+    if (result == std::string_view::npos) return false;
+    const auto code = what.substr(result + 14, 3);
+    if (code.substr(0, 2) != "-1" && code.substr(0, 2) != "-2") return false;
+    if (code.size() > 2 && code[2] >= '0' && code[2] <= '9') return false;
+    const auto relief = device.Load();
+    if (relief == nullptr) return false;
+    static std::atomic<std::int64_t> lastRelief{0};
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (throttled && now - lastRelief.load(std::memory_order_relaxed) < 1000) return false;
+    lastRelief.store(now, std::memory_order_relaxed);
+    const auto freed = relief->RelieveMemory();
+    std::fprintf(stderr, "[gpumem] %s; freed %.0f MiB%s\n", error.what(), freed / 1048576.0, throttled ? "" : ", trying the packet once more");
+    return true;
+}
+
+template <typename TWork>
+void Driver::retryOutOfMemory(TWork&& work) {
+    const auto failures = Graphics::OutOfMemoryFailures();
+    try {
+        work();
+        return;
+    } catch (const std::exception& error) {
+        if (!relieveMemory(failures, error, false)) throw;
+    }
+    work();
+}
+
 void Driver::execute(const Submission& submission) {
+    const bool pipelined = submission.queue == 0 && DrawPipeline::Depth() != 0;
+    static const bool orderedWaits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
+    DrawPipeline::Active() = pipelined;
+    struct PipelineDrain {
+        bool pipelined;
+        ~PipelineDrain() {
+            if (!pipelined || std::uncaught_exceptions() == 0) return;
+            try {
+                DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+            } catch (...) {
+            }
+        }
+    } pipelineDrain{pipelined};
+    static const bool orderedCompletion = std::getenv("APS5_PIPELINE_DRAIN_SUBMISSIONS") == nullptr && orderedWaits;
+    if (pipelined && (submission.suspend || !orderedCompletion)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;
@@ -72,7 +164,9 @@ void Driver::execute(const Submission& submission) {
     {
         std::lock_guard lock(mutex);
         if (submission.queue == 0 && resetGraphics) {
+            auto markers = std::move(queues[0].markers);
             queues.erase(0);
+            queues[0].markers = std::move(markers);
             resetGraphics = false;
         }
         state = &queues[submission.queue];
@@ -108,13 +202,40 @@ void Driver::execute(const Submission& submission) {
     auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);
     ++packetProfile.submissions;
 
-    bumpEpoch(&EpochBumps::submissions);
+    // A submission sees the CPU writes made before it was submitted. When that was before this
+    // worker's current collect epoch began, every walk of the epoch already covers them (each walk
+    // happened after the bump), so the epoch goes on: a worker behind a queue of submissions walks
+    // a surface once per catch-up instead of once per submission. APS5_SUBMISSION_EPOCH_EACH=1
+    // starts an epoch at every submission as before.
+    // A REWIND tail counts as submitted when the CPU released it: noteReleasedTails reads, before the
+    // bump, which tails of the chain are released already (executeRewindTail dates those before it).
+    static const bool epochEach = std::getenv("APS5_SUBMISSION_EPOCH_EACH") != nullptr;
+    if (epochEach || submission.enqueuedAt == std::chrono::steady_clock::time_point{} || submission.enqueuedAt > lastEpochBump()) {
+        if (!epochEach) noteReleasedTails(submission);
+        bumpEpoch(&EpochBumps::submissions);
+    }
     clearResolvedAhead();
     gateOpened() = true;
     struct ClearAhead {
         ~ClearAhead() { clearResolvedAhead(); }
     } clearAhead;
+    // A frame capture can start while this submission is unfinished: publish where it is.
+    const bool publishInFlight = submission.source != nullptr && submission.queue < inFlightSource.size() && Capture::FrameCapture::Get().Active();
+    struct InFlight {
+        std::atomic<const std::uint32_t*>* source;
+        ~InFlight() { if (source != nullptr) source->store(nullptr, std::memory_order_release); }
+    } inFlight{publishInFlight ? &inFlightSource[submission.queue] : nullptr};
+    if (publishInFlight) {
+        inFlightCursor[submission.queue].store(0, std::memory_order_relaxed);
+        inFlightWords[submission.queue].store(submission.commands.size(), std::memory_order_relaxed);
+        inFlightCommands[submission.queue].store(submission.commands.data(), std::memory_order_relaxed);
+        inFlightRewindTail[submission.queue].store(submission.rewindTail, std::memory_order_relaxed);
+        inFlightRewindWords[submission.queue].store(submission.rewindWords, std::memory_order_relaxed);
+        inFlightReceived[submission.queue].store(submission.received, std::memory_order_relaxed);
+        inFlightSource[submission.queue].store(submission.source, std::memory_order_release);
+    }
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
+        if (publishInFlight) inFlightCursor[submission.queue].store(cursor, std::memory_order_relaxed);
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
         const auto header = submission.commands[cursor];
@@ -126,6 +247,24 @@ void Driver::execute(const Submission& submission) {
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
+        if (pipelined && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !(Pm4::Predicated(header) && queue.predication.operation != 0) && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue))) {
+            traceLabel(packet, submission.queue);
+            recent.Record(cursor);
+            packetsExecuted[submission.queue].fetch_add(1, std::memory_order_release);
+            cursor += count;
+            continue;
+        }
+        if (pipelined && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && orderedWaits && DrawPipeline::Queue0().Busy()) {
+            const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+            if (const auto value = DrawPipeline::Queue0().PendingLabel(awaited, Pm4::WaitAwaitedBytes(packet)); value.has_value() && Pm4::WaitComparesValue(packet, *value)) {
+                ++waitOutcomes().fromRecorderSameQueue;
+                recent.Record(cursor);
+                packetsExecuted[submission.queue].fetch_add(1, std::memory_order_release);
+                cursor += count;
+                continue;
+            }
+        }
+        if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
         if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
 
@@ -215,6 +354,7 @@ void Driver::execute(const Submission& submission) {
                 if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
             }
             ++flipsCounted;
+            Pm4::NoteTimestampFlip();
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
 
@@ -237,8 +377,8 @@ void Driver::execute(const Submission& submission) {
                 gateOpened() = false;
                 timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
             }
-            if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
-            else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { tolerateDispatch([&] { retryOutOfMemory([&] { dispatch(queue, packet, submission); }); }); });
+            else timed(&WorkerProfile::dispatchMs, [&] { tolerateDispatch([&] { retryOutOfMemory([&] { dispatchIndirect(queue, packet, submission); }); }); });
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(opcode == 0x16);
         } else if (opcode == 0x3c || opcode == 0x93) {
@@ -259,17 +399,80 @@ void Driver::execute(const Submission& submission) {
                 }
             }
         } else if (drawPacket) {
+            // DRAW_INDEX_2 and DRAW_INDEX_OFFSET_2 write their MAX_SIZE into VGT_DMA_MAX_SIZE (the register
+            // INDEX_BUFFER_SIZE writes) and DRAW_INDEX_2 its index base into VGT_DMA_BASE; both persist, so a later
+            // indirect indexed draw (Wolverine's DRAW_INDEX_INDIRECT_MULTI) reads the last draw's index buffer.
+            if (opcode == 0x27 && packet.size() >= 6) {
+                queue.indexBufferSize = packet[1];
+                queue.indexBase = (static_cast<std::uint64_t>(packet[3]) << 32u) | packet[2];
+            } else if (opcode == 0x35 && packet.size() >= 5) {
+                queue.indexBufferSize = packet[1];
+            }
             landPendingWaits(submission.queue);
             bool drawn = false;
             timed(&WorkerProfile::drawMs, [&] {
                 static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
                 static const bool profileDraws = std::getenv("APS5_PROFILE_DRAW") != nullptr;
                 const auto color = (static_cast<std::uint64_t>(readRegister(queue.context, 0x390)) << 40u) | (static_cast<std::uint64_t>(readRegister(queue.context, 0x318)) << 8u);
+                // Debug aid: APS5_TRACE_DRAW_TARGETS=1 prints each draw packet with its color and depth targets, its
+                // pixel and geometry programs, its counts and, for an indirect draw, the first argument record as
+                // guest memory holds it at the packet (with APS5_SYNC_DISPATCH=1 the compute that wrote it is done).
+                static const bool traceTargets = std::getenv("APS5_TRACE_DRAW_TARGETS") != nullptr;
+                if (traceTargets) {
+                    const auto peek = [](const auto& registers, std::uint32_t offset) -> std::uint64_t {
+                        const auto found = registers.find(offset);
+                        return found == registers.end() ? 0u : static_cast<std::uint64_t>(found->second);
+                    };
+                    const auto depth = peek(queue.context, 0x014) << 8u;
+                    const auto ps = peek(queue.shader, 0x008) << 8u;
+                    const auto gs = peek(queue.shader, 0x088) << 8u;
+                    const auto vs = peek(queue.shader, 0x048) << 8u;
+                    std::string args;
+                    try {
+                        const auto parameters = Pm4::ResolveDraw(packet, queue);
+                        char text[160];
+                        std::snprintf(text, sizeof(text), " indexCount %u instances %u", parameters.indexCount, parameters.instanceCount);
+                        args = text;
+                        if (parameters.indirect && GuestMemory::Accessible(reinterpret_cast<const void*>(parameters.indirect->arguments), 20u)) {
+                            const auto* words = reinterpret_cast<const std::uint32_t*>(parameters.indirect->arguments);
+                            std::snprintf(text, sizeof(text), " indirect x%u args %u %u %u %u %u", parameters.indirect->count, words[0], words[1], words[2], words[3], words[4]);
+                            args += text;
+                        }
+                    } catch (const std::exception&) {
+                        args = " (unresolved)";
+                    }
+                    std::fprintf(stderr, "[draw-target] %s color 0x%llx depth 0x%llx ps 0x%llx gs 0x%llx vs 0x%llx%s\n", Pm4::Name(header).c_str(), static_cast<unsigned long long>(color), static_cast<unsigned long long>(depth), static_cast<unsigned long long>(ps), static_cast<unsigned long long>(gs), static_cast<unsigned long long>(vs), args.c_str());
+                }
                 const auto started = profileDraws ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 const auto countSkip = [&](Graphics::DrawSkip kind) {
                     if (profileDraws) Graphics::CountDrawSkip(kind, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count());
                 };
 
+                const auto skipped = [&](const std::string& what) {
+                    if (traceDraws) std::fprintf(stderr, "[draw] target 0x%llx mask 0x%x failed: %.160s\n",static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), what.c_str());
+
+                    char suffix[80];
+                    std::snprintf(suffix, sizeof(suffix), " [%s, color target 0x%llx]", Pm4::Name(header).c_str(), static_cast<unsigned long long>(color));
+                    // Every refused draw, not only the first of each reason (reportSkip): tools/fidelity counts them.
+                    if (Graphics::TraceDrawIo()) std::fprintf(stderr, "[draw-io] %s color 0x%llx+0x0(0x0 f0 t0) skipped: %.300s\n", drawIoTag(queue, submission.queue, submission.serial, header).c_str(), static_cast<unsigned long long>(color), what.c_str());
+
+                    static std::set<std::pair<std::uint64_t, std::string>> dumpedTargets;
+                    const std::string reason = what.substr(0, 48);
+                    if (dumpedTargets.insert({color, reason}).second) {
+                        char name[64];
+                        std::snprintf(name, sizeof(name), "draw_%llx_%08x.regs", static_cast<unsigned long long>(color), static_cast<std::uint32_t>(std::hash<std::string>{}(reason)));
+                        if (std::FILE* file = std::fopen(name, "w")) {
+                            std::fprintf(file, "# %s\n", what.c_str());
+                            recent.Print(file, "# packet %s\n");
+                            for (const auto& [offset, value] : queue.context) std::fprintf(file, "context %x %08x\n", offset, value);
+                            for (const auto& [offset, value] : queue.userConfig) std::fprintf(file, "uconfig %x %08x\n", offset, value);
+                            for (const auto& [offset, value] : queue.shader) std::fprintf(file, "shader %x %08x\n", offset, value);
+                            std::fclose(file);
+                        }
+                    }
+                    reportSkip("draw", what + suffix);
+                };
+                const auto failures = Graphics::OutOfMemoryFailures();
                 try {
                     std::string rejected;
                     const auto verdict = draw(queue, packet, submission, rejected);
@@ -286,7 +489,10 @@ void Driver::execute(const Submission& submission) {
                 } catch (const std::exception& error) {
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
                     countSkip(Graphics::DrawSkip::Thrown);
-                    throw;
+                    // Reported once per reason, as before the merge: a draw dropped silently hid the missing rect-list
+                    // artifacts that removed GTA V's lighting composite and HUD.
+                    skipped(error.what());
+                    relieveMemory(failures, error, true);
                 }
             });
             finishDrawPacket(drawn);
@@ -309,6 +515,7 @@ void Driver::execute(const Submission& submission) {
             if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);
         }
         if (drawPacket || (sampleDump && wroteOnGpu)) Graphics::Recorder::CountRecordedWork();
+        packetsExecuted[submission.queue].fetch_add(1, std::memory_order_release);
         timing.Mark(header == RenderingWaitPacketHeader ? "rendering_wait" : opcode == 0x3c || opcode == 0x93 ? "memory_wait" : opcode == 0x15 || opcode == 0x16 ? "dispatch" : drawPacket ? "draw" : "execute");
         if (submission.queue == 0) timing.FinishPacket(submission.serial, cursor, opcode, count);
         else timing.Finish();
@@ -318,6 +525,21 @@ void Driver::execute(const Submission& submission) {
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
+    if (pipelined && orderedCompletion && deferredLabels().labels.empty()) {
+        if (submission.rewindTail == nullptr) {
+            deferCompletion(submission);
+            return;
+        }
+        if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
+            // A segment whose tail the guest already released ends nothing the guest observes: under
+            // APS5_BATCH_SUBMITS the batch stays open into the tail (labels, waits, the cap and the
+            // deadline still end it).
+            if (!Graphics::BatchSubmits()) DrawPipeline::Queue0().Enqueue([this] { submitOpenWork(); }, {});
+            executeRewindTail(submission);
+            return;
+        }
+    }
+    if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
     if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {
         auto& costs = submissionCosts(submission.queue);
         if (!submitAtEnd && submission.rewindTail == nullptr && submission.queue == 0 && workerQueued() != nullptr && workerQueued()->load(std::memory_order_acquire) != 0) {

@@ -87,8 +87,7 @@ void testLifetime(bool reopen) {
         std::lock_guard lock(cfg->mutex);
         check(cfg->flipStatus.flipPendingNum == 1 && cfg->flipStatus.count == 0, "reservation status is wrong");
     }
-    attribute.dcc_control = 1;
-    check(expectFailure([&] { sceVideoOutSubmitChangeBufferAttribute2(handle, 0, &attribute, nullptr); }).find("pending flip") != std::string::npos, "pending attributes were changed");
+    check(sceVideoOutSubmitChangeBufferAttribute2(handle, 0, &attribute, nullptr) == 0, "attributes could not change while a flip was pending");
     check(expectFailure([&] { sceVideoOutUnregisterBuffers(handle, 0); }).find("pending flip") != std::string::npos, "pending buffer was unregistered");
     check(sceVideoOutWaitVblank(handle) == 0 && sceVideoOutWaitVblank(handle) == 0, "vblank stalled behind the GPU queue");
     std::shared_ptr<VideoOutConfig> replacement;

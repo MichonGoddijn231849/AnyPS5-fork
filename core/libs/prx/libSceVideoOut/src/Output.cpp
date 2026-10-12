@@ -301,15 +301,20 @@ int APS5_VABI sceVideoOutAdjustColor(int handle, const VideoOutColorSettings* se
     LibcAwaitExit_nid_postfix();
 }
 
-int APS5_VABI sceVideoOutVrrUnpegFromFixedRate() try {
-    NotImplemented_nid_no_patch(__func__);
+// Variable refresh is not modelled: the host presents at its own rate, so pegging is accepted for valid handles.
+int APS5_VABI sceVideoOutVrrUnpegFromFixedRate(int handle, std::int32_t flags, std::int32_t reserved) try {
+    (void)flags;
+    (void)reserved;
+    if (VideoOutDriver::Get().GetConfig(handle) == nullptr) throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
-int APS5_VABI sceVideoOutVrrPegToFixedRate() try {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceVideoOutVrrPegToFixedRate(int handle, std::int32_t rate, std::int32_t flags) try {
+    (void)rate;
+    (void)flags;
+    if (VideoOutDriver::Get().GetConfig(handle) == nullptr) throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();

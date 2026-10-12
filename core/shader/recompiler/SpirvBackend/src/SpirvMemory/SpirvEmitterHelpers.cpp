@@ -345,6 +345,9 @@ void DefineOutputs(SpirvEmitterState& state) {
         case StageOutputKind::SampleMask:
             binding.variableId = BuiltIn(state.sampleMaskVariable, SampleMaskArrayType(state), "gl_SampleMask", spv::BuiltInSampleMask);
             break;
+        case StageOutputKind::StencilRef:
+            binding.variableId = BuiltIn(state.stencilRefVariable, TypeI32(state), "gl_FragStencilRefARB", spv::BuiltInFragStencilRefEXT);
+            break;
         case StageOutputKind::Parameter:
         case StageOutputKind::Mrt: {
             const bool uintOutput = binding.kind == StageOutputKind::Mrt && state.program.Resources().stage == IrShaderStage::Pixel && binding.index < std::size(PixelInfo(state).targetOutputMode) && PixelInfo(state).targetOutputMode[binding.index] == 7u;
@@ -375,9 +378,10 @@ void DefineDescriptors(SpirvEmitterState& state) {
             return variable;
         };
         const auto ArrayType = [&](std::uint32_t type) {
+            const bool wide = RuntimeAbi::IsWideImages(binding.kind);
             const bool heap = binding.kind == DescriptorBindingKind::Samplers || ImageBindingResourceClass(binding.kind) != ImageResourceClass::None;
-            const auto count = static_cast<std::uint32_t>(binding.resources.size());
-            const auto length = heap ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::HeapCountBase + static_cast<std::uint32_t>(binding.kind), count) : ConstantU32(state, count);
+            const auto count = wide ? 16u : static_cast<std::uint32_t>(binding.resources.size());
+            const auto length = wide ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::WideImageCount, count) : heap ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::HeapCountBase + static_cast<std::uint32_t>(binding.kind), count) : ConstantU32(state, count);
             return state.module.Type(spv::OpTypeArray, type, length);
         };
         switch (binding.kind) {
@@ -411,7 +415,23 @@ void DefineDescriptors(SpirvEmitterState& state) {
         case DescriptorBindingKind::Gds:
             state.gdsVariable = Define(StorageBufferBlockType(state), "gds");
             break;
+        case DescriptorBindingKind::WideFeedback:
+            state.wideFeedbackVariable = Define(StorageBufferBlockType(state), "wide_feedback");
+            break;
         default: {
+            if (RuntimeAbi::IsWideImages(binding.kind)) {
+                // Of the roots' native mode of the binding's class; the roots share the binding's dimension.
+                const auto& root = state.program.Info().images.at(binding.resources.front());
+                const auto modes = ResourceMaterializer::RuntimeImageModes(root);
+                const auto wideKind = static_cast<std::uint32_t>(binding.kind) - static_cast<std::uint32_t>(DescriptorBindingKind::WideImages);
+                const auto modeIndex = ResourceMaterializer::WideModes(root).at(wideKind % RuntimeAbi::WideImageClasses);
+                if (modeIndex == UINT32_MAX) FailEmit("wide image binding has no mode of its class");
+                const auto& image = modes.at(modeIndex);
+                const auto name = "wide_images_" + std::to_string(wideKind);
+                state.wideImageVariables.at(wideKind) = Define(ArrayType(ImageType(state, image)), name.c_str(), spv::StorageClassUniformConstant);
+                if (image.dimension == RdnaImageDimension::Dim1D || image.dimension == RdnaImageDimension::Dim1DArray) state.module.EmitCapability(spv::CapabilitySampled1D);
+                break;
+            }
             if (ImageBindingResourceClass(binding.kind) == ImageResourceClass::None) {
                 FailEmit("descriptor binding has an unmapped image resource class");
             }

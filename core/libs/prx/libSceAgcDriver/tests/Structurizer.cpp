@@ -75,6 +75,15 @@ void requireStructuredBranches(const ControlFlowGraph& graph, const char* name) 
     }
 }
 
+void requireDominatedMerges(const ControlFlowGraph& graph, const char* name) {
+    for (const auto& block : graph.blocks) {
+        const auto merge = block.terminator.mergeBlock;
+        if (merge != InvalidControlFlowId && !graph.Dominates(block.id, merge)) {
+            throw std::runtime_error(std::string(name) + ": header " + std::to_string(block.id) + " does not dominate its merge " + std::to_string(merge));
+        }
+    }
+}
+
 void requireExactPostDominators(const ControlFlowGraph& graph, const char* name) {
     const auto count = static_cast<std::uint32_t>(graph.blocks.size());
     const auto reachesExitAvoiding = [&](std::uint32_t from, std::uint32_t avoided) {
@@ -102,6 +111,12 @@ void requireExactPostDominators(const ControlFlowGraph& graph, const char* name)
             throw std::runtime_error(std::string(name) + ": block " + std::to_string(block.id) + " has " + std::to_string(block.postDominators.size()) + " post-dominators, expected " + std::to_string(expected.size()));
         }
     }
+}
+
+ControlFlowGraph makeSizedGraph(const std::vector<std::vector<std::uint32_t>>& successors, const std::vector<std::uint32_t>& words) {
+    auto graph = makeGraph(successors);
+    for (auto& block : graph.blocks) block.estimatedSpirvWords = words[block.id];
+    return graph;
 }
 
 std::vector<std::vector<std::uint32_t>> originalPostDominators(const ControlFlowGraph& graph) {
@@ -249,6 +264,14 @@ int main() {
                 return 1;
             }
         }
+        auto sharedEarlyExit = makeSizedGraph({{8, 1}, {5, 2}, {4, 3}, {9, 4}, {5}, {8, 6}, {9, 7}, {8}, {}, {}}, {564, 308, 264, 8, 8, 8, 4336, 120, 116, 28});
+        Structurizer{}.Structurize(sharedEarlyExit);
+        requireStructuredBranches(sharedEarlyExit, "nested selections sharing an early exit");
+        requireDominatedMerges(sharedEarlyExit, "nested selections sharing an early exit");
+        auto siblingEarlyExits = makeSizedGraph({{2, 1}, {2}, {5, 3}, {16, 4}, {6}, {16, 6}, {10, 7}, {9, 8}, {9}, {15}, {14, 11}, {13, 12}, {13}, {14}, {15}, {}, {}}, {4376, 1000, 1924, 188, 0, 768, 136, 68, 1680, 0, 788, 2116, 5228, 8, 1756, 31724, 28});
+        Structurizer{}.Structurize(siblingEarlyExits);
+        requireStructuredBranches(siblingEarlyExits, "sibling selections sharing an early exit beside their join");
+        requireDominatedMerges(siblingEarlyExits, "sibling selections sharing an early exit beside their join");
         std::vector<std::vector<std::uint32_t>> diamonds;
         for (std::uint32_t diamond = 0; diamond < 50u; ++diamond) {
             const auto head = diamond * 3u;

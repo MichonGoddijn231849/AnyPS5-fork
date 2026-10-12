@@ -10,6 +10,14 @@ namespace ShaderRecompiler {
 
 namespace {
 
+bool GlobalRedundancyElimination() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_SPIRV_GLOBAL_REDUNDANCY");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 bool HasLimitedUseTypes(std::span<const std::uint32_t> spirv) {
     if (spirv.size() < 5) throw std::runtime_error("SPIRV-Tools: incomplete module header");
     bool int8 = false, int16 = false, float16 = false;
@@ -126,8 +134,9 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
         if (allowFolding) optimizer.RegisterPass(spvtools::CreateCCPPass());
         optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass(true));
         if (full) optimizer.RegisterPass(spvtools::CreateLoopUnrollPass(true));
-        optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass())
-            .RegisterPass(spvtools::CreateRedundancyEliminationPass());
+        optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass());
+        if (GlobalRedundancyElimination()) optimizer.RegisterPass(spvtools::CreateRedundancyEliminationPass());
+        else optimizer.RegisterPass(spvtools::CreateLocalRedundancyEliminationPass());
         if (full) optimizer.RegisterPass(spvtools::CreateCombineAccessChainsPass());
         if (allowFolding) optimizer.RegisterPass(spvtools::CreateSimplificationPass());
         if (full) {
@@ -160,6 +169,7 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
     options.set_preserve_bindings(true);
     options.set_preserve_spec_constants(!specialize);
     options.set_validator_options(validatorOptions);
+    options.set_run_validator(false);
     std::vector<std::uint32_t> optimized;
     diagnostics.clear();
     if (!optimizer.Run(spirv.data(), spirv.size(), &optimized, options)) {

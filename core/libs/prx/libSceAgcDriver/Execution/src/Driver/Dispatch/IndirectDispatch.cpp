@@ -25,11 +25,12 @@ void Driver::countIndirect(int path, double readMs) {
 
 void Driver::dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission) {
     static const bool gpuIndirect = std::getenv("APS5_NO_GPU_INDIRECT") == nullptr;
+    static const bool cpuThreadDimensions = std::getenv("APS5_CPU_THREAD_DIMENSIONS") != nullptr;
     const auto arguments = Pm4::DispatchArgumentAddress(packet, queue);
     const auto initiator = packet.back();
     int path = IndirectGpu;
     if (!gpuIndirect) path = IndirectDisabled;
-    else if ((initiator & 0x20u) != 0) path = IndirectThreadDimensions;
+    else if ((initiator & 0x20u) != 0 && cpuThreadDimensions) path = IndirectThreadDimensions;
     else if (arguments % 4 != 0) path = IndirectMisaligned;
     if (path != IndirectGpu) {
         if (!resolvingAhead()) {

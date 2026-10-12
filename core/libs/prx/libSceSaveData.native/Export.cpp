@@ -740,14 +740,16 @@ int APS5_VABI sceSaveDataDirNameSearchPs4(const SaveDataDirNameSearchCond* cond,
     return rc;
 }
 
+// Converting PS4 save data into PS5 save data: as for sceSaveDataTransferringMount, no PS4 save data exists on this
+// console, so there is nothing to convert (Wolverine calls it after its PS4 directory search at the title screen).
 int APS5_VABI sceSaveDataConvert() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    SAVEDATA_TRACE("convert -> not found (no PS4 save data)");
+    return SAVE_DATA_ERROR_NOT_FOUND;
 }
 
 int APS5_VABI sceSaveDataGetConvertProgress() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    SAVEDATA_TRACE("getConvertProgress -> not found (no conversion)");
+    return SAVE_DATA_ERROR_NOT_FOUND;
 }
 
 int APS5_VABI sceSaveDataCancel() {

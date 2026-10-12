@@ -279,12 +279,91 @@ void testInvalidInputIsRejected() {
 
 }
 
+void testRepeatedFaultSites() {
+    for (const char* name : {"record_bda_fault", "other_function"}) {
+        const std::string source = std::string(R"(OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %index
+OpExecutionMode %main LocalSize 8 1 1
+OpName %fault ")") + name + R"("
+OpDecorate %index BuiltIn LocalInvocationIndex
+%void = OpTypeVoid
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%input = OpTypePointer Input %uint
+%private = OpTypePointer Private %uint
+%function = OpTypeFunction %void
+%faultType = OpTypeFunction %void %uint
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%two = OpConstant %uint 2
+%index = OpVariable %input Input
+%output = OpVariable %private Private
+%fault = OpFunction %void DontInline %faultType
+%reason = OpFunctionParameter %uint
+%faultEntry = OpLabel
+OpStore %output %reason
+OpReturn
+OpFunctionEnd
+%main = OpFunction %void None %function
+%entry = OpLabel
+%lane = OpLoad %uint %index
+%invalid = OpIEqual %bool %lane %zero
+%other = OpIEqual %bool %lane %one
+%third = OpIEqual %bool %lane %two
+OpSelectionMerge %firstJoin None
+OpBranchConditional %invalid %firstFault %firstJoin
+%firstFault = OpLabel
+%call1 = OpFunctionCall %void %fault %one
+OpBranch %firstJoin
+%firstJoin = OpLabel
+OpSelectionMerge %secondJoin None
+OpBranchConditional %invalid %secondFault %secondJoin
+%secondFault = OpLabel
+%call2 = OpFunctionCall %void %fault %two
+OpBranch %secondJoin
+%secondJoin = OpLabel
+OpSelectionMerge %armJoin None
+OpBranchConditional %other %arm %armJoin
+%arm = OpLabel
+OpSelectionMerge %armFaultJoin None
+OpBranchConditional %third %armFault %armFaultJoin
+%armFault = OpLabel
+%call3 = OpFunctionCall %void %fault %one
+OpBranch %armFaultJoin
+%armFaultJoin = OpLabel
+OpBranch %armJoin
+%armJoin = OpLabel
+OpSelectionMerge %lastJoin None
+OpBranchConditional %third %lastFault %lastJoin
+%lastFault = OpLabel
+%call4 = OpFunctionCall %void %fault %two
+OpBranch %lastJoin
+%lastJoin = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+        try {
+            const auto words = assemble(source);
+            static_cast<void>(ShaderRecompiler::ValidateAndOptimizeSpirv(words, Vulkan11, Spirv13, false, false));
+            const auto specialized = ShaderRecompiler::SpecializeSpirv(words);
+            static_cast<void>(ShaderRecompiler::ValidateAndOptimizeSpirv(specialized, Vulkan11, Spirv13, false, false));
+            const auto expected = std::string(name) == "record_bda_fault" ? 3u : 4u;
+            check(opcodeCount(specialized, spv::OpFunctionCall) == expected, std::string(name) + ": " + std::to_string(opcodeCount(specialized, spv::OpFunctionCall)) + " calls after specialization, expected " + std::to_string(expected));
+            check(ShaderRecompiler::SpecializeSpirv(specialized) == specialized, "repeated fault specialization is not stable");
+        } catch (const std::exception& error) {
+            check(false, std::string("repeated fault sites: ") + error.what());
+        }
+    }
+}
+
 int main() {
     const char* mode = std::getenv("APS5_SPIRV_OPT");
     const bool optimizationEnabled = mode == nullptr || std::string(mode) != "none";
     testNarrowConversions(optimizationEnabled);
     testInvalidInputIsRejected();
     testSpecializedSelectionExit();
+    testRepeatedFaultSites();
     if (failures != 0) {
         std::fprintf(stderr, "%d optimizer check(s) failed\n", failures);
         return 1;

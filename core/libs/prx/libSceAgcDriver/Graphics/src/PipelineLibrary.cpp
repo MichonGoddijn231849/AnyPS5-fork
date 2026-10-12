@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <array>
 #include <condition_variable>
@@ -178,6 +179,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         }
         VkPipeline handle = VK_NULL_HANDLE;
         Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle), "vkCreateGraphicsPipelines library");
+        PipelineCache::NoteCreation();
         cache.emplace(key, handle);
         ++device.counters.built[part];
         libraries.push_back(handle);
@@ -190,6 +192,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     create.layout = info.layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
     Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &pipeline), "vkCreateGraphicsPipelines link");
+    PipelineCache::NoteCreation();
     ++device.counters.linked;
     static const bool optimize = std::getenv("APS5_NO_PIPELINE_LTO") == nullptr;
     if (optimize && optimized != nullptr) {
@@ -210,6 +213,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             create.layout = pipelineLayout;
             VkPipeline result = VK_NULL_HANDLE;
             if (createPipelines(slot->device, cache, 1, &create, nullptr, &result) != VK_SUCCESS) return;
+            PipelineCache::NoteCreation();
             slot->handle.store(result);
             if (slot->released.load()) {
                 if (const auto handle = slot->handle.exchange(VK_NULL_HANDLE)) slot->destroy(slot->device, handle, nullptr);

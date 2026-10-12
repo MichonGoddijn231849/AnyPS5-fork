@@ -52,6 +52,17 @@ DccKeys ByteKeys(std::uint8_t key) {
         case 0xc0: return DccKeys::Clear1111;
         case 0x20: return DccKeys::ClearRegister;
         case 0xff: return DccKeys::Uncompressed;
+        case 0x10: {
+            // GFX9+ comp-to-single (DCC_CLEAR_SINGLE). Experiment: APS5_DCC_SINGLE=0000 reads it as a clear to
+            // 0000, =reg as a register clear; by default it stays mixed (texels read as stored).
+            static const DccKeys single = [] {
+                const char* text = std::getenv("APS5_DCC_SINGLE");
+                if (text != nullptr && std::strcmp(text, "0000") == 0) return DccKeys::Clear0000;
+                if (text != nullptr && std::strcmp(text, "reg") == 0) return DccKeys::ClearRegister;
+                return DccKeys::Mixed;
+            }();
+            return single;
+        }
         default: return DccKeys::Mixed;
     }
 }
@@ -617,6 +628,42 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
             stable = !Recorder::SnapshotWriteOverlaps(resource.dccAddress, count);
         }
     }
+    proof = stable ? DccKeyProof{keys, collected} : DccKeyProof{};
+    counters.scanned.fetch_add(1, std::memory_order_relaxed);
+    if (!stable) counters.unstable.fetch_add(1, std::memory_order_relaxed);
+    return keys;
+}
+
+DccKeys ProvedCurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes, DccKeyProof& proof) {
+    auto& counters = Proofs();
+    const auto count = static_cast<std::size_t>(surfaceBytes / KeyBytes);
+    if (!KeyFastPath() || metaAddress == 0 || count == 0) {
+        proof = {};
+        return CurrentDccKeys(metaAddress, surfaceBytes);
+    }
+    // A store still pending on the GPU: no proof across it (CurrentDccKeys answers from the store or waits for it).
+    if (GuestMemory::GpuMutex().HeldByThisThread()) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
+            proof = {};
+            counters.scanned.fetch_add(1, std::memory_order_relaxed);
+            counters.unstable.fetch_add(1, std::memory_order_relaxed);
+            return CurrentDccKeys(metaAddress, surfaceBytes);
+        }
+    } else if (Recorder::SnapshotWriteOverlaps(metaAddress, count)) {
+        proof = {};
+        counters.scanned.fetch_add(1, std::memory_order_relaxed);
+        counters.unstable.fetch_add(1, std::memory_order_relaxed);
+        return CurrentDccKeys(metaAddress, surfaceBytes);
+    }
+    // As ProvedClearKeys: the collect precedes the scan.
+    const auto collected = GuestMemory::CollectWrites(metaAddress, count);
+    if (proof.generation != 0 && collected != 0 && GuestMemory::UnchangedSince(metaAddress, count, proof.generation)) {
+        counters.proved.fetch_add(1, std::memory_order_relaxed);
+        return proof.keys;
+    }
+    bool memoized = false;
+    const auto keys = readDccKeys(metaAddress, count, memoized);
+    const bool stable = collected != 0 && !memoized;
     proof = stable ? DccKeyProof{keys, collected} : DccKeyProof{};
     counters.scanned.fetch_add(1, std::memory_order_relaxed);
     if (!stable) counters.unstable.fetch_add(1, std::memory_order_relaxed);

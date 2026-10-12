@@ -12,6 +12,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -243,7 +245,13 @@ TCommand _read(const Apr::CommandBufferObject& buffer, std::uint32_t cursor) {
     return command;
 }
 
-constexpr std::uint64_t AmmRangeBytes = 32ull << 30;
+// APS5_AMM_RANGE_GIB=<n> sizes the AMM range (default 32). Wolverine packs AMM addresses into 36 bits: its range
+// must end below 0x1000000000, which 2 x 32 GiB does not (it crashes on its first streaming loads); 11 fits.
+const std::uint64_t AmmRangeBytes = [] {
+    const char* text = std::getenv("APS5_AMM_RANGE_GIB");
+    const auto gib = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    return (gib != 0 ? gib : 32ull) << 30;
+}();
 constexpr int GuestMapFixed = 0x10;
 
 struct AmmPage {
@@ -273,6 +281,7 @@ std::uintptr_t _ammBase(AmmState& state) {
         void* address = nullptr;
         if (DoReserveVirtual(&address, 2 * AmmRangeBytes, 0, 0x200000) != 0) throw std::runtime_error("AMM: cannot reserve the virtual address range");
         state.base = reinterpret_cast<std::uintptr_t>(address);
+        if (std::getenv("APS5_TRACE_APR") != nullptr) std::fprintf(stderr, "[amm] range 0x%llx+0x%llx\n", static_cast<unsigned long long>(state.base), static_cast<unsigned long long>(2 * AmmRangeBytes));
     }
     return state.base;
 }
@@ -514,9 +523,9 @@ void _readResolved(Apr::Opcode opcode, Apr::ReadFileCommand command, ReadCursor&
     read = {true, command.fileId, command.destination + command.size, command.offset + command.size};
 }
 
-void _execute(const Apr::CommandBufferObject& buffer) {
-    std::uint32_t cursor = 0;
-    ReadCursor read;
+// Runs the commands from `cursor` on and returns where it stopped: the end, or with `deferWaits` the first wait
+// that does not hold yet (its header), for the worker to resume with the same gather/scatter state.
+std::uint32_t _executeFrom(const Apr::CommandBufferObject& buffer, std::uint32_t cursor, ReadCursor& read, bool deferWaits) {
     while (cursor < buffer.offset) {
         if (cursor + sizeof(Apr::CommandHeader) > buffer.offset) throw std::runtime_error("APR: truncated command buffer");
         Apr::CommandHeader header;
@@ -586,6 +595,7 @@ void _execute(const Apr::CommandBufferObject& buffer) {
                 return std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(command.address)).load(std::memory_order_acquire);
             };
             const std::uint64_t reference = (command.reference & command.mask) << unused;
+            if (deferWaits && !_waitSatisfied(command.compare, (current() & command.mask) << unused, reference)) return cursor;
             while (!_waitSatisfied(command.compare, (current() & command.mask) << unused, reference)) PreciseSleepUs(50);
             break;
         }
@@ -612,6 +622,119 @@ void _execute(const Apr::CommandBufferObject& buffer) {
         }
         cursor += header.bytes;
     }
+    return cursor;
+}
+
+void _execute(const Apr::CommandBufferObject& buffer) {
+    ReadCursor read;
+    static_cast<void>(_executeFrom(buffer, 0u, read, false));
+}
+
+// Submitted command buffers run in order. One the queue is free for runs on the submitting thread until a wait that
+// does not hold yet; the rest of it, and every buffer submitted behind it, run on one worker, as the AMPR runs them
+// beside the CPU: a buffer can wait on an address or counter its submitter writes after the submit returns
+// (Wolverine's asset streaming), which never happens when the submitting thread waits for it. Deferred commands are
+// copied, so the guest may reuse its buffer.
+struct AprItem {
+    std::uint32_t id = 0;
+    Apr::CommandBufferObject buffer{};
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t cursor = 0;
+    ReadCursor read;
+};
+
+struct AprQueue {
+    std::mutex mutex;
+    std::condition_variable work;
+    std::condition_variable done;
+    std::deque<AprItem> pending;
+    std::uint32_t submitted = 0;
+    std::uint32_t completed = 0;
+    bool started = false;
+    // A buffer runs on a submitting thread or the worker runs one: the next waits for it.
+    bool running = false;
+};
+
+AprQueue& _aprQueue() {
+    static auto* queue = new AprQueue;
+    return *queue;
+}
+
+void _aprWorker() {
+    auto& queue = _aprQueue();
+    for (;;) {
+        AprItem item;
+        {
+            std::unique_lock lock(queue.mutex);
+            queue.work.wait(lock, [&] { return !queue.pending.empty() && !queue.running; });
+            item = std::move(queue.pending.front());
+            queue.pending.pop_front();
+            queue.running = true;
+        }
+        item.buffer.base = item.bytes.data();
+        try {
+            static_cast<void>(_executeFrom(item.buffer, item.cursor, item.read, false));
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[apr] FATAL: command buffer %u: %s\n", item.id, e.what());
+            std::fflush(stderr);
+            throw;
+        }
+        {
+            std::lock_guard lock(queue.mutex);
+            queue.completed = item.id;
+            queue.running = false;
+        }
+        queue.done.notify_all();
+        queue.work.notify_one();
+    }
+}
+
+std::uint32_t _aprSubmit(const Apr::CommandBufferObject& buffer) {
+    auto& queue = _aprQueue();
+    AprItem item;
+    item.buffer = buffer;
+    item.buffer.size = buffer.offset;
+    bool inlineRun = false;
+    {
+        std::lock_guard lock(queue.mutex);
+        if (!queue.started) {
+            std::thread(_aprWorker).detach();
+            queue.started = true;
+        }
+        item.id = ++queue.submitted;
+        if (item.id == 0) item.id = ++queue.submitted;
+        inlineRun = queue.pending.empty() && !queue.running;
+        if (inlineRun) queue.running = true;
+    }
+    if (inlineRun) {
+        std::uint32_t stop = 0u;
+        try {
+            stop = _executeFrom(buffer, 0u, item.read, true);
+        } catch (...) {
+            {
+                std::lock_guard lock(queue.mutex);
+                queue.running = false;
+            }
+            queue.work.notify_one();
+            throw;
+        }
+        std::lock_guard lock(queue.mutex);
+        queue.running = false;
+        if (stop >= buffer.offset) {
+            queue.completed = item.id;
+        } else {
+            item.cursor = stop;
+            item.bytes.assign(buffer.base, buffer.base + buffer.offset);
+            queue.pending.push_front(std::move(item));
+        }
+    } else {
+        item.bytes.assign(buffer.base, buffer.base + buffer.offset);
+        std::lock_guard lock(queue.mutex);
+        queue.pending.push_back(std::move(item));
+    }
+    queue.done.notify_all();
+    queue.work.notify_one();
+    return item.id;
 }
 
 }
@@ -705,17 +828,19 @@ int APS5_VABI sceKernelAprGetFileStat(uint32_t id, FileStat* stat) {
 
 int APS5_VABI sceKernelAprSubmitCommandBuffer(const Apr::CommandBufferObject* buffer, uint32_t priority) {
     (void)priority;
+    static const bool traceSubmit = std::getenv("APS5_TRACE_APR") != nullptr;
+    if (traceSubmit) std::fprintf(stderr, "[apr] submit buffer %p type %d bytes %llu\n", static_cast<const void*>(buffer), buffer ? static_cast<int>(buffer->type) : -1, buffer ? static_cast<unsigned long long>(buffer->offset) : 0ull);
+    // Wolverine submits command buffers it built itself rather than through sceAmprAprCommandBufferConstruct, so their
+    // type field is not the APR type; the commands are the same.
     if (!buffer) return _fail(GUEST_EINVAL);
-    _execute(*buffer);
+    _aprSubmit(*buffer);
     return 0;
 }
 
 int APS5_VABI sceKernelAprSubmitCommandBufferAndGetId(const Apr::CommandBufferObject* buffer, uint32_t priority, uint32_t* id) {
-    if (!id) return _fail(GUEST_EINVAL);
-    const int result = sceKernelAprSubmitCommandBuffer(buffer, priority);
-    if (result != 0) return result;
-    static std::atomic<uint32_t> nextId{1};
-    *id = nextId.fetch_add(1);
+    (void)priority;
+    if (!id || !buffer) return _fail(GUEST_EINVAL);
+    *id = _aprSubmit(*buffer);
     return 0;
 }
 
@@ -728,7 +853,9 @@ int APS5_VABI sceKernelAprSubmitCommandBufferAndGetResult(const Apr::CommandBuff
 }
 
 int APS5_VABI sceKernelAprWaitCommandBuffer(uint32_t id) {
-    (void)id;
+    auto& queue = _aprQueue();
+    std::unique_lock lock(queue.mutex);
+    queue.done.wait(lock, [&] { return static_cast<std::int32_t>(queue.completed - id) >= 0; });
     return 0;
 }
 

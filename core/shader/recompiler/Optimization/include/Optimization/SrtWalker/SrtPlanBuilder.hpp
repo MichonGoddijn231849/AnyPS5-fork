@@ -4,6 +4,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 
 #include <cstdint>
+#include <unordered_set>
 #include <vector>
 
 namespace ShaderRecompiler::Detail {
@@ -22,11 +23,13 @@ private:
     };
 
     void Collect(IrValue* raw, std::uint32_t usePc);
+    void Finish(IrValue* inst, std::uint32_t usePc);
     void PatchReads();
 
     IrProgram& _program;
     std::vector<IrValue*> _visiting;
-    std::vector<IrValue*> _visited;
+    std::unordered_set<IrValue*> _visitingSet;
+    std::unordered_set<IrValue*> _visited;
     std::vector<Patch> _patches;
 };
 

@@ -1,0 +1,363 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp b/core/libs/prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp
+index 2fcb1675..dc4475f1 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp
+@@ -14,6 +14,7 @@
+ 
+ namespace ShaderRecompiler {
+ struct SourceHandle;
++struct SrtMemoryWord;
+ }
+ 
+ namespace AgcDriver {
+@@ -111,6 +112,9 @@ private:
+     };
+ 
+     static bool read(void* context, std::uint64_t address, std::uint32_t* value);
++    // The run reader of read (ShaderRecompiler::SrtMemoryRunReader): the same words, results and
++    // side effects, one page lookup per page instead of one per word.
++    static std::size_t readRun(void* context, std::uint64_t address, const ShaderRecompiler::SrtMemoryWord* expected, ShaderRecompiler::SrtMemoryWord* results, std::size_t count);
+     Page& page(std::uint64_t base);
+ 
+     // Regions given at construction (the registered shader's code and header), referenced as given:
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/ShaderMemory.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/ShaderMemory.cpp
+index af4bbccb..89dfda0b 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/ShaderMemory.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/ShaderMemory.cpp
+@@ -92,6 +92,20 @@ std::vector<std::unique_ptr<TPage>>& pagePool() {
+ 
+ constexpr std::size_t PagePoolLimit = 64;
+ 
++// Whether no snapshot region can affect a dword read in [first, end): none covers a byte of it, and
++// none starts inside a dword's bytes (read's straddle checks). Otherwise the dwords take read's
++// snapshot path, which readRun leaves to the per-word read.
++bool clearOfInitial(const std::map<std::uint64_t, std::span<const std::byte>>& initial, std::uint64_t first, std::uint64_t end) {
++    if (initial.empty()) return true;
++    const auto next = initial.lower_bound(first);
++    if (next != initial.end() && next->first < end) return false;
++    if (next != initial.begin()) {
++        const auto previous = std::prev(next);
++        if (previous->first + previous->second.size() > first) return false;
++    }
++    return true;
++}
++
+ }
+ 
+ void ShaderMemory::SetWaitedMsProvider(WaitedMsProvider provider) {
+@@ -302,6 +316,8 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
+     runtime.userContext = this;
+     runtime.readMemory = &read;
+     runtime.readSpecializationMemory = &read;
++    runtime.readMemoryRun = &readRun;
++    runtime.readSpecializationMemoryRun = &readRun;
+     auto capture = handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
+     if (profile) {
+         totals.captureNanoseconds += NanosecondsSince(started);
+@@ -360,6 +376,46 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::TakeRecentRegions() {
+     return result;
+ }
+ 
++std::size_t ShaderMemory::readRun(void* context, std::uint64_t address, const ShaderRecompiler::SrtMemoryWord* expected, ShaderRecompiler::SrtMemoryWord* results, std::size_t count) {
++    auto& self = *static_cast<ShaderMemory*>(context);
++    constexpr auto WordBytes = static_cast<std::uint64_t>(sizeof(std::uint32_t));
++    // Misaligned or wrapping addresses, and dwords in or next to a snapshot region, take read's own
++    // checks, so they are read one at a time by read.
++    const bool plain = address % WordBytes == 0 && count <= (std::numeric_limits<std::uint64_t>::max() - address) / WordBytes && clearOfInitial(self.initial, address, address + count * WordBytes);
++    const auto readOne = [&](std::uint64_t at) {
++        std::uint32_t value = 0;
++        const bool ok = read(context, at, &value);
++        return ShaderRecompiler::SrtMemoryWord{ok ? value : 0u, ok};
++    };
++    std::size_t done = 0;
++    while (done < count) {
++        if (!plain) {
++            results[done] = readOne(address + done * WordBytes);
++            if (!ShaderRecompiler::SameMemoryWord(results[done], expected[done])) return done + 1;
++            ++done;
++            continue;
++        }
++        // One page lookup for the page of the next word, then the words of that page in order.
++        const auto base = (address + done * WordBytes) & ~static_cast<std::uint64_t>(PageBytes - 1);
++        auto& page = self.page(base);
++        for (; done < count && address + done * WordBytes - base < PageBytes; ++done) {
++            const auto wordAddress = address + done * WordBytes;
++            const auto index = static_cast<std::size_t>((wordAddress % PageBytes) / WordBytes);
++            if (page.valid.Test(index)) {
++                // read's path for a valid dword: counted, marked read and recent, and its value returned.
++                ++CaptureTotals().reads;
++                page.read.Set(index);
++                page.recent.Set(index);
++                results[done] = {page.words[index], true};
++            } else {
++                results[done] = readOne(wordAddress);
++            }
++            if (!ShaderRecompiler::SameMemoryWord(results[done], expected[done])) return done + 1;
++        }
++    }
++    return count;
++}
++
+ DataWordPositionCounts DataWordPositions(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads, std::span<const std::uint32_t> words, std::span<const std::uint32_t> flattenedSrt, std::vector<std::uint32_t>& positions, std::vector<std::uint32_t>& slots) {
+     DataWordPositionCounts counts;
+     positions.clear();
+diff --git a/core/shader/recompiler/CMakeLists.txt b/core/shader/recompiler/CMakeLists.txt
+index c3c34966..4230263f 100644
+--- a/core/shader/recompiler/CMakeLists.txt
++++ b/core/shader/recompiler/CMakeLists.txt
+@@ -221,6 +221,7 @@ function(add_shader_recompiler target runtimeTarget)
+             ResourceMaterializer::MaterializeNanoseconds
+             ResourceMaterializer::SetBindlessTableLimit
+             ResourceMaterializer::SpecializationNanoseconds
++            SameMemoryWord
+             SetDebugProbeActive
+             ShaderCacheDirectory
+             ThreadOwned
+diff --git a/core/shader/recompiler/Optimization/include/Optimization/SrtWalker.hpp b/core/shader/recompiler/Optimization/include/Optimization/SrtWalker.hpp
+index f5f5a407..df668d00 100644
+--- a/core/shader/recompiler/Optimization/include/Optimization/SrtWalker.hpp
++++ b/core/shader/recompiler/Optimization/include/Optimization/SrtWalker.hpp
+@@ -3,6 +3,7 @@
+ 
+ #include "IntermediateRepresentation/IrProgram.hpp"
+ 
++#include <cstddef>
+ #include <cstdint>
+ #include <span>
+ #include <utility>
+@@ -12,6 +13,23 @@ namespace ShaderRecompiler {
+ 
+ using SrtMemoryReader = bool (*)(void* userData, std::uint64_t address, std::uint32_t* value);
+ 
++// One dword read's result, as an SrtMemoryReader reports it (value is 0 when the read failed).
++struct SrtMemoryWord {
++    std::uint32_t value = 0;
++    bool ok = false;
++};
++
++// Whether two reads of a dword gave the same result: the same success and, on success, the same value.
++inline bool SameMemoryWord(const SrtMemoryWord& left, const SrtMemoryWord& right) {
++    return left.ok == right.ok && (!left.ok || left.value == right.value);
++}
++
++// Reads `count` dwords at consecutive addresses from `address`, in order, with the results and side
++// effects of `count` SrtMemoryReader calls: results[i] receives the result of word i. The reads stop
++// after the first word whose result is not SameMemoryWord to expected[i]; returns how many were read
++// (count when every word matched). An optional fast path for SrtMemoryReader (SrtRuntime's *Run fields).
++using SrtMemoryRunReader = std::size_t (*)(void* userData, std::uint64_t address, const SrtMemoryWord* expected, SrtMemoryWord* results, std::size_t count);
++
+ // The guest addresses a walk dereferenced (Detail::Evaluator::EvaluateRawRead): the leaf read of
+ // each pure flat slot (IrResourcePlan::pureFlatSlots) as (flat offset, address), set by the
+ // flattened loop through `leaf`/`leafSlot` around that slot's evaluation, and every other raw read
+@@ -30,6 +48,9 @@ struct SrtRuntime {
+     void* userContext = nullptr;
+     SrtMemoryReader readSpecializationMemory = nullptr;
+     SrtReadTrace* readTrace = nullptr;
++    // Optional run readers for the same words as readMemory / readSpecializationMemory (nullptr: per word).
++    SrtMemoryRunReader readMemoryRun = nullptr;
++    SrtMemoryRunReader readSpecializationMemoryRun = nullptr;
+ };
+ 
+ enum class RuntimeValueType {
+diff --git a/core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp b/core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp
+index 4e5cf2b5..88f07352 100644
+--- a/core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp
++++ b/core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp
+@@ -595,6 +595,20 @@ bool srtEvalRecordingRead(void* user, std::uint64_t address, std::uint32_t* valu
+     return ok;
+ }
+ 
++// The memo's key is hashed from the call's own spans and compared with the stored key in place, so
++// a lookup allocates nothing: the owned key vectors are copied only when an entry is inserted.
++struct SrtEvalKeyView {
++    const IrResourcePlan* plan = nullptr;
++    std::uint64_t shaderBase = 0;
++    SrtMemoryReader readMemory = nullptr;
++    SrtMemoryReader readSpecializationMemory = nullptr;
++    std::size_t descriptorSources = 0;
++    std::size_t pureFlatSlots = 0;
++    std::span<const std::uint32_t> userData;
++    std::span<const std::uint32_t> sources;
++    std::span<const std::uint8_t> cleanFlatSlots;
++};
++
+ struct SrtEvalKey {
+     const IrResourcePlan* plan = nullptr;
+     std::uint64_t shaderBase = 0;
+@@ -606,31 +620,34 @@ struct SrtEvalKey {
+     std::vector<std::uint32_t> sources;
+     std::vector<std::uint8_t> cleanFlatSlots;
+ 
+-    bool operator==(const SrtEvalKey&) const = default;
+-};
++    explicit SrtEvalKey(const SrtEvalKeyView& key)
++        : plan(key.plan), shaderBase(key.shaderBase), readMemory(key.readMemory), readSpecializationMemory(key.readSpecializationMemory), descriptorSources(key.descriptorSources), pureFlatSlots(key.pureFlatSlots), userData(key.userData.begin(), key.userData.end()), sources(key.sources.begin(), key.sources.end()), cleanFlatSlots(key.cleanFlatSlots.begin(), key.cleanFlatSlots.end()) {}
+ 
+-struct SrtEvalKeyHash {
+-    std::size_t operator()(const SrtEvalKey& key) const {
+-        std::uint64_t hash = 1469598103934665603ull;
+-        const auto mix = [&hash](std::uint64_t value) {
+-            hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+-        };
+-        mix(reinterpret_cast<std::uintptr_t>(key.plan));
+-        mix(key.shaderBase);
+-        mix(reinterpret_cast<std::uintptr_t>(key.readMemory));
+-        mix(reinterpret_cast<std::uintptr_t>(key.readSpecializationMemory));
+-        mix(key.descriptorSources);
+-        mix(key.pureFlatSlots);
+-        for (const auto word : key.userData) mix(word);
+-        mix(key.userData.size());
+-        for (const auto source : key.sources) mix(source);
+-        mix(key.sources.size());
+-        for (const auto clean : key.cleanFlatSlots) mix(clean);
+-        mix(key.cleanFlatSlots.size());
+-        return static_cast<std::size_t>(hash);
++    [[nodiscard]] bool matches(const SrtEvalKeyView& key) const {
++        return plan == key.plan && shaderBase == key.shaderBase && readMemory == key.readMemory && readSpecializationMemory == key.readSpecializationMemory && descriptorSources == key.descriptorSources && pureFlatSlots == key.pureFlatSlots && std::equal(userData.begin(), userData.end(), key.userData.begin(), key.userData.end()) && std::equal(sources.begin(), sources.end(), key.sources.begin(), key.sources.end()) && std::equal(cleanFlatSlots.begin(), cleanFlatSlots.end(), key.cleanFlatSlots.begin(), key.cleanFlatSlots.end());
+     }
+ };
+ 
++std::uint64_t srtEvalKeyHash(const SrtEvalKeyView& key) {
++    std::uint64_t hash = 1469598103934665603ull;
++    const auto mix = [&hash](std::uint64_t value) {
++        hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
++    };
++    mix(reinterpret_cast<std::uintptr_t>(key.plan));
++    mix(key.shaderBase);
++    mix(reinterpret_cast<std::uintptr_t>(key.readMemory));
++    mix(reinterpret_cast<std::uintptr_t>(key.readSpecializationMemory));
++    mix(key.descriptorSources);
++    mix(key.pureFlatSlots);
++    for (const auto word : key.userData) mix(word);
++    mix(key.userData.size());
++    for (const auto source : key.sources) mix(source);
++    mix(key.sources.size());
++    for (const auto clean : key.cleanFlatSlots) mix(clean);
++    mix(key.cleanFlatSlots.size());
++    return hash;
++}
++
+ struct SrtEvalEntry {
+     std::vector<SrtEvalRead> reads;
+     std::vector<DescriptorValue> values;
+@@ -638,14 +655,52 @@ struct SrtEvalEntry {
+     std::vector<std::uint8_t> activeSources;
+ };
+ 
++struct SrtEvalStored {
++    SrtEvalKey key;
++    SrtEvalEntry entry;
++};
++
+ constexpr std::size_t SrtEvalMemoCapacity = 16384;
+ 
+-bool srtEvalReadsUnchanged(const std::vector<SrtEvalRead>& reads, const SrtRuntime& runtime) {
++// Re-reads the recorded words in order through the current readers and stops at the first that
++// differs. Consecutive words of one reader at stride 4 go through that reader's run function when
++// the runtime has one: the same results and side effects as the word-by-word reads, one call per
++// run. `verify` also reads each run word by word and aborts if a result differs.
++bool srtEvalReadsUnchanged(const std::vector<SrtEvalRead>& reads, const SrtRuntime& runtime, bool verify) {
+     const SrtMemoryReader readers[2] = {runtime.readMemory, runtime.readSpecializationMemory};
+-    for (const auto& read : reads) {
+-        std::uint32_t word = 0;
+-        const bool ok = readers[read.reader](runtime.userContext, read.address, &word);
+-        if (ok != read.ok || (ok && word != read.value)) return false;
++    const SrtMemoryRunReader runReaders[2] = {runtime.readMemoryRun, runtime.readSpecializationMemoryRun};
++    thread_local std::vector<SrtMemoryWord> expected;
++    thread_local std::vector<SrtMemoryWord> results;
++    std::size_t i = 0;
++    while (i < reads.size()) {
++        const auto reader = reads[i].reader;
++        if (runReaders[reader] == nullptr) {
++            std::uint32_t word = 0;
++            const bool ok = readers[reader](runtime.userContext, reads[i].address, &word);
++            if (ok != reads[i].ok || (ok && word != reads[i].value)) return false;
++            ++i;
++            continue;
++        }
++        std::size_t end = i + 1;
++        while (end < reads.size() && reads[end].reader == reader && reads[end].address == reads[end - 1].address + sizeof(std::uint32_t)) ++end;
++        const auto count = end - i;
++        expected.resize(count);
++        results.resize(count);
++        for (std::size_t k = 0; k < count; ++k) expected[k] = {reads[i + k].value, reads[i + k].ok};
++        const auto done = runReaders[reader](runtime.userContext, reads[i].address, expected.data(), results.data(), count);
++        if (verify) {
++            for (std::size_t k = 0; k < done; ++k) {
++                std::uint32_t word = 0;
++                const bool ok = readers[reader](runtime.userContext, reads[i + k].address, &word);
++                if (!SameMemoryWord({ok ? word : 0u, ok}, results[k])) {
++                    std::fprintf(stderr, "APS5_SRT_EVAL_MEMO=verify: a run read of 0x%llx differs from the word-by-word read\n", static_cast<unsigned long long>(reads[i + k].address));
++                    std::fflush(stderr);
++                    std::abort();
++                }
++            }
++        }
++        if (done != count) return false;
++        i = end;
+     }
+     return true;
+ }
+@@ -656,19 +711,21 @@ void evaluateMaterializationSources(const IrResourcePlan& plan, const SrtRuntime
+         walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, flat, plan.cleanFlatSlots, activeSources);
+         return;
+     }
+-    thread_local std::unordered_map<SrtEvalKey, SrtEvalEntry, SrtEvalKeyHash> memo;
+-    SrtEvalKey key;
+-    key.plan = &plan;
+-    key.shaderBase = runtime.shaderBase;
+-    key.readMemory = runtime.readMemory;
+-    key.readSpecializationMemory = runtime.readSpecializationMemory;
+-    key.descriptorSources = plan.descriptorSources.size();
+-    key.pureFlatSlots = plan.pureFlatSlots.size();
+-    key.userData.assign(runtime.userData.begin(), runtime.userData.end());
+-    key.sources.assign(plan.materializationSources.begin(), plan.materializationSources.end());
+-    key.cleanFlatSlots.assign(plan.cleanFlatSlots.begin(), plan.cleanFlatSlots.end());
+-    if (const auto found = memo.find(key); found != memo.end() && srtEvalReadsUnchanged(found->second.reads, runtime)) {
+-        const auto& entry = found->second;
++    // Per thread: the entries by key hash; a bucket holds the entries whose keys share a hash.
++    thread_local std::unordered_map<std::uint64_t, std::vector<SrtEvalStored>> memo;
++    thread_local std::size_t memoEntries = 0;
++    const SrtEvalKeyView key{&plan, runtime.shaderBase, runtime.readMemory, runtime.readSpecializationMemory, plan.descriptorSources.size(), plan.pureFlatSlots.size(), runtime.userData, plan.materializationSources, plan.cleanFlatSlots};
++    const auto hash = srtEvalKeyHash(key);
++    const auto findStored = [&]() -> SrtEvalStored* {
++        const auto bucket = memo.find(hash);
++        if (bucket == memo.end()) return nullptr;
++        for (auto& stored : bucket->second) {
++            if (stored.key.matches(key)) return &stored;
++        }
++        return nullptr;
++    };
++    if (auto* stored = findStored(); stored != nullptr && srtEvalReadsUnchanged(stored->entry.reads, runtime, mode == SrtEvalMemoMode::Verify)) {
++        const auto& entry = stored->entry;
+         if (mode == SrtEvalMemoMode::Verify) {
+             std::vector<DescriptorValue> freshValues;
+             std::vector<std::uint32_t> freshFlat;
+@@ -695,12 +752,25 @@ void evaluateMaterializationSources(const IrResourcePlan& plan, const SrtRuntime
+     recording.userContext = &recorder;
+     recording.readMemory = &srtEvalRecordingRead<0>;
+     recording.readSpecializationMemory = &srtEvalRecordingRead<1>;
++    // The recording readers log each word, so the run readers are not used for the recording.
++    recording.readMemoryRun = nullptr;
++    recording.readSpecializationMemoryRun = nullptr;
+     walker.EvaluateRuntimeSources(plan, plan.materializationSources, recording, values, flat, plan.cleanFlatSlots, activeSources);
+     entry.values = values;
+     entry.flat = flat;
+     entry.activeSources = activeSources;
+-    if (memo.size() >= SrtEvalMemoCapacity && memo.find(key) == memo.end()) memo.clear();
+-    memo.insert_or_assign(std::move(key), std::move(entry));
++    // The evaluation can not have touched the memo, but the lookup is repeated before a replace so
++    // no iterator or reference is held across it.
++    if (auto* stored = findStored(); stored != nullptr) {
++        stored->entry = std::move(entry);
++        return;
++    }
++    if (memoEntries >= SrtEvalMemoCapacity) {
++        memo.clear();
++        memoEntries = 0;
++    }
++    memo[hash].push_back({SrtEvalKey(key), std::move(entry)});
++    ++memoEntries;
+ }
+ 
+ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, ResourceSnapshot& snapshot, std::vector<TableResolution>& tables) {

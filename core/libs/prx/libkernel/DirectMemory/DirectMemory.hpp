@@ -37,4 +37,16 @@ bool GuestProtection(uintptr_t addr, int* prot);
 bool GuestReservation(std::uintptr_t addr, std::uintptr_t* start, std::uintptr_t* end);
 bool GuestRangeMapped(std::uintptr_t start, std::uintptr_t end);
 
+struct DirectMappingInfo {
+    std::uintptr_t address;
+    std::uintptr_t end;
+    std::uint64_t phys;
+    int memoryType;
+    const void* backing;
+    std::uint64_t backingOffset;
+    std::uint64_t backingBytes;
+};
+
+extern "C" void DirectMemoryMappings_nid_postfix(std::vector<DirectMappingInfo>* mappings);
+
 #endif

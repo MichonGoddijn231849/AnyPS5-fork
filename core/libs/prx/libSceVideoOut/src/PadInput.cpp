@@ -267,6 +267,8 @@ void PadInput::Update() {
         controllerState = sampleController();
         publish();
     }
+    static const bool inputFile = std::getenv("APS5_INPUT_FILE") != nullptr;
+    if (inputFile && controller == nullptr) publish();
     const auto now = std::chrono::steady_clock::now();
     bool released = false;
     for (std::size_t index = 0; index < bindings.size(); ++index) {
@@ -343,7 +345,55 @@ void PadInput::publish() {
         state.sticks[2] = mouseStick[0];
         state.sticks[3] = mouseStick[1];
     }
+    applyInputFile(state);
     if (state.analogButtonsL2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::L2);
     if (state.analogButtonsR2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::R2);
     PadPublishInput_nid_postfix(state);
+}
+
+// Debug aid: APS5_INPUT_FILE=<path> also holds the buttons and stick directions the file names (whitespace separated:
+// Cross, Circle, Square, Triangle, Options, Up, Down, Left, Right, L1, R1, L2, R2, L3, R3, StickUp, StickDown,
+// StickLeft, StickRight, LookUp, LookDown, LookLeft, LookRight), read again every 100 ms, so a script can drive a game.
+void PadInput::applyInputFile(PadInputState& state) {
+    static const char* path = std::getenv("APS5_INPUT_FILE");
+    if (path == nullptr || path[0] == '\0') return;
+    static std::uint32_t buttons = 0;
+    static std::array<int, 4> sticks{-1, -1, -1, -1};
+    static std::uint32_t lastRead = 0;
+    const auto now = SDL_GetTicks();
+    if (now - lastRead >= 100u) {
+        lastRead = now;
+        buttons = 0;
+        sticks = {-1, -1, -1, -1};
+        if (std::FILE* file = std::fopen(path, "r")) {
+            char word[32];
+            while (std::fscanf(file, "%31s", word) == 1) {
+                const std::string name = word;
+                static const std::pair<const char*, Pad::PadButton> names[] = {
+                    {"Cross", Pad::PadButton::Cross}, {"Circle", Pad::PadButton::Circle}, {"Square", Pad::PadButton::Square},
+                    {"Triangle", Pad::PadButton::Triangle}, {"Options", Pad::PadButton::Options}, {"Up", Pad::PadButton::Up},
+                    {"Down", Pad::PadButton::Down}, {"Left", Pad::PadButton::Left}, {"Right", Pad::PadButton::Right},
+                    {"L1", Pad::PadButton::L1}, {"R1", Pad::PadButton::R1}, {"L2", Pad::PadButton::L2}, {"R2", Pad::PadButton::R2},
+                    {"L3", Pad::PadButton::L3}, {"R3", Pad::PadButton::R3}};
+                for (const auto& [text, button] : names) {
+                    if (name == text) buttons |= static_cast<std::uint32_t>(button);
+                }
+                if (name == "StickLeft") sticks[0] = 0;
+                if (name == "StickRight") sticks[0] = 255;
+                if (name == "StickUp") sticks[1] = 0;
+                if (name == "StickDown") sticks[1] = 255;
+                if (name == "LookLeft") sticks[2] = 0;
+                if (name == "LookRight") sticks[2] = 255;
+                if (name == "LookUp") sticks[3] = 0;
+                if (name == "LookDown") sticks[3] = 255;
+            }
+            std::fclose(file);
+        }
+    }
+    state.buttons |= buttons;
+    if ((buttons & static_cast<std::uint32_t>(Pad::PadButton::L2)) != 0) state.analogButtonsL2 = 255;
+    if ((buttons & static_cast<std::uint32_t>(Pad::PadButton::R2)) != 0) state.analogButtonsR2 = 255;
+    for (std::size_t axis = 0; axis < state.sticks.size() && axis < sticks.size(); ++axis) {
+        if (sticks[axis] >= 0) state.sticks[axis] = static_cast<std::uint8_t>(sticks[axis]);
+    }
 }

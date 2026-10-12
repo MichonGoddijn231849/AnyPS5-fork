@@ -2,6 +2,8 @@
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <bit>
+#include <utility>
+#include <vector>
 
 namespace ShaderRecompiler {
 
@@ -44,16 +46,69 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto pointer = TypePointer(state, spv::StorageClassFunction, u32);
     state.module.AddFunction(spv::OpVariable, pointer, low, spv::StorageClassFunction);
     state.module.AddFunction(spv::OpVariable, pointer, high, spv::StorageClassFunction);
-    const auto fail = [&](std::uint32_t condition, BdaAbi::FaultReason reason) {
+    const auto failNow = [&](std::uint32_t condition, BdaAbi::FaultReason reason) {
         if (recordFaults) {
             ReturnBdaFailureIf(state, condition, address, bytes, instruction, reason);
         } else {
             ReturnBdaZeroIf(state, condition);
         }
     };
+    std::vector<std::pair<std::uint32_t, BdaAbi::FaultReason>> pending;
+    const bool sharedFault = BdaHelpersCompact() && recordFaults;
+    const auto outerMerge = sharedFault ? state.module.AllocateId() : 0u;
+    std::vector<std::uint32_t> faultPhi;
+    if (sharedFault) {
+        const auto outerBody = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, outerMerge, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpSwitch, constant(0u), outerBody);
+        EmitLabel(state, outerBody);
+    }
+    const auto fail = [&](std::uint32_t condition, BdaAbi::FaultReason reason) {
+        if (BdaHelpersCompact()) pending.emplace_back(condition, reason);
+        else failNow(condition, reason);
+    };
+    const auto flush = [&] {
+        if (sharedFault && !pending.empty()) {
+            auto reason = constant(static_cast<std::uint32_t>(pending.back().second));
+            auto failed = pending.back().first;
+            for (auto entry = pending.rbegin() + 1; entry != pending.rend(); ++entry) {
+                reason = Select(state, u32, entry->first, constant(static_cast<std::uint32_t>(entry->second)), reason);
+                failed = binary(spv::OpLogicalOr, boolean, failed, entry->first);
+            }
+            const auto failedLabel = state.module.AllocateId();
+            const auto next = state.module.AllocateId();
+            state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
+            state.module.AddFunction(spv::OpBranchConditional, failed, failedLabel, next);
+            EmitLabel(state, failedLabel);
+            state.module.AddFunction(spv::OpBranch, outerMerge);
+            faultPhi.insert(faultPhi.end(), {reason, failedLabel});
+            EmitLabel(state, next);
+            pending.clear();
+            return;
+        }
+        if (pending.size() == 1u) failNow(pending.front().first, pending.front().second);
+        if (pending.size() > 1u) {
+            auto reason = constant(0u);
+            auto failed = ConstantBool(state, false);
+            for (auto entry = pending.rbegin(); entry != pending.rend(); ++entry) {
+                reason = Select(state, u32, entry->first, constant(static_cast<std::uint32_t>(entry->second)), reason);
+                failed = binary(spv::OpLogicalOr, boolean, failed, entry->first);
+            }
+            const auto failedLabel = state.module.AllocateId();
+            const auto next = state.module.AllocateId();
+            state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
+            state.module.AddFunction(spv::OpBranchConditional, failed, failedLabel, next);
+            EmitLabel(state, failedLabel);
+            if (recordFaults) state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaFaultFunction, reason, address, bytes, instruction);
+            state.module.AddFunction(spv::OpReturnValue, BdaConstant(state, 0u));
+            EmitLabel(state, next);
+        }
+        pending.clear();
+    };
     const auto length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
     fail(binary(spv::OpULessThan, boolean, length, constant(4)), BdaAbi::FaultReason::InvalidTable);
+    flush();
     fail(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version)), BdaAbi::FaultReason::InvalidTable);
     fail(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))), BdaAbi::FaultReason::InvalidTable);
     fail(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(3)), constant(0)), BdaAbi::FaultReason::InvalidTable);
@@ -64,6 +119,26 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     fail(binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow);
     const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
     fail(binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow);
+    flush();
+    // A read inside the range this lane's previous read lookup found is translated without the
+    // table: a shader's reads walk a few ranges, and each search is ~25 dependent loads.
+    const bool cached = permission == BdaAbi::Read && state.bdaRangeCache[0] != 0;
+    if (cached) {
+        const auto cachedBegin = state.module.AllocateId();
+        const auto cachedFinish = state.module.AllocateId();
+        const auto cachedBase = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u64, cachedBegin, state.bdaRangeCache[0]);
+        state.module.AddFunction(spv::OpLoad, u64, cachedFinish, state.bdaRangeCache[1]);
+        state.module.AddFunction(spv::OpLoad, u64, cachedBase, state.bdaRangeCache[2]);
+        const auto inside = binary(spv::OpLogicalAnd, boolean, binary(spv::OpUGreaterThanEqual, boolean, address, cachedBegin), binary(spv::OpULessThanEqual, boolean, end, cachedFinish));
+        const auto hit = state.module.AllocateId();
+        const auto miss = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, miss, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, inside, hit, miss);
+        EmitLabel(state, hit);
+        state.module.AddFunction(spv::OpReturnValue, binary(spv::OpIAdd, u64, cachedBase, binary(spv::OpISub, u64, address, cachedBegin)));
+        EmitLabel(state, miss);
+    }
     state.module.AddFunction(spv::OpStore, low, constant(0));
     state.module.AddFunction(spv::OpStore, high, count);
     const auto header = state.module.AllocateId();
@@ -93,6 +168,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     EmitLabel(state, merge);
     const auto index = load(low);
     fail(binary(spv::OpIEqual, boolean, index, constant(0)), BdaAbi::FaultReason::Unmapped);
+    flush();
     const auto selected = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, index, constant(1)), constant(8)));
     const auto at = [&](std::uint32_t offset) { return binary(spv::OpIAdd, u32, selected, constant(offset)); };
     const auto begin = BdaLoadAddress(state, selected);
@@ -109,7 +185,22 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     fail(binary(spv::OpULessThan, boolean, result, base), BdaAbi::FaultReason::Overflow);
     const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
     fail(binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow);
+    flush();
+    if (cached) {
+        state.module.AddFunction(spv::OpStore, state.bdaRangeCache[0], begin);
+        state.module.AddFunction(spv::OpStore, state.bdaRangeCache[1], finish);
+        state.module.AddFunction(spv::OpStore, state.bdaRangeCache[2], base);
+    }
     state.module.AddFunction(spv::OpReturnValue, result);
+    if (sharedFault) {
+        EmitLabel(state, outerMerge);
+        const auto reason = state.module.AllocateId();
+        std::vector<std::uint32_t> phi{spv::OpPhi, u32, reason};
+        phi.insert(phi.end(), faultPhi.begin(), faultPhi.end());
+        state.module.AddFunction(phi);
+        state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaFaultFunction, reason, address, bytes, instruction);
+        state.module.AddFunction(spv::OpReturnValue, BdaConstant(state, 0u));
+    }
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;
 }
@@ -181,6 +272,12 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (state.faultBufferVariable != 0) DefineBdaFaultFunction(state);
     if (!state.program.Info().usesDma) return;
+    {
+        const auto pointer = TypePointer(state, spv::StorageClassPrivate, TypeScalarU64(state));
+        state.bdaRangeCache = {state.module.DefineInitializedGlobalVariable(pointer, spv::StorageClassPrivate, BdaConstant(state, ~0ull)),
+                               state.module.DefineInitializedGlobalVariable(pointer, spv::StorageClassPrivate, BdaConstant(state, 0u)),
+                               state.module.DefineInitializedGlobalVariable(pointer, spv::StorageClassPrivate, BdaConstant(state, 0u))};
+    }
     state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);
     DefineBdaDwordReadFunctions(state);

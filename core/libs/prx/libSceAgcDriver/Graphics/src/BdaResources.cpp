@@ -208,6 +208,12 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     }
 }
 
+void BdaResources::ClearTableCache() {
+    auto& cache = Tables();
+    std::lock_guard lock(cache.mutex);
+    cache.entries.clear();
+}
+
 BdaResources::TableCacheStats BdaResources::TableCacheCounters() {
     auto& cache = Tables();
     std::lock_guard lock(cache.mutex);

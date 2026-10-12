@@ -452,7 +452,7 @@ std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const Swa
     std::vector<SwappcCall> calls;
     for (std::uint32_t index = 0; index < program.instructions.size(); ++index) {
         const auto& instruction = program.instructions[index];
-        if (instruction.op != RdnaOpcode::SSwappcB64 && instruction.op != RdnaOpcode::SCallB64) {
+        if ((instruction.op != RdnaOpcode::SSwappcB64 && instruction.op != RdnaOpcode::SCallB64) || instruction.resolvedJump) {
             continue;
         }
         const std::uint32_t linkRegister = scalarIndex(instruction.destination);
@@ -494,7 +494,7 @@ std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const Swa
                 continue;
             }
             const auto& instruction = program.instructions[index];
-            if (instruction.op == RdnaOpcode::SSetpcB64 && isScalar(instruction.source0, call.linkRegister)) {
+            if (instruction.op == RdnaOpcode::SSetpcB64 && !instruction.resolvedJump && isScalar(instruction.source0, call.linkRegister)) {
                 if (returnIndex != InvalidControlFlowId) {
                     throw std::invalid_argument("unclosable scalar call/return pairing at program counter " + toHexString(program.instructions[call.callIndex].programCounter) +
                         ": multiple s_setpc_b64 returns read link register s[" + std::to_string(call.linkRegister) + "]");
@@ -555,7 +555,7 @@ std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const Swa
         std::vector<Transfer> transfers;
         for (std::uint32_t index = 0; index < program.instructions.size(); ++index) {
             const auto& instruction = program.instructions[index];
-            if (IsDirectBranchOpcode(instruction.op)) {
+            if (IsDirectBranchOpcode(instruction.op) || instruction.resolvedJump) {
                 transfers.push_back(Transfer{index, instructionIndexOfProgramCounter(program, instruction.branchTarget)});
                 if (IsConditionalBranchOpcode(instruction.op)) transfers.push_back(Transfer{index, index + 1u});
                 continue;
@@ -688,7 +688,7 @@ std::vector<BasicBlock> GraphBuilder::splitIntoBlocks(const RdnaProgram& program
         const auto& instruction = program.instructions[index];
         const std::uint32_t nextProgramCounter = instructionEndProgramCounter(instruction);
 
-        if (IsDirectBranchOpcode(instruction.op)) {
+        if (IsDirectBranchOpcode(instruction.op) || instruction.resolvedJump) {
             if (!isValidTarget(instruction.branchTarget, instructionProgramCounters, firstProgramCounter, endProgramCounter)) {
                 throw std::invalid_argument("branch at program counter " + toHexString(instruction.programCounter) + " targets invalid program counter " + toHexString(instruction.branchTarget));
             }
@@ -740,6 +740,10 @@ std::vector<BasicBlock> GraphBuilder::splitIntoBlocks(const RdnaProgram& program
             continue;
         }
         if (start != endProgramCounter && !instructionProgramCounters.contains(start)) {
+            // Words no instruction was decoded from up to the next label (the code after s_endpgm, before the inlined
+            // subroutine copies that follow it): no block.
+            const auto next = instructionProgramCounters.lower_bound(start);
+            if (!program.ownedCode.empty() && i + 1u < sortedLabels.size() && next != instructionProgramCounters.end() && *next >= sortedLabels[i + 1u]) continue;
             throw std::invalid_argument("control flow graph label does not start on an instruction boundary: " + toHexString(start));
         }
 
@@ -773,6 +777,11 @@ void GraphBuilder::linkBlocks(std::vector<BasicBlock>& blocks, const RdnaProgram
 
         if (last.op == RdnaOpcode::SEndpgm) {
             block.terminator.kind = TerminatorKind::Return;
+        } else if (last.resolvedJump) {
+            // An inlined subroutine call or its return (InlineSubroutineCalls).
+            block.terminator.kind = TerminatorKind::Branch;
+            block.terminator.condition = BranchCondition::Always;
+            block.terminator.trueBlock = programCounterToBlock.at(last.branchTarget);
         } else if (last.op == RdnaOpcode::SSetpcB64) {
             std::uint32_t target = 0;
             if (const SwappcCall* returnCall = findReturnAt(calls, block.instructionEnd - 1u); returnCall != nullptr) {

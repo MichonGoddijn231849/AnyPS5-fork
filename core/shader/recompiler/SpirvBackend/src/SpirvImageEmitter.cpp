@@ -15,6 +15,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstdlib>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -27,6 +28,9 @@ namespace {
 struct TableSelection {
     std::uint32_t slot = 0;
     std::uint32_t mapped = 0;
+    // `slot` is a WideImages element, not a runtime image metadata index, and `wideClass` the entry's class.
+    bool wide = false;
+    std::uint32_t wideClass = 0;
 };
 
 struct ImageEmitAccess {
@@ -983,30 +987,27 @@ std::uint32_t ImageSampleIndex(SpirvValueEmitContext& ctx, const ImageEmitAccess
 
 void EmitWriteOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     auto& state = ctx.state;
-    if (access.slot != 0) {
-        ctx.Fail(access.inst, "stores through a bindless image table are unsupported");
-    }
     const bool uintImage = access.image.numericClass == IrTextureNumericClass::Uint;
-    EmitIfCondition(state, ctx.Arg(access.inst, 3), [&]() {
+    auto condition = ctx.Arg(access.inst, 3);
+    if (access.table.mapped != 0) condition = Binary(state, spv::OpLogicalAnd, TypeBool(state), condition, access.table.mapped);
+    EmitIfCondition(state, condition, [&]() {
         const auto mipLod = access.image.mipMode == ImageMipMode::DynamicStorage ? LodU32(ctx, access) : 0u;
         const auto coord = CoordU32(ctx, access);
         const auto texel = access.mem.imagePacked ? PackedStoreTexel(ctx, access, ctx.Arg(access.inst, 2)) : StoreTexel(ctx, access, ctx.Arg(access.inst, 2), uintImage);
-        EmitStorageImageWrite(state, access.mem.resource, mipLod, coord, texel, ImageSampleIndex(ctx, access));
+        EmitStorageImageWrite(state, access.mem.resource, mipLod, coord, texel, ImageSampleIndex(ctx, access), access.slot);
     });
 }
 
 void EmitAtomicOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     auto& state = ctx.state;
-    if (access.slot != 0) {
-        ctx.Fail(access.inst, "atomics through a bindless image table are unsupported");
-    }
     const auto opcode = access.inst.Opcode();
-    const auto condition = ctx.Arg(access.inst, access.inst.ArgumentCount() - 1u);
+    auto condition = ctx.Arg(access.inst, access.inst.ArgumentCount() - 1u);
+    if (access.table.mapped != 0) condition = Binary(state, spv::OpLogicalAnd, TypeBool(state), condition, access.table.mapped);
     if (IsImageAtomic64Opcode(opcode)) {
         ctx.Define(access.inst, EmitValueOrDefaultIfCondition(state, condition, TypeU64(state), ConstantU64(state, 0u), [&]() {
             const auto scalar = TypeScalarU64(state);
             const auto pointer = state.module.AllocateId();
-            state.module.AddFunction(spv::OpImageTexelPointer, TypePointer(state, spv::StorageClassImage, scalar), pointer, StorageImageDescriptorPointer(state, access.mem.resource), CoordU32(ctx, access), ConstantU32(state, 0));
+            state.module.AddFunction(spv::OpImageTexelPointer, TypePointer(state, spv::StorageClassImage, scalar), pointer, StorageImageDescriptorPointer(state, access.mem.resource, access.slot), CoordU32(ctx, access), ConstantU32(state, 0));
             const auto value = Unary(state, spv::OpBitcast, scalar, ctx.Arg(access.inst, 2));
             const auto old = state.module.AllocateId();
             if (opcode == IrOpcode::ImageAtomicCmpSwap64) {
@@ -1024,7 +1025,7 @@ void EmitAtomicOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     ctx.Define(access.inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
         const auto pointer = state.module.AllocateId();
         const auto pointerType = TypePointer(state, spv::StorageClassImage, TypeU32(state));
-        state.module.AddFunction(spv::OpImageTexelPointer, pointerType, pointer, StorageImageDescriptorPointer(state, access.mem.resource), CoordU32(ctx, access), ImageSampleIndex(ctx, access));
+        state.module.AddFunction(spv::OpImageTexelPointer, pointerType, pointer, StorageImageDescriptorPointer(state, access.mem.resource, access.slot), CoordU32(ctx, access), ImageSampleIndex(ctx, access));
         if (opcode == IrOpcode::ImageAtomicInc32 || opcode == IrOpcode::ImageAtomicDec32) {
             return AtomicUpdate(state, pointer, ResourceKind::Image, [&](std::uint32_t current) {
                 return opcode == IrOpcode::ImageAtomicInc32 ? AtomicIncrement(state, current, value) : AtomicDecrement(state, current, value);
@@ -1042,6 +1043,7 @@ void EmitAtomicOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
             });
         }
         const auto old = state.module.AllocateId();
+        EmitDeviceAtomicReleaseBarrier(state);
         if (opcode == IrOpcode::ImageAtomicCmpSwap32) {
             state.module.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), old, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, spv::MemorySemanticsMaskNone), value, ctx.Arg(access.inst, 3));
         } else {
@@ -1471,6 +1473,42 @@ TableSelection TableSlot(SpirvValueEmitContext& ctx, const IrValue& inst, const 
     if (handle == nullptr || image.source >= sources.size() || !sources[image.source].indirectImage.has_value() || sources[image.source].indirectImage->keyArg >= handle->ArgumentCount()) {
         ctx.Fail(inst, "has invalid bindless image table key provenance");
     }
+    if (image.wideTable) {
+        // The flattened SRT holds the table's base element in WideImages, its entry count and where its entries'
+        // 2-bit classes start; a key past the entries reads zeros (TableResult).
+        if (state.flattenedSrtVariable == 0) ctx.Fail(inst, "has no wide bindless table header");
+        const auto loadHeader = [&](std::uint32_t word) {
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, state.flattenedSrtVariable, ConstantU32(state, 0), ConstantU32(state, image.indirectMappingOffset + word));
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+            return value;
+        };
+        // The header: where the table's key map starts, its entry count, its feedback region. A map word is the
+        // entry's class << 30 | (element + 1), 0 for an entry not bound (it reads zeros, TableResult).
+        const auto key = ctx.Def(handle->Argument(sources[image.source].indirectImage->keyArg));
+        const auto inTable = Binary(state, spv::OpULessThan, TypeBool(state), key, loadHeader(1u));
+        const auto safeKey = Select(state, TypeU32(state), inTable, key, ConstantU32(state, 0u));
+        const auto mapWord = state.module.AllocateId();
+        const auto mapPointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), mapPointer, state.flattenedSrtVariable, ConstantU32(state, 0), Binary(state, spv::OpIAdd, TypeU32(state), loadHeader(0u), safeKey));
+        state.module.AddFunction(spv::OpLoad, TypeU32(state), mapWord, mapPointer);
+        const auto elementPlusOne = Binary(state, spv::OpBitwiseAnd, TypeU32(state), mapWord, ConstantU32(state, 0x3fffffffu));
+        const auto mapped = Binary(state, spv::OpLogicalAnd, TypeBool(state), inTable, Binary(state, spv::OpINotEqual, TypeBool(state), elementPlusOne, ConstantU32(state, 0u)));
+        const auto element = Select(state, TypeU32(state), mapped, Binary(state, spv::OpISub, TypeU32(state), elementPlusOne, ConstantU32(state, 1u)), ConstantU32(state, 0u));
+        const auto entryClass = Binary(state, spv::OpShiftRightLogical, TypeU32(state), mapWord, ConstantU32(state, 30u));
+        if (state.wideFeedbackVariable != 0u) {
+            // The key was sampled (bound or not yet): its flag in the table's feedback region (word 0 when past the
+            // table or without a region) becomes 1, so the next builds bind its entry.
+            const auto region = loadHeader(2u);
+            const auto live = Binary(state, spv::OpLogicalAnd, TypeBool(state), inTable, Binary(state, spv::OpINotEqual, TypeBool(state), region, ConstantU32(state, 0u)));
+            const auto flag = Select(state, TypeU32(state), live, Binary(state, spv::OpIAdd, TypeU32(state), region, key), ConstantU32(state, 0u));
+            const auto flagPointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), flagPointer, state.wideFeedbackVariable, ConstantU32(state, 0), flag);
+            state.module.AddFunction(spv::OpStore, flagPointer, ConstantU32(state, 1u));
+        }
+        return {element, mapped, true, entryClass};
+    }
     if (state.flattenedSrtVariable == 0 || image.indirectSearchIterations == 0u) {
         ctx.Fail(inst, "has no bindless image table runtime mapping");
     }
@@ -1565,10 +1603,22 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const auto& memory = ctx.Memory(inst);
     const auto& base = ImageResourceOf(state, memory);
-    const auto modes = ResourceMaterializer::RuntimeImageModes(base);
+    auto modes = ResourceMaterializer::RuntimeImageModes(base);
+    // A wide table's entries are of its native float, uint or sint mode (the materializer binds others null):
+    // those modes in class order, the entry's class mapped to its position among them.
+    std::vector<std::uint32_t> widePositions;
+    if (base.wideTable) {
+        const auto wide = ResourceMaterializer::WideModes(base);
+        std::vector<ImageResource> available;
+        for (const auto index : wide) {
+            widePositions.push_back(static_cast<std::uint32_t>(available.size()));
+            if (index != UINT32_MAX) available.push_back(modes.at(index));
+        }
+        modes = std::move(available);
+    }
     state.runtimeImageMetadata = ConstantU32(state, memory.resource);
     const auto table = TableSlot(ctx, inst, memory, base);
-    if (table.slot != 0u) {
+    if (table.slot != 0u && !table.wide) {
         state.runtimeImageMetadata = table.slot;
     }
     const auto emitMode = [&](const ImageResource& mode) {
@@ -1596,7 +1646,11 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
         state.runtimeImageMetadata = 0u;
         return;
     }
-    const auto selector = base.indirectRoot == ImageResource::NoIndirectImage ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords, 0u) : Binary(state, spv::OpShiftRightLogical, TypeU32(state), RuntimeImageDword(state, memory.resource, offsetof(RuntimeAbi::ResourceMetadata, flags) / sizeof(std::uint32_t)), ConstantU32(state, 1u));
+    auto selector = base.indirectRoot == ImageResource::NoIndirectImage ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords, 0u) : base.wideTable ? 0u : Binary(state, spv::OpShiftRightLogical, TypeU32(state), RuntimeImageDword(state, memory.resource, offsetof(RuntimeAbi::ResourceMetadata, flags) / sizeof(std::uint32_t)), ConstantU32(state, 1u));
+    if (base.wideTable) {
+        selector = ConstantU32(state, 0u);
+        for (std::uint32_t wideClass = 0u; wideClass < widePositions.size(); ++wideClass) selector = Select(state, TypeU32(state), Binary(state, spv::OpIEqual, TypeBool(state), table.wideClass, ConstantU32(state, wideClass)), ConstantU32(state, widePositions[wideClass]), selector);
+    }
     const bool returnsValue = inst.Opcode() != IrOpcode::ImageWrite;
     const auto resultId = returnsValue ? ctx.Result(inst) : 0u;
     ctx.definitions.erase(&inst);
@@ -1620,7 +1674,7 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
         EmitLabel(state, labels[index]);
         std::uint32_t modeMerge = 0u;
-        if (base.indirectRoot != ImageResource::NoIndirectImage) {
+        if (base.indirectRoot != ImageResource::NoIndirectImage && !base.wideTable) {
             const auto enabled = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageModeBase + memory.resource * PipelineSpecialization::ImageModeStride + index, 1u);
             const auto active = Binary(state, spv::OpINotEqual, TypeBool(state), enabled, ConstantU32(state, 0u));
             const auto activeLabel = state.module.AllocateId();
@@ -1808,8 +1862,12 @@ void EmitImageAtomicCmpSwap64(SpirvValueEmitContext& ctx, const IrValue& inst) {
     EmitImage(ctx, inst);
 }
 
-void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
-    auto& state = ctx.state;
+// One image_bvh_intersect_ray query (a box node's four children or a triangle) in the current
+// function: the body of its variant's shared function (DefineBvhIntersectFunctions), or inline at
+// the instruction when node reads take the byte path (EmitBdaDwordReads needs the instruction).
+// `component(i)` is the i-th address VGPR, `pcValue` the instruction's pc for fault records.
+template <typename TComponent>
+std::uint32_t EmitBvhQuery(SpirvEmitterState& state, SpirvValueEmitContext* inlineCtx, const IrValue* inlineInst, std::uint32_t descriptor, TComponent&& component, bool a16, bool node64, std::uint32_t pcValue) {
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
     const auto f32 = TypeF32(state);
@@ -1835,16 +1893,11 @@ void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const auto pair = [&](std::uint32_t low, std::uint32_t high) { return op(spv::OpBitwiseOr, u64, widen(low), op(spv::OpShiftLeftLogical, u64, widen(high), BdaConstant(state, 32u))); };
 
     const auto query = [&] {
-        const auto descriptor = ctx.Arg(inst, 0);
         std::array<std::uint32_t, 4> word{};
         for (std::uint32_t i = 0; i < 4u; ++i) {
             word[i] = state.module.AllocateId();
             state.module.AddFunction(spv::OpCompositeExtract, u32, word[i], descriptor, i);
         }
-        const IrValue* address = ctx.ImageAddress(inst.Argument(1));
-        const auto component = [&](std::uint32_t index) { return ctx.Arg(*address, index); };
-        const bool a16 = (ctx.Memory(inst).imageSampleFlags & RdnaImageSampleFlagA16) != 0u;
-        const bool node64 = ctx.Memory(inst).addressIsFull;
         const std::uint32_t ray = node64 ? 2u : 1u;
 
         const auto nodeLow = component(0);
@@ -1889,12 +1942,12 @@ void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
             std::vector<std::uint32_t> dwords;
             if (state.bdaProbeFunction == 0) {
                 for (std::uint32_t first = 0; first < count; first += 4u) {
-                    const auto read = EmitBdaDwordReads(ctx, inst, nodeAddress, first * 4u, 4u, true);
+                    const auto read = EmitBdaDwordReads(*inlineCtx, *inlineInst, nodeAddress, first * 4u, 4u, true);
                     dwords.insert(dwords.end(), read.begin(), read.end());
                 }
                 return dwords;
             }
-            const auto pc = uint(inst.Flags<MemoryFlags>().pc);
+            const auto pc = pcValue;
             const auto bytes = uint(count * 4u);
             const auto physical = state.module.AllocateId();
             state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaProbeFunction, nodeAddress, bytes, pc);
@@ -2029,7 +2082,78 @@ void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
         const auto box16 = EmitValueOrDefaultIfCondition(state, isBox16, result4, tested, [&] { return boxes(true); });
         return EmitValueOrDefaultIfCondition(state, isBox32, result4, box16, [&] { return boxes(false); });
     };
-    const auto inactive = compose({invalid, invalid, invalid, invalid});
+    return query();
+}
+
+namespace {
+
+// The shared function of a variant: index (A16 ? 1 : 0) | (64-bit node pointer ? 2 : 0), and the
+// address VGPRs it takes (node pointer, extent, origin, then direction and inverse direction:
+// three packed pairs under A16, six dwords otherwise).
+std::uint32_t BvhVariant(bool a16, bool node64) { return (a16 ? 1u : 0u) | (node64 ? 2u : 0u); }
+std::uint32_t BvhComponents(bool a16, bool node64) { return (node64 ? 2u : 1u) + (a16 ? 7u : 10u); }
+
+}
+
+// Each image_bvh_intersect_ray of a wave64 program on a 32-wide host was emitted inline once per
+// lane half, so GTA V's ray tracing kernel carried its box and triangle tests four times (705k
+// SPIR-V words, minutes of driver compile); with BDA probes the query is one function per variant,
+// called at each instruction.
+void DefineBvhIntersectFunctions(SpirvEmitterState& state) {
+    if (state.bdaProbeFunction == 0) return;
+    std::array<bool, 4> used{};
+    for (const IrBlock* block : state.program.BlockOrder()) {
+        for (const IrValue* inst : block->Instructions()) {
+            if (inst->Opcode() != IrOpcode::ImageBvhIntersectRay) continue;
+            const auto& mem = state.program.Resources().memoryInfo.at(inst->Flags<MemoryFlags>().index);
+            used[BvhVariant((mem.imageSampleFlags & RdnaImageSampleFlagA16) != 0u, mem.addressIsFull)] = true;
+        }
+    }
+    const auto u32 = TypeU32(state);
+    const auto result4 = TypeU32Composite(state, 4u);
+    for (std::uint32_t variant = 0; variant < used.size(); ++variant) {
+        if (!used[variant]) continue;
+        const bool a16 = (variant & 1u) != 0u;
+        const bool node64 = (variant & 2u) != 0u;
+        const auto count = BvhComponents(a16, node64);
+        std::vector<std::uint32_t> parameterTypes{result4};
+        parameterTypes.insert(parameterTypes.end(), count + 1u, u32);
+        const auto function = state.module.AllocateId();
+        state.module.AddName(function, "image_bvh_intersect_ray");
+        state.module.AddFunction(spv::OpFunction, result4, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, result4, std::span<const std::uint32_t>(parameterTypes)));
+        std::vector<std::uint32_t> parameters(parameterTypes.size());
+        for (std::size_t i = 0; i < parameters.size(); ++i) {
+            parameters[i] = state.module.AllocateId();
+            state.module.AddFunction(spv::OpFunctionParameter, parameterTypes[i], parameters[i]);
+        }
+        EmitLabel(state, state.module.AllocateId());
+        const auto value = EmitBvhQuery(state, nullptr, nullptr, parameters[0], [&](std::uint32_t index) { return parameters[1u + index]; }, a16, node64, parameters.back());
+        state.module.AddFunction(spv::OpReturnValue, value);
+        state.module.AddFunction(spv::OpFunctionEnd);
+        state.bvhIntersectFunctions[variant] = function;
+    }
+}
+
+void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    auto& state = ctx.state;
+    const auto result4 = TypeU32Composite(state, 4u);
+    const auto invalid = ConstantU32(state, 0xffffffffu);
+    const IrValue* address = ctx.ImageAddress(inst.Argument(1));
+    const bool a16 = (ctx.Memory(inst).imageSampleFlags & RdnaImageSampleFlagA16) != 0u;
+    const bool node64 = ctx.Memory(inst).addressIsFull;
+    const auto pc = ConstantU32(state, inst.Flags<MemoryFlags>().pc);
+    const auto function = state.bvhIntersectFunctions[BvhVariant(a16, node64)];
+    const auto query = [&] {
+        if (function == 0) return EmitBvhQuery(state, &ctx, &inst, ctx.Arg(inst, 0), [&](std::uint32_t index) { return ctx.Arg(*address, index); }, a16, node64, pc);
+        std::vector<std::uint32_t> arguments{ctx.Arg(inst, 0)};
+        for (std::uint32_t i = 0; i < BvhComponents(a16, node64); ++i) arguments.push_back(ctx.Arg(*address, i));
+        arguments.push_back(pc);
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, result4, value, function, std::span<const std::uint32_t>(arguments));
+        return value;
+    };
+    const auto inactive = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, result4, inactive, invalid, invalid, invalid, invalid);
     ctx.Define(inst, EmitValueOrDefaultIfCondition(state, ctx.Arg(inst, 2), result4, inactive, query));
 }
 

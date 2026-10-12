@@ -777,6 +777,96 @@ void verifyBindlessTable() {
     fillSrt(4u);
 }
 
+void verifyBindlessShiftedKey() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Format8888UNorm = 56;
+    constexpr std::uint32_t Type2D = 9;
+    struct alignas(256) Texture { std::array<std::uint8_t, 256> bytes{}; };
+    static Texture textures[2];
+    struct alignas(4096) GuestTables {
+        std::array<std::array<std::uint32_t, 8>, 4> heap{};
+        std::array<std::uint32_t, 12> records{};
+        std::array<std::uint32_t, 2> indices{};
+        std::array<std::uint32_t, 4> output{};
+        std::array<std::uint32_t, 18> srt{};
+    };
+    static GuestTables guest;
+    const auto makeTexture = [&](std::uint32_t entry, const Texture& texture) {
+        const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
+        guest.heap[entry] = {static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+    };
+    makeTexture(0, textures[0]);
+    makeTexture(1, textures[1]);
+    guest.heap[3] = guest.heap[1];
+    guest.records[8] = 3u << 4u;
+    guest.indices = {1u, 1u};
+    const auto bufferDescriptor = [](const void* base, std::uint32_t stride, std::uint32_t records) {
+        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(base));
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), records, 0xfacu};
+    };
+    const auto heapV = bufferDescriptor(guest.heap.data(), 32u, 4u);
+    const auto recordV = bufferDescriptor(guest.records.data(), 0u, sizeof(guest.records));
+    const auto outputV = bufferDescriptor(guest.output.data(), 0u, 16u);
+    std::copy(heapV.begin(), heapV.end(), guest.srt.begin());
+    std::copy(recordV.begin(), recordV.end(), guest.srt.begin() + 8);
+    std::copy(outputV.begin(), outputV.end(), guest.srt.begin() + 12);
+    const auto indices = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(guest.indices.data()));
+    guest.srt[16] = static_cast<std::uint32_t>(indices);
+    guest.srt[17] = static_cast<std::uint32_t>(indices >> 32u);
+    const std::vector<std::uint32_t> code{
+        0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u,
+        0xf4040480u, 0xfa000040u, 0xf4000449u, 0xfa000000u, 0xf4000409u, 0xfa000004u,
+        0x81101110u, 0x93108310u, 0x8f108210u, 0x81108810u,
+        0xf4200406u, 0x20000000u, 0x90108410u, 0x8f108510u,
+        0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xf09c0f08u, 0x00450400u, 0xe0700004u, 0x80070400u, 0xbf810000u};
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(guest.srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    const auto plan = GetResourcePlan(request);
+    std::size_t tables = 0;
+    for (const auto& source : plan->descriptorSources) {
+        if (!source.indirectImage.has_value()) continue;
+        ++tables;
+        require(!source.indirectImage->hasMaterial && source.indirectImage->entryOffset == 0u, "bindless shifted key: the table is not bound whole");
+    }
+    require(tables == 1, "bindless shifted key: the table read by two samples was not planned once");
+    const auto slots = ResourceMaterializer::BindlessSlots();
+    const auto direct = static_cast<std::uint32_t>(plan->info.images.size());
+    AgcDriver::ShaderMemory memory({});
+    const auto capture = memory.Capture(request);
+    require(capture->snapshot.images.size() == direct + slots - 1u, "bindless shifted key: the snapshot does not hold the table slots");
+    require(capture->snapshot.images[0].dwords == guest.heap[0] && capture->snapshot.images[direct].dwords == guest.heap[1] && capture->snapshot.images[direct + 2u].dwords == guest.heap[3], "bindless shifted key: the slots do not hold the table entries");
+    const auto& flat = capture->snapshot.flattenedSrt;
+    const auto guards = plan->guardedSrtSlots.size();
+    require(flat.size() >= guards + 1u + 2u * slots, "bindless shifted key: the mapping block is missing");
+    const auto mappingBegin = flat.size() - guards - (1u + 2u * slots);
+    const std::vector<std::uint32_t> mapping(flat.begin() + static_cast<std::ptrdiff_t>(mappingBegin), flat.begin() + static_cast<std::ptrdiff_t>(mappingBegin) + 7);
+    require(mapping == std::vector<std::uint32_t>{3u, 0u, 0u, 1u, 1u, 3u, 3u}, "bindless shifted key: the (key, slot) mapping is wrong");
+    request.context.memory = memory.Regions();
+    const auto compiled = Recompile(request, *capture);
+    std::size_t sampled = 0;
+    for (const auto& binding : compiled->bindings) {
+        if (binding.kind != DescriptorKind::SampledImage) continue;
+        ++sampled;
+        require(binding.count == direct + slots - 1u, "bindless shifted key: the image binding does not hold the table slots");
+    }
+    require(sampled == 1u, "bindless shifted key: the two samples do not share one image binding");
+}
 
 void verifyDescriptorPhis() {
     using namespace ShaderRecompiler;
@@ -1286,7 +1376,7 @@ void verifyPixelRequestSerialization() {
                         value.posZ, value.posW, value.frontFace, value.ancillary, value.sampleShading,
                         value.noPerspective, value.linearCentroid, value.pixelKillEnable, value.depthExportEnable,
                         value.sampleMaskExportEnable, value.earlyZ, value.executeOnNoop, value.conservativeZExport, value.orderedPixelShader,
-                        value.targetOutputMode, value.targetExportMapping);
+                        value.targetOutputMode, value.targetExportMapping, value.stencilExportEnable);
     };
     const std::array<std::uint32_t, 1> code{0xbf810000u};
     const std::array<std::uint32_t, 3> userData{0x12345678u, 0xabcdef01u, 0x87654321u};
@@ -1326,7 +1416,8 @@ void verifyPixelRequestSerialization() {
         .executeOnNoop = true,
         .conservativeZExport = ConservativeZExport::GreaterThanZ,
         .orderedPixelShader = true,
-        .targetOutputMode = {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}
+        .targetOutputMode = {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u},
+        .stencilExportEnable = true
     };
     for (std::uint32_t i = 0; i < pixel.interpolatorSettings.size(); ++i) pixel.interpolatorSettings[i] = 0x10101010u + i;
     const std::array<std::array<std::uint8_t, 8>, 3> mappings{{
@@ -1364,12 +1455,12 @@ void verifyPixelRequestSerialization() {
     minimal.context.waveSize = 64;
     minimal.context.pixel = ShaderPixelStageInfo{};
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQQ8AAAA=", "new requests did not use serialization version 15");
+    require(requestPrefix(encoded, 8u) == "NVNQQREAAAA=", "new requests did not use serialization version 17");
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
     for (std::size_t bytes = 0; bytes < 17u; ++bytes) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing or dual-source flag was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRAAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRIAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
 }
@@ -2143,14 +2234,16 @@ void verifyBdaReadFallbackFunctions() {
                     if (callee == "probe_bda_pointer" || callee.starts_with("read_bda_dword_bytes")) ++mainProbes;
                     if (callee == span) ++spanCalls;
                 }
-                if (op == spv::OpLoad && function == reader) ++readerLoads[length > 4u && (five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
+                if (op == spv::OpLoad && function == reader && length > 4u) ++readerLoads[(five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
                 cursor += length;
             }
             require(definitions["record_bda_fault"] == 1u && definitions[reader] == 1u && definitions[span] == 1u, "BDA read functions: the fault, byte read and span read functions are not defined");
             for (const auto& [name, count] : definitions) require(count == 1u, "BDA read functions: a function is defined twice");
             require(compareExchanges == 1u, "BDA read functions: a fault is recorded outside record_bda_fault");
             require(mainLookups == 0u, "BDA read functions: a read site looks up its bytes inline");
-            require(readerLoads[coherent] == 4u && readerLoads[!coherent] == 0u, "BDA read functions: the byte loads do not keep the access's coherence");
+            const char* compact = std::getenv("APS5_COMPACT_BDA_HELPERS");
+            const std::size_t byteLoads = compact != nullptr && std::strcmp(compact, "0") != 0 ? 1u : 4u;
+            require(readerLoads[coherent] == byteLoads && readerLoads[!coherent] == 0u, "BDA read functions: the byte loads do not keep the access's coherence");
             require(mainProbes == 0u, "BDA read functions: a read site probes or reads bytes outside its span read function");
             require(spanCalls == 5u, "BDA read functions: a read site does not call its span read function once");
             require(five.size() - one.size() < 4u * 150u, "BDA read functions: a read site takes 150 SPIR-V words or more");
@@ -2560,6 +2653,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--bindless") {
             verifyBindlessTable();
+            verifyBindlessShiftedKey();
             std::cout << "Bindless mapping, indexing capabilities and strict validation passed\n";
             return 0;
         }
@@ -2570,6 +2664,7 @@ int main(int argc, char** argv) {
         verifySignedSrtComparison();
         verifyPureFlatSlots();
         verifyBindlessTable();
+        verifyBindlessShiftedKey();
         verifyDescriptorPhis();
         verifyProgramCounterRelativeData();
         verifyLanesOutsideHostSubgroup();

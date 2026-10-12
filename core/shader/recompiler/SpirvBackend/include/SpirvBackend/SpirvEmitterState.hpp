@@ -111,6 +111,11 @@ struct SpirvEmitterState {
     // The lookup without fault recording that wide reads try first (see EmitBdaDwordReads); 0 when
     // every read takes the byte path.
     std::uint32_t bdaProbeFunction = 0;
+    // The range the lane's last read lookup found (Private begin, end and device base), which the
+    // read lookups try before their table search; 0 when not defined.
+    std::array<std::uint32_t, 3> bdaRangeCache{};
+    // The shared image_bvh_intersect_ray functions by variant (see DefineBvhIntersectFunctions).
+    std::array<std::uint32_t, 4> bvhIntersectFunctions{};
     std::uint32_t bdaWritePointerFunction = 0;
     std::uint32_t bdaWriteProbeFunction = 0;
     std::uint32_t bdaAtomicPointerFunction = 0;
@@ -134,6 +139,8 @@ struct SpirvEmitterState {
     std::uint32_t loopGuardVisits = 0;
     std::uint32_t loopGuardPc = 0;
     std::uint32_t srgbTableVariable = 0;
+    // The runtime buffer format table of SpirvRuntimeBuffer.cpp's table-driven loads (Private, initialized).
+    std::uint32_t bufferFormatTableVariable = 0;
     std::uint32_t gdsVariable = 0;
     std::uint32_t gdsLength = 0;
     std::uint32_t pushConstantVariable = 0;
@@ -146,6 +153,9 @@ struct SpirvEmitterState {
     std::array<std::uint32_t, 2> scratchVariable {};
     std::array<std::uint32_t, ImageBindingCount> imageVariables {};
     std::uint32_t samplerVariable = 0;
+    // The WideImages bindings (APS5_WIDE_BINDLESS): the entries of the wide bindless tables, by numeric class.
+    std::array<std::uint32_t, RuntimeAbi::WideImageKinds> wideImageVariables {};
+    std::uint32_t wideFeedbackVariable = 0;
     std::uint32_t mainFunc = 0;
     std::uint32_t meshGuestFunc = 0;
     std::uint32_t meshAllocation = 0;
@@ -156,6 +166,7 @@ struct SpirvEmitterState {
     std::uint32_t currentLabel = 0;
     const IrBlock* currentBlock = nullptr;
     std::uint32_t pixelValidMaskVariable = 0;
+    std::uint32_t quadPixelUncovered = 0;
     std::uint32_t subgroupLocalInvocationIdVariable = 0;
     std::uint32_t perVertexVariable = 0;
     std::uint32_t pointSizeVariable = 0;
@@ -165,6 +176,7 @@ struct SpirvEmitterState {
     std::uint32_t viewportIndexVariable = 0;
     std::uint32_t depthVariable = 0;
     std::uint32_t sampleMaskVariable = 0;
+    std::uint32_t stencilRefVariable = 0;
     std::vector<SpirvInputBinding> inputs;
     std::vector<SpirvOutputBinding> outputs;
     std::vector<std::uint32_t> interfaceVariables;

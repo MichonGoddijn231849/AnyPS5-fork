@@ -35,6 +35,7 @@ public:
         std::uint64_t firstEmpty = 0;
     };
     static TableCacheStats TableCacheCounters();
+    static void ClearTableCache();
 
 private:
     // The page table is read-only to the shader, so consecutive builds mapping the same ranges to the

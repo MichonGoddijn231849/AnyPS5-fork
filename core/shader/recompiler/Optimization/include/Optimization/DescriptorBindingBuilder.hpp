@@ -16,7 +16,15 @@ struct PreparedDescriptorBinding {
     std::vector<std::uint32_t> samplerFilterElements;
     std::size_t writtenBuffers = 0;
     std::size_t readOnlyBuffers = 0;
+    // The WideImages binding: its elements are the snapshot's wide table entries, padded with null descriptors.
+    bool wideImages = false;
+    // The binding's offset among the WideImages kinds (dimension index * 3 + class).
+    std::uint32_t wideKind = 0;
 };
+
+// The WideImages binding's element count for `entries` wide table entries: a power of two of at least 16 (one
+// pipeline per size class).
+std::uint32_t WideImageElements(std::size_t entries);
 
 struct PreparedImageMetadata {
     std::uint32_t resource;

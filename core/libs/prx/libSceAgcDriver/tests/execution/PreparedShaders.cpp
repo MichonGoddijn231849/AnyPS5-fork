@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include <spirv/unified1/spirv.hpp>
@@ -38,7 +39,7 @@ void ExpectFailure(TAction action, const char* expected) {
         Require(std::string(error.what()).find(expected) != std::string::npos, error.what());
         return;
     }
-    throw std::runtime_error("expected preparation failure");
+    throw std::runtime_error(std::string("expected preparation failure: ") + expected);
 }
 
 void RunUnregistered(AgcDriver::VulkanDevice& device, ShaderRecompiler::RecompileRequest request) {
@@ -402,7 +403,9 @@ void Registration(bool indirect) {
     padded.back() = std::byte{0x7d};
     AgcDriverResolveShaderAbi_nid_postfix(reinterpret_cast<Shader*>(padded.data()), {}, {});
     copy.target ^= 1u;
-    ExpectFailure([&] { AgcDriverResolveShaderAbi_nid_postfix(&copy, {}, {}); }, "replaced shader header");
+    AgcDriverResolveShaderAbi_nid_postfix(&copy, {}, {});
+    ExpectFailure([&] { AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(&copy, {}, {}); }, "replaced shader header");
+    AgcDriver::DriverDetail::ShaderPreparationTransaction::ForgiveFailure();
     header.registers[1].value |= 0x100u;
     ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&header.shader); }, "invalid registered program address");
     header.registers[1].value &= 0xffu;

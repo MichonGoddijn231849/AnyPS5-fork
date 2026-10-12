@@ -104,12 +104,33 @@ void Run(AgcDriver::VulkanDevice& device) {
         AgcDriver::Pm4::DrawParameters draw{0u, 3u, 0u, 1u, 0u, false};
         draw.firstVertex = 1u;
         draw.firstInstance = 1u;
-        pixels.fill(std::byte{0});
-        device.Draw(state, draw, shaders);
-        device.WaitIdle();
-        for (std::size_t index = 0; index < pixels.size(); index += 4u) {
-            Require(pixels[index] == std::byte{255} && pixels[index + 1u] == std::byte{0} && pixels[index + 2u] == std::byte{0} && pixels[index + 3u] == std::byte{255}, "runtime vertex fetch produced the wrong triangle");
-        }
+        const auto drawWith = [&](const AgcDriver::Graphics::DrawPreparation* prepared) {
+            const AgcDriver::Graphics::DrawPreparationScope scope(prepared);
+            pixels.fill(std::byte{0});
+            device.Draw(state, draw, shaders);
+            device.WaitIdle();
+        };
+        const auto covered = [&] {
+            for (std::size_t index = 0; index < pixels.size(); index += 4u) {
+                if (pixels[index] != std::byte{255} || pixels[index + 1u] != std::byte{0} || pixels[index + 2u] != std::byte{0} || pixels[index + 3u] != std::byte{255}) return false;
+            }
+            return true;
+        };
+        drawWith(nullptr);
+        Require(covered(), "runtime vertex fetch produced the wrong triangle");
+        AgcDriver::Graphics::DrawPreparation prepared;
+        Require(device.PrepareDraw(state, draw, shaders, prepared), "the draw could not be prepared");
+        drawWith(&prepared);
+        Require(covered(), "a prepared draw produced the wrong triangle");
+        auto poisoned = prepared;
+        poisoned.fragmentOutputs.clear();
+        const auto other = state;
+        poisoned.state = &other;
+        drawWith(&poisoned);
+        Require(covered(), "a draw took a preparation made for another state");
+        poisoned.state = &state;
+        drawWith(&poisoned);
+        Require(!covered(), "a draw did not take its own preparation");
     }
 }
 

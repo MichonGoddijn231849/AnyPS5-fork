@@ -3,6 +3,8 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <thread>
 #include <chrono>
 #include <cstdio>
@@ -15,6 +17,36 @@
 extern "C" void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protection, int flags, int descriptor, std::int64_t offset) noexcept;
 
 namespace AgcDriver::Pm4 {
+
+namespace {
+std::atomic<std::uint64_t> timestampFlip{0};
+
+std::uint64_t ReferenceClock() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+}
+
+std::uint64_t TimestampScale() {
+    static const std::uint64_t scale = [] {
+        const char* text = std::getenv("APS5_GPU_TIMESTAMP_SCALE");
+        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 100ull;
+        return std::clamp<std::uint64_t>(parsed, 100, 300);
+    }();
+    return scale;
+}
+}
+
+std::uint64_t GuestGpuTimestamp() {
+    const auto now = ReferenceClock();
+    const auto scale = TimestampScale();
+    if (scale == 100) return now;
+    const auto base = timestampFlip.load(std::memory_order_relaxed);
+    if (base == 0 || now < base) return now;
+    return base + (now - base) * scale / 100;
+}
+
+void NoteTimestampFlip() {
+    if (TimestampScale() != 100) timestampFlip.store(ReferenceClock(), std::memory_order_relaxed);
+}
 
 std::uint64_t GdsAddress() {
     static const std::uint64_t address = [] {
@@ -556,7 +588,7 @@ std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet
         if (dataSelect == 0 || dataSelect > 3) return std::nullopt;
         if (destination == 0) return std::nullopt;
         std::uint64_t value = address(packet[5], packet[6]);
-        if (dataSelect == 3) value = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+        if (dataSelect == 3) value = GuestGpuTimestamp();
         LabelWrite label{destination, {}};
         label.inlineSize = dataSelect == 1 ? 4 : 8;
         std::memcpy(label.inlineBytes.data(), &value, label.inlineSize);
@@ -790,7 +822,12 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
         case 0x10:
             switch ((packet[0] >> 2u) & 0x3fu) {
                 case 0: return;
-                case 0x09: queue = std::move(*std::make_unique<QueueState>()); return;
+                case 0x09: {
+                    auto markers = std::move(queue.markers);
+                    queue = std::move(*std::make_unique<QueueState>());
+                    queue.markers = std::move(markers);
+                    return;
+                }
                 case 0x0b: queue.markers.emplace_back(reinterpret_cast<const char*>(packet.data() + 1)); return;
                 case 0x0c:
                     if (!queue.markers.empty()) queue.markers.pop_back();
@@ -857,7 +894,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             if (dataSelect == 0 || destination == 0) return;
             std::uint64_t value = address(packet[5], packet[6]);
             if (dataSelect == 3) {
-                value = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+                value = GuestGpuTimestamp();
             }
             GuestMemory::Write(destination, std::as_bytes(std::span(&value, 1)).first(dataSelect == 1 ? 4 : 8), dataSelect == 1 ? 4 : 8);
             return;

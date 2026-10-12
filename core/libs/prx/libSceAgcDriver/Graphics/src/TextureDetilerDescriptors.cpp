@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NullSubmit.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <array>
 
@@ -10,14 +11,17 @@ void TextureDetiler::BeginBatch() {
     // Sets of recorded work that has not completed stay allocated; the pools are recycled once the
     // recorder is idle again.
     if (const auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) return;
-    for (const auto pool : descriptorPools) {
-        Check(context.Function<PFN_vkResetDescriptorPool>("vkResetDescriptorPool")(context.device, pool, 0), "vkResetDescriptorPool texture detiler");
-    }
-    allocatedSets = 0;
     for (const auto pool : cmaskDescriptorPools) {
         Check(context.Function<PFN_vkResetDescriptorPool>("vkResetDescriptorPool")(context.device, pool, 0), "vkResetDescriptorPool CMASK clear");
     }
     allocatedCmaskSets = 0;
+    // APS5_NULL_SUBMIT: every dispatch writes the one set of its layout that allocateSet keeps (nothing executes the
+    // work), so there is nothing to recycle.
+    if (NullSubmit()) return;
+    for (const auto pool : descriptorPools) {
+        Check(context.Function<PFN_vkResetDescriptorPool>("vkResetDescriptorPool")(context.device, pool, 0), "vkResetDescriptorPool texture detiler");
+    }
+    allocatedSets = 0;
     for (const auto pool : imageDescriptorPools) {
         Check(context.Function<PFN_vkResetDescriptorPool>("vkResetDescriptorPool")(context.device, pool, 0), "vkResetDescriptorPool texture detiler");
     }
@@ -28,6 +32,11 @@ VkDescriptorSet TextureDetiler::allocateSet(bool image) {
     constexpr std::uint32_t setsPerPool = 64;
     auto& pools = image ? imageDescriptorPools : descriptorPools;
     auto& allocated = image ? allocatedImageSets : allocatedSets;
+    auto& first = image ? firstImageSet : firstSet;
+    // APS5_NULL_SUBMIT: one set per layout serves every dispatch (rewritten each time; the recorded work never runs).
+    // lavapipe backs each descriptor set with a mapping of its own, so a set per dispatch filled the process with
+    // mappings (134k in 40 s of the GTA replay) and made every mapping walk crawl, which a real device does not do.
+    if (NullSubmit() && allocated != 0) return first;
     const auto poolIndex = allocated / setsPerPool;
     if (poolIndex == pools.size()) {
         std::array<VkDescriptorPoolSize, 2> sizes{};
@@ -48,6 +57,7 @@ VkDescriptorSet TextureDetiler::allocateSet(bool image) {
     allocation.pSetLayouts = image ? &imageDescriptorLayout : &descriptorLayout;
     VkDescriptorSet set = VK_NULL_HANDLE;
     Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocation, &set), "vkAllocateDescriptorSets texture detiler");
+    if (allocated == 0) first = set;
     ++allocated;
     return set;
 }

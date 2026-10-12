@@ -23,11 +23,6 @@ struct FileHeader {
 };
 static_assert(sizeof(FileHeader) == 24);
 
-bool profiling() {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    return profile;
-}
-
 }
 
 PipelineCache::PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties) : context(context), properties(properties) {
@@ -69,7 +64,7 @@ PipelineCache::~PipelineCache() {
         }
         wake.notify_all();
         saver.join();
-        save(true);
+        if (const auto bytes = currentBytes(); bytes != 0 && bytes != savedBytes) save(true);
     }
     context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, cache, nullptr);
 }
@@ -103,30 +98,46 @@ void PipelineCache::load(std::vector<std::byte>& initialData) {
     std::fprintf(stderr, "[pipeline-cache] loaded %.1f KiB from %s\n", static_cast<double>(initialData.size()) / 1024.0, path.string().c_str());
 }
 
-void PipelineCache::save(bool final) {
+std::size_t PipelineCache::currentBytes() const {
+    std::size_t size = 0;
+    if (context.Function<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData")(context.device, cache, &size, nullptr) != VK_SUCCESS) return 0;
+    return size;
+}
+
+bool PipelineCache::save(bool final) {
+    const auto started = std::chrono::steady_clock::now();
     const auto getData = context.Function<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
     std::size_t size = 0;
-    if (getData(context.device, cache, &size, nullptr) != VK_SUCCESS || size == 0 || size == savedBytes) return;
+    if (getData(context.device, cache, &size, nullptr) != VK_SUCCESS || size == 0 || size == savedBytes) return false;
     std::vector<std::byte> file(sizeof(FileHeader) + size);
     const auto result = getData(context.device, cache, &size, file.data() + sizeof(FileHeader));
-    if (result != VK_SUCCESS && result != VK_INCOMPLETE) return;
+    if (result != VK_SUCCESS && result != VK_INCOMPLETE) return false;
     file.resize(sizeof(FileHeader) + size);
     const FileHeader header{FileMagic, FileFormat, size, ShaderRecompiler::HashBytes(std::span(file).subspan(sizeof(FileHeader)))};
     std::memcpy(file.data(), &header, sizeof(header));
-    const auto started = std::chrono::steady_clock::now();
+    const auto gathered = std::chrono::steady_clock::now();
     if (!ShaderRecompiler::WriteFileAtomically(path, file)) {
         std::fprintf(stderr, "[pipeline-cache] cannot write %s\n", path.string().c_str());
-        return;
+        return false;
     }
     savedBytes = size;
-    if (final || profiling()) std::fprintf(stderr, "[pipeline-cache] saved %.1f KiB to %s in %.1f ms%s\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), final ? " (teardown)" : "");
+    const auto finished = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[pipeline-cache] saved %.1f KiB to %s in %.1f ms (%.1f ms reading the cache, %.1f ms writing)%s\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(finished - started).count(), std::chrono::duration<double, std::milli>(gathered - started).count(), std::chrono::duration<double, std::milli>(finished - gathered).count(), final ? " (teardown)" : "");
+    return true;
 }
 
 void PipelineCache::run() {
+    PipelineCacheSaveSchedule::Settings settings;
+    settings.minSpacing = std::chrono::seconds(SaveIntervalSeconds);
+    PipelineCacheSaveSchedule schedule(settings, savedBytes, PipelineCacheSaveSchedule::Clock::now());
     std::unique_lock lock(mutex);
-    while (!wake.wait_for(lock, std::chrono::seconds(SaveIntervalSeconds), [&] { return stopping; })) {
+    while (!wake.wait_for(lock, std::chrono::seconds(1), [&] { return stopping; })) {
         lock.unlock();
-        save(false);
+        schedule.Tick(PipelineCacheSaveSchedule::Clock::now(), Creations(), LastCreation(), [&] { return currentBytes(); }, [&](std::size_t& bytes) {
+            if (!save(false)) return false;
+            bytes = savedBytes;
+            return true;
+        });
         lock.lock();
     }
 }

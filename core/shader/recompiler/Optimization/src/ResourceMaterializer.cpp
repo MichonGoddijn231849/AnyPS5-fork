@@ -1,4 +1,5 @@
 #include "Optimization/ResourceMaterializer.hpp"
+#include "Optimization/WideFeedback.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
@@ -293,7 +294,73 @@ void reportBindless() {
 struct TableResolution {
     std::vector<DescriptorValue> slots;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> mapping;
+    // A wide table's entries by key (null where an entry is empty or in none of the root's native modes) and each
+    // entry's class (see ResourceMaterializer::WideModes).
+    std::vector<DescriptorValue> wide;
+    std::vector<std::uint8_t> wideClasses;
+    // The table's heap base, which names its feedback region.
+    std::uint64_t wideTable = 0;
 };
+
+// A resolved wide table (see resolveTableImage), shared by every capture of the same shader image over the same
+// table words.
+struct WideResolution {
+    std::vector<DescriptorValue> wide;
+    std::vector<std::uint8_t> wideClasses;
+    DescriptorValue resolved;
+    std::uint32_t nullEntries = 0;
+};
+
+struct WideMemoKey {
+    std::uint64_t shader = 0;
+    std::uint32_t image = 0;
+    std::uint32_t entries = 0;
+    std::uint64_t words = 0;
+    bool operator==(const WideMemoKey& other) const = default;
+};
+
+struct WideMemoHash {
+    std::size_t operator()(const WideMemoKey& key) const noexcept {
+        return static_cast<std::size_t>(key.shader * 0x9e3779b97f4a7c15ull ^ key.words ^ (static_cast<std::uint64_t>(key.image) << 32u) ^ key.entries);
+    }
+};
+
+struct WideMemo {
+    std::mutex mutex;
+    std::unordered_map<WideMemoKey, std::shared_ptr<const WideResolution>, WideMemoHash> entries;
+};
+
+WideMemo& wideMemo() {
+    static WideMemo memo;
+    return memo;
+}
+
+// The numeric class of a wide table entry, by shader image and descriptor words, shared by every table and capture:
+// classifying an entry the runtime modes cannot take throws, and Wolverine's menu tables hold thousands of them.
+struct WideClassKey {
+    std::uint64_t shader = 0;
+    std::uint32_t image = 0;
+    std::array<std::uint32_t, 8> words{};
+    bool operator==(const WideClassKey& other) const = default;
+};
+
+struct WideClassHash {
+    std::size_t operator()(const WideClassKey& key) const noexcept {
+        std::uint64_t hash = key.shader * 0x9e3779b97f4a7c15ull ^ key.image;
+        for (const auto word : key.words) hash = (hash ^ word) * 1099511628211ull;
+        return static_cast<std::size_t>(hash);
+    }
+};
+
+struct WideClassMemo {
+    std::mutex mutex;
+    std::unordered_map<WideClassKey, std::uint8_t, WideClassHash> entries;
+};
+
+WideClassMemo& wideClassMemo() {
+    static WideClassMemo memo;
+    return memo;
+}
 
 struct TableTrace {
     bool material = false;
@@ -316,12 +383,12 @@ void traceTable(const IrResourcePlan& plan, const ImageResource& image, const De
 
 // The slots of the table image `imageIndex` (see TableResolution). Mode M enumerates the keys the
 // dispatch can reach from the material records; mode T binds the whole table when it fits.
-void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, const DescriptorSource::IndirectImage& table, const SrtRuntime& runtime, SrtWalker& walker, DescriptorValue& resolved, TableResolution& resolution) {
+void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, const DescriptorSource::IndirectImage& table, const SrtRuntime& runtime, SrtWalker& walker, std::span<const std::uint32_t> flattenedSrt, DescriptorValue& resolved, TableResolution& resolution) {
     const auto& image = plan.info.images.at(imageIndex);
     if (runtime.readMemory == nullptr) {
         throw std::runtime_error("bindless image table resolution requires runtime memory access");
     }
-    if (image.resourceClass != ImageResourceClass::Sampled) {
+    if (image.resourceClass != ImageResourceClass::Sampled && !(image.resourceClass == ImageResourceClass::Storage && ResourceMaterializer::BindlessStorageTables())) {
         rejectTable(BindlessRejection::Storage, "bindless storage image tables are unsupported");
     }
     if (image.packed || image.byElements != 0u) {
@@ -342,12 +409,140 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     };
 
     auto& counters = bindlessCounters();
+    resolution.wideTable = heap.Base48() + table.entryOffset;
+    // The plan predates the static interface (ApplyStaticInterface), so the switch, not ImageResource::wideTable,
+    // says the table is wide; both follow APS5_WIDE_BINDLESS.
+    if (ResourceMaterializer::WideTableImage(image)) {
+        // Every entry is bound at its key, in the array of its numeric class (a view of its format, its swizzle in
+        // the view). An entry none of the root's native modes samples is bound null and reads zeros.
+        // TODO(debt): entries needing a format conversion, depth bits or sRGB decoding in the shader read zeros.
+        if (entries > RuntimeAbi::WideImageCapacity) rejectTable(BindlessRejection::Capacity, "wide bindless image table has " + std::to_string(entries) + " entries, limit " + std::to_string(RuntimeAbi::WideImageCapacity));
+        DescriptorValue nullDescriptor;
+        nullDescriptor.dwordCount = 8u;
+        resolution.wide.assign(entries, nullDescriptor);
+        resolution.wideClasses.assign(entries, 0u);
+        resolved = nullDescriptor;
+        const auto wideModes = ResourceMaterializer::WideModes(image);
+        bool haveRoot = false;
+        std::uint32_t nullEntries = 0u;
+        const auto heapBase = heap.Base48();
+        const auto& modes = plan.info.runtimeImageModes.at(imageIndex);
+        // The whole table at once where the runtime reads in bulk (the per-dword reads cost ~1 us each).
+        std::vector<std::uint32_t> tableWords;
+        if (runtime.readMemoryBlock != nullptr && entries != 0u) {
+            tableWords.resize(static_cast<std::size_t>(entries) * 8u);
+            if (!runtime.readMemoryBlock(runtime.userContext, heapBase + table.entryOffset, tableWords.data(), tableWords.size())) throw std::runtime_error("failed to read a bindless image table from memory");
+        }
+        // The same table words resolve the same way for the same shader image: memoized by a hash of the words, as
+        // classifying thousands of entries costs tens of milliseconds per capture.
+        WideMemoKey memoKey{plan.shaderHash, imageIndex, entries, 14695981039346656037ull};
+        if (!tableWords.empty()) {
+            for (const auto word : tableWords) memoKey.words = (memoKey.words ^ word) * 1099511628211ull;
+            auto& memo = wideMemo();
+            std::lock_guard lock(memo.mutex);
+            if (const auto found = memo.entries.find(memoKey); found != memo.entries.end()) {
+                const auto& hit = *found->second;
+                resolution.wide = hit.wide;
+                resolution.wideClasses = hit.wideClasses;
+                resolved = hit.resolved;
+                counters.tablesWhole.fetch_add(1, std::memory_order_relaxed);
+                counters.keys.fetch_add(entries - hit.nullEntries, std::memory_order_relaxed);
+                counters.paddedNull.fetch_add(hit.nullEntries, std::memory_order_relaxed);
+                return;
+            }
+        }
+        // Within a table each distinct descriptor is classified once.
+        std::map<std::array<std::uint32_t, 8>, std::uint32_t> classOf;
+        for (std::uint32_t key = 0u; key < entries; ++key) {
+            DescriptorValue candidate;
+            candidate.dwordCount = 8u;
+            const std::uint64_t address = heapBase + table.entryOffset + static_cast<std::uint64_t>(key) * TableEntryBytes;
+            if (!tableWords.empty()) std::copy_n(tableWords.begin() + static_cast<std::ptrdiff_t>(key) * 8, 8, candidate.dwords.begin());
+            else for (std::uint32_t dword = 0u; dword < 8u; ++dword) readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword]);
+            if (nullImageDescriptor(candidate) || !validImageDescriptor(candidate, image.r128)) {
+                ++nullEntries;
+                continue;
+            }
+            std::array<std::uint32_t, 8> words{};
+            std::copy_n(candidate.dwords.begin(), 8, words.begin());
+            const auto known = classOf.find(words);
+            std::uint32_t entryClass = RuntimeAbi::WideImageClasses;
+            if (known != classOf.end()) {
+                entryClass = known->second;
+            } else {
+                const WideClassKey classKey{plan.shaderHash, imageIndex, words};
+                auto& shared = wideClassMemo();
+                bool found = false;
+                {
+                    std::lock_guard lock(shared.mutex);
+                    if (const auto hit = shared.entries.find(classKey); hit != shared.entries.end()) {
+                        entryClass = hit->second;
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    try {
+                        if (!decodeImageDescriptor(candidate, image, plan.srgbDecodeFormats).fmask) {
+                            // No mode of the root takes most entries of a large table: answered without throwing.
+                            const auto mode = ResourceMaterializer::MatchRuntimeImageMode(image, candidate, modes, true);
+                            for (std::uint32_t index = 0u; index < wideModes.size(); ++index) {
+                                if (mode != UINT32_MAX && wideModes[index] == mode) entryClass = index;
+                            }
+                        }
+                    } catch (const std::runtime_error&) {
+                        entryClass = RuntimeAbi::WideImageClasses;
+                    }
+                    std::lock_guard lock(shared.mutex);
+                    // Bounded: about 64 MiB of keys.
+                    if (shared.entries.size() >= (1u << 20u)) shared.entries.clear();
+                    shared.entries.emplace(classKey, static_cast<std::uint8_t>(entryClass));
+                }
+                classOf.emplace(words, entryClass);
+            }
+            if (entryClass == RuntimeAbi::WideImageClasses) {
+                ++nullEntries;
+                continue;
+            }
+            resolution.wide[key] = candidate;
+            resolution.wideClasses[key] = static_cast<std::uint8_t>(entryClass);
+            if (!haveRoot) {
+                resolved = candidate;
+                haveRoot = true;
+            }
+        }
+        counters.tablesWhole.fetch_add(1, std::memory_order_relaxed);
+        counters.keys.fetch_add(entries - nullEntries, std::memory_order_relaxed);
+        counters.paddedNull.fetch_add(nullEntries, std::memory_order_relaxed);
+        if (BindlessTraced()) traceTable(plan, image, table, heapBase, 0u, {false, entries, 0u, entries - nullEntries});
+        if (!tableWords.empty()) {
+            auto stored = std::make_shared<WideResolution>();
+            stored->wide = resolution.wide;
+            stored->wideClasses = resolution.wideClasses;
+            stored->resolved = resolved;
+            stored->nullEntries = nullEntries;
+            auto& memo = wideMemo();
+            std::lock_guard lock(memo.mutex);
+            // Bounded: a table rewritten every frame would otherwise keep every version. One entry goes at a time:
+            // clearing them all made a scene with more shader tables than the bound re-resolve every table.
+            if (memo.entries.size() >= 256u) memo.entries.erase(memo.entries.begin());
+            memo.entries.emplace(memoKey, std::move(stored));
+        }
+        return;
+    }
     std::vector<std::uint32_t> keys;
     bool materialMode = false;
     std::uint32_t materialEntries = 0;
     std::uint64_t materialBase = 0;
     std::uint32_t outOfRange = 0;
-    if (table.hasMaterial) {
+    if (table.hasMaterial && table.selectorStride == 0u) {
+        // A key from a word of the flattened SRT (stride 0): one key for the whole dispatch.
+        if (table.selectorOffset >= flattenedSrt.size()) throw std::runtime_error("bindless table key is outside the flattened SRT");
+        materialMode = true;
+        materialEntries = 1u;
+        const auto key = flattenedSrt[table.selectorOffset];
+        if (key < entries) keys.push_back(key);
+        else outOfRange++;
+    } else if (table.hasMaterial) {
         if (table.selectorStride < sizeof(std::uint32_t) || table.selectorOffset > table.selectorStride - sizeof(std::uint32_t)) throw std::runtime_error("bindless material selector is outside its record");
         DescriptorValue materialValue;
         walker.EvaluateDescriptorSource(plan, table.materialSource, runtime, materialValue);
@@ -461,7 +656,7 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         if (image.source >= plan.descriptorSources.size()) {
             throw std::runtime_error("image resource references an unknown descriptor source");
         }
-        if (plan.descriptorSources[image.source].indirectImage.has_value()) tableCount++;
+        if (plan.descriptorSources[image.source].indirectImage.has_value() && !ResourceMaterializer::WideTableImage(image)) tableCount++;
     }
     const auto tableSlots = ResourceMaterializer::BindlessSlots();
     if (tableCount != 0u && plan.info.images.size() + static_cast<std::size_t>(tableSlots - 1u) * tableCount > ShaderInfo::MaxImages) {
@@ -473,10 +668,10 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         if (source.indirectImage.has_value()) {
             if (image.source < activeSources.size() && activeSources[image.source] == 0u) {
                 snapshot.images[i].dwordCount = 8u;
-                tables[i].slots.assign(tableSlots, snapshot.images[i]);
+                if (!ResourceMaterializer::WideTableImage(image)) tables[i].slots.assign(tableSlots, snapshot.images[i]);
                 continue;
             }
-            resolveTableImage(plan, i, *source.indirectImage, runtime, walker, snapshot.images[i], tables[i]);
+            resolveTableImage(plan, i, *source.indirectImage, runtime, walker, snapshot.flattenedSrt, snapshot.images[i], tables[i]);
             continue;
         }
         if (cursor >= values.size()) {
@@ -567,6 +762,8 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
     return *samplerState | (reference << EmulatedCompare::ReferenceShift) | (singleLevel ? EmulatedCompare::SingleLevel : 0u);
 }
 
+void materializeSrtGuards(const IrResourcePlan& plan, ResourceSnapshot& snapshot);
+
 void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, const std::vector<TableResolution>& tables) {
     for (std::uint32_t i = 0u; i < plan.info.buffers.size(); ++i) {
         const auto decoded = decodeBufferDescriptor(snapshot.buffers.at(i));
@@ -574,12 +771,42 @@ void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, c
         if (plan.stage != IrShaderStage::Compute && decoded.AddTid()) throw std::runtime_error("buffer ADD_TID is only valid for compute shaders");
     }
     if (snapshot.flattenedSrt.size() != plan.srtReads.size()) throw std::runtime_error("runtime SRT size differs from the static interface");
+    std::vector<std::size_t> wideHeaders;
+    std::vector<std::vector<std::uint32_t>> wideMaps;
     for (std::uint32_t i = 0u; i < plan.info.images.size(); ++i) {
         const auto& image = plan.info.images[i];
         static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, snapshot.images.at(i), plan.info.runtimeImageModes.at(i)));
         const auto& table = tables.at(i);
         if (!plan.descriptorSources.at(image.source).indirectImage.has_value()) {
             if (!table.slots.empty()) throw std::runtime_error("direct image has runtime table slots");
+            continue;
+        }
+        if (ResourceMaterializer::WideTableImage(image)) {
+            // The header goes where ApplyStaticInterface placed it (tables in image order, three words each): where
+            // the table's key map starts (it follows the static part of the flattened SRT), the entry count and
+            // the table's feedback region. A key's map word is its entry's class << 30 | (element + 1), 0 for an
+            // entry not bound: empty, or (with the feedback on) not sampled by the GPU yet, which reads zeros once
+            // and is bound from the next build on. Only bound entries take WideImages elements.
+            if (!table.slots.empty()) throw std::runtime_error("wide bindless table has runtime table slots");
+            const auto entries = static_cast<std::uint32_t>(table.wide.size());
+            const auto region = WideFeedback::Enabled() && entries != 0u ? WideFeedback::Region(table.wideTable, entries) : 0u;
+            const auto wideKind = entries != 0u ? ResourceMaterializer::WideKind(image, 0u) : 0u;
+            wideHeaders.push_back(snapshot.flattenedSrt.size());
+            snapshot.flattenedSrt.push_back(0u);
+            snapshot.flattenedSrt.push_back(entries);
+            snapshot.flattenedSrt.push_back(region);
+            std::vector<std::uint32_t> map(entries, 0u);
+            for (std::uint32_t key = 0u; key < entries; ++key) {
+                if (nullImageDescriptor(table.wide[key]) || (region != 0u && !WideFeedback::Touched(region, key))) continue;
+                // A table past the binding's capacity leaves its further entries unbound (they read zeros).
+                if (snapshot.wideImages.size() >= RuntimeAbi::WideImageCapacity) break;
+                const auto element = static_cast<std::uint32_t>(snapshot.wideImages.size());
+                const auto entryClass = static_cast<std::uint32_t>(table.wideClasses[key]);
+                snapshot.wideImages.push_back(table.wide[key]);
+                snapshot.wideKinds.push_back(static_cast<std::uint8_t>(wideKind + entryClass));
+                map[key] = (entryClass << 30u) | (element + 1u);
+            }
+            wideMaps.push_back(std::move(map));
             continue;
         }
         const auto slots = ResourceMaterializer::BindlessSlots();
@@ -593,6 +820,11 @@ void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, c
         }
         snapshot.flattenedSrt.resize(mappingOffset + 1u + 2u * slots, 0u);
         snapshot.images.insert(snapshot.images.end(), table.slots.begin() + 1u, table.slots.end());
+    }
+    materializeSrtGuards(plan, snapshot);
+    for (std::size_t index = 0u; index < wideHeaders.size(); ++index) {
+        snapshot.flattenedSrt[wideHeaders[index]] = static_cast<std::uint32_t>(snapshot.flattenedSrt.size());
+        snapshot.flattenedSrt.insert(snapshot.flattenedSrt.end(), wideMaps[index].begin(), wideMaps[index].end());
     }
 }
 
@@ -745,6 +977,10 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
 }
 
 std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes) {
+    return MatchRuntimeImageMode(image, descriptor, modes, false);
+}
+
+std::uint32_t ResourceMaterializer::MatchRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes, bool noMatchIsValue) {
     if (descriptor.dwordCount != 8u) throw std::runtime_error("runtime image descriptor must contain eight dwords");
     if (modes.empty()) throw std::runtime_error("prepared runtime image modes are missing");
     if (nullImageDescriptor(descriptor)) return 0u;
@@ -778,6 +1014,7 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
         }
         if (mode.numericClass == decoded.numericClass && mode.dimension == decoded.dimension && mode.conversionFormat == decoded.conversionFormat && mode.packedFormat == decoded.packedFormat && mode.cube == decoded.cube && mode.depthBits == decoded.depthBits && mode.depthUnorm16 == decoded.depthUnorm16 && mode.srgbDecode == decoded.srgbDecode) return index;
     }
+    if (noMatchIsValue) return UINT32_MAX;
     if (image.dimension == RdnaImageDimension::Dim1D && decoded.dimension != RdnaImageDimension::Dim1D) throw std::runtime_error("image address has too few coordinate components");
     throw std::runtime_error("image descriptor is incompatible with the static runtime image interface");
 }
@@ -813,7 +1050,14 @@ void ResourceMaterializer::ApplyStaticInterface(IrProgram& program, bool nativeS
         if (image.indirectRoot != ImageResource::NoIndirectImage) throw std::runtime_error("static image interface was already expanded");
         image.numericClass = image.atomic ? IrTextureNumericClass::Uint : IrTextureNumericClass::Float;
         image.mipCount = image.mipMode == ImageMipMode::DynamicStorage ? RuntimeAbi::StorageMipSlots : 1u;
-        if (resources.descriptorSources.at(image.source).indirectImage.has_value()) {
+        if (resources.descriptorSources.at(image.source).indirectImage.has_value() && WideTableImage(image)) {
+            // A wide table root: no slots; the flattened SRT holds its base element in WideImages and its entry count.
+            image.indirectRoot = index;
+            image.indirectResources.push_back(index);
+            image.wideTable = true;
+            image.indirectMappingOffset = mappingOffset;
+            mappingOffset += 3u;
+        } else if (resources.descriptorSources.at(image.source).indirectImage.has_value()) {
             if (images.size() + slots - 1u > ShaderInfo::MaxImages) throw std::runtime_error("static bindless image capacity exceeded");
             image.indirectRoot = index;
             image.indirectResources.push_back(index);
@@ -874,7 +1118,7 @@ void ownPlanValues(IrResourcePlan& plan) {
         }
     }
     for (const auto* value : order) {
-        auto clone = std::make_unique<IrValue>(value->Opcode(), value->Type(), value->Id());
+        auto clone = std::make_unique<IrValue>(value->Opcode(), value->Type(), static_cast<std::uint32_t>(plan.valueStorage.size()));
         clone->SetFlags(value->Flags<std::uint64_t>());
         if (value->HasImmediate()) clone->SetImmediateU64(value->ImmediateU64());
         clone->SetRegister(value->Register());
@@ -905,6 +1149,58 @@ void ownPlanValues(IrResourcePlan& plan) {
     for (auto* root : roots) {
         if (*root != nullptr) *root = clones.at(*root);
     }
+    plan.denseValueIds = true;
+}
+
+void buildCompactPlan(IrResourcePlan& plan) {
+    if (!plan.denseValueIds || plan.valueStorage.size() >= CompactResourcePlan::NoValue) return;
+    CompactResourcePlan compact;
+    const auto idOf = [&](const IrValue* value, std::uint32_t& id) {
+        if (value == nullptr) return false;
+        const auto* resolved = value->Resolve();
+        id = resolved->Id();
+        return id < plan.valueStorage.size() && plan.valueStorage[id].get() == resolved;
+    };
+    try {
+        compact.values.reserve(plan.valueStorage.size());
+        for (const auto& value : plan.valueStorage) {
+            if (value->ArgumentCount() > 0xffu) return;
+            CompactPlanValue entry;
+            entry.immediate = value->ImmediateU64();
+            entry.flags = value->Flags<std::uint64_t>();
+            entry.firstArgument = static_cast<std::uint32_t>(compact.arguments.size());
+            entry.registerIndex = value->Register().index;
+            entry.type = value->Type();
+            entry.opcode = value->Opcode();
+            entry.argumentCount = static_cast<std::uint8_t>(value->ArgumentCount());
+            entry.hasImmediate = value->HasImmediate();
+            for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
+                std::uint32_t id = 0;
+                if (!idOf(value->Argument(index), id)) return;
+                compact.arguments.push_back(id);
+            }
+            compact.values.push_back(entry);
+        }
+        compact.sourceDwords.assign(plan.descriptorSources.size() * 8u, CompactResourcePlan::NoValue);
+        for (std::size_t source = 0; source < plan.descriptorSources.size(); source++) {
+            const auto& descriptor = plan.descriptorSources[source];
+            if (descriptor.dwordCount > 8u) return;
+            for (std::uint32_t dword = 0; dword < descriptor.dwordCount; dword++) {
+                if (!idOf(descriptor.dwords[dword], compact.sourceDwords[source * 8u + dword])) return;
+            }
+        }
+        compact.srtReads.resize(plan.srtReads.size());
+        for (std::size_t slot = 0; slot < plan.srtReads.size(); slot++) {
+            if (!idOf(plan.srtReads[slot].value, compact.srtReads[slot])) return;
+        }
+        compact.conditions.assign(plan.controlFlow.size(), CompactResourcePlan::NoValue);
+        for (std::size_t block = 0; block < plan.controlFlow.size(); block++) {
+            if (plan.controlFlow[block].condition != nullptr && !idOf(plan.controlFlow[block].condition, compact.conditions[block])) return;
+        }
+    } catch (const std::exception&) {
+        return;
+    }
+    plan.compact = std::move(compact);
 }
 
 }
@@ -952,6 +1248,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     for (const auto& sampler : plan.info.samplers) addSource(sampler.source);
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
     plan.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(plan);
+    buildCompactPlan(plan);
     return plan;
 }
 
@@ -974,7 +1271,6 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
     }
     const auto started = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     materializeTables(plan, nextSnapshot, tables);
-    materializeSrtGuards(plan, nextSnapshot);
     if (MaterializeProfiled()) specializationNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     snapshot = std::move(nextSnapshot);
     reportBindless();
@@ -984,8 +1280,52 @@ std::uint64_t ResourceMaterializer::SpecializationNanoseconds() {
     return specializationNanoseconds.load(std::memory_order_relaxed);
 }
 
+// Fewer than the sampled heap holds, so a table and the shader's other images of its group fit together.
 std::uint32_t ResourceMaterializer::BindlessSlots() {
-    return RuntimeAbi::BindlessTableSlots;
+    static const std::uint32_t slots = [] {
+        const char* text = std::getenv("APS5_BINDLESS_SLOTS");
+        const auto value = text != nullptr ? std::strtoul(text, nullptr, 0) : static_cast<unsigned long>(RuntimeAbi::BindlessTableSlots);
+        return static_cast<std::uint32_t>(std::clamp<unsigned long>(value, 2ul, ShaderInfo::MaxImages / 2u));
+    }();
+    return slots;
+}
+
+std::array<std::uint32_t, RuntimeAbi::WideImageClasses> ResourceMaterializer::WideModes(const ImageResource& image) {
+    std::array<std::uint32_t, RuntimeAbi::WideImageClasses> result{UINT32_MAX, UINT32_MAX, UINT32_MAX};
+    const auto modes = RuntimeImageModes(image);
+    for (std::uint32_t index = 0u; index < modes.size(); ++index) {
+        const auto& mode = modes[index];
+        if (mode.conversionFormat != IrBufferFormat::Invalid || mode.packedFormat != IrBufferFormat::Invalid || mode.depthBits || mode.srgbDecode || mode.constantSwizzle || mode.dimension != image.dimension || (mode.emulatedCompare & EmulatedCompare::Enabled) != 0u) continue;
+        const auto entryClass = mode.numericClass == IrTextureNumericClass::Float ? 0u : mode.numericClass == IrTextureNumericClass::Uint ? 1u : mode.numericClass == IrTextureNumericClass::Sint ? 2u : RuntimeAbi::WideImageClasses;
+        if (entryClass < result.size() && result[entryClass] == UINT32_MAX) result[entryClass] = index;
+    }
+    return result;
+}
+
+std::uint32_t ResourceMaterializer::WideKind(const ImageResource& image, std::uint32_t wideClass) {
+    const auto dimension = static_cast<std::uint32_t>(image.dimension);
+    if (dimension == 0u || dimension > RuntimeAbi::WideImageDimensions || wideClass >= RuntimeAbi::WideImageClasses) throw std::runtime_error("wide bindless table has no image dimension");
+    return (dimension - 1u) * RuntimeAbi::WideImageClasses + wideClass;
+}
+
+bool ResourceMaterializer::BindlessStorageTables() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_BINDLESS_STORAGE_TABLES");
+        return text != nullptr && text[0] != '\0' && text[0] != '0';
+    }();
+    return enabled;
+}
+
+bool ResourceMaterializer::WideTableImage(const ImageResource& image) {
+    return WideBindless() && !(image.resourceClass == ImageResourceClass::Storage && BindlessStorageTables());
+}
+
+bool ResourceMaterializer::WideBindless() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_WIDE_BINDLESS");
+        return text != nullptr && text[0] != '\0' && text[0] != '0';
+    }();
+    return enabled;
 }
 
 void ResourceMaterializer::CountBindlessRejection(BindlessRejection reason) {

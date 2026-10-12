@@ -216,15 +216,18 @@ void TranslationContext::sInstPrefetch() {
     (void)ir.Emit(IrOpcode::InstPrefetch, IrType::Void, {});
 }
 
+// An inlined callee's copy (InlineSubroutineCalls) adds its guestPcDelta: the address is the callee's, not the copy's
+// place after the caller.
 void TranslationContext::sGetpcB64(const RdnaInstruction& inst) {
     IrValue& base = ir.Emit(IrOpcode::GetShaderBase, IrType::U64, {});
-    const IrU64 pc(ir.Emit(IrOpcode::IAdd64, IrType::U64, {&base, &ir.ConstantU64(static_cast<std::uint64_t>(currentProgramCounter) + 4u)}));
+    const IrU64 pc(ir.Emit(IrOpcode::IAdd64, IrType::U64, {&base, &ir.ConstantU64(static_cast<std::uint64_t>(currentProgramCounter) + 4u + inst.guestPcDelta)}));
     writeU32Pair(inst.destination, extractU64(pc));
 }
 
 void TranslationContext::sSwappcB64(const RdnaInstruction& inst) {
+    if (inst.linkInDispatcher) return;
     IrValue& base = ir.Emit(IrOpcode::GetShaderBase, IrType::U64, {});
-    const IrU64 link(ir.Emit(IrOpcode::IAdd64, IrType::U64, {&base, &ir.ConstantU64(static_cast<std::uint64_t>(currentProgramCounter) + 4u)}));
+    const IrU64 link(ir.Emit(IrOpcode::IAdd64, IrType::U64, {&base, &ir.ConstantU64(static_cast<std::uint64_t>(currentProgramCounter) + 4u + inst.guestPcDelta)}));
     writeU32Pair(inst.destination, extractU64(link));
 }
 

@@ -1,17 +1,274 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Capture/PassCapture.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "ControlFlow/RequestSerializer.hpp"
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <filesystem>
+#include <map>
+#include <optional>
+#include <mutex>
+#include <set>
+#include <span>
+#include <string>
+#include <vector>
 #include <stdexcept>
 
+namespace {
+
+// APS5_DUMP_AFTER=<program hex>:<address hex>:<bytes hex> (see the dispatch below).
+const std::array<std::uint64_t, 3>& DumpAfter() {
+    static const std::array<std::uint64_t, 3> parsed = [] {
+        std::array<std::uint64_t, 3> values{};
+        if (const char* text = std::getenv("APS5_DUMP_AFTER")) std::sscanf(text, "%llx:%llx:%llx", reinterpret_cast<unsigned long long*>(&values[0]), reinterpret_cast<unsigned long long*>(&values[1]), reinterpret_cast<unsigned long long*>(&values[2]));
+        return values;
+    }();
+    return parsed;
+}
+
+// The program's dispatch instance (APS5_CAPTURE_PASSES, see PassCapture.hpp), counted at its [dispatch-io] header.
+std::uint64_t NextDispatchInstance(std::uint64_t program) {
+    static std::mutex mutex;
+    static std::map<std::uint64_t, std::uint64_t> counts;
+    std::lock_guard lock(mutex);
+    return counts[program]++;
+}
+
+}
+
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// Debug aid (APS5_CHECK_BVH=1): before each dispatch of the BVH refit program (GTA V's RT, found by its first
+// code words), and before every later dispatch that gets a blob the refit used in user data 4-5, that
+// PSR_BVHL blob is checked the way the refit walks it: every leaf child must start a list inside the list
+// array that ends at an entry with its end bit (second dword negative) or type 7. When a blob has more bad
+// leaves than at its last check, the bad nodes and the dispatches since that check are printed, to find
+// what first corrupts it.
+struct BvhCheck {
+    std::mutex mutex;
+    std::map<std::uint64_t, std::size_t> badLeaves;
+    std::map<std::uint64_t, std::uint64_t> checkedAt;
+    std::map<std::uint64_t, std::vector<std::byte>> lastBytes;
+    std::deque<std::pair<std::uint64_t, std::string>> recent;
+    std::uint64_t sequence = 0;
+    std::uint64_t checks = 0;
+    std::uint64_t badChecks = 0;
+    double reportedAt = -1e9;
+};
+
+BvhCheck& Bvh() {
+    static BvhCheck check;
+    return check;
+}
+
+void NoteDispatchForBvh(std::uint32_t queue, std::uint64_t serial, std::uint64_t program, std::span<const std::uint32_t> userData) {
+    std::string text = std::to_string(TraceMs()) + " ms queue 0x" + [&] { char q[16]; std::snprintf(q, sizeof(q), "%x", queue); return std::string(q); }() + " submission " + std::to_string(serial) + " program 0x";
+    char item[24];
+    std::snprintf(item, sizeof(item), "%llx", static_cast<unsigned long long>(program));
+    text += item;
+    for (const auto word : userData) {
+        std::snprintf(item, sizeof(item), " %08x", word);
+        text += item;
+    }
+    auto& check = Bvh();
+    std::lock_guard lock(check.mutex);
+    check.recent.emplace_back(++check.sequence, std::move(text));
+    if (check.recent.size() > 4096) check.recent.pop_front();
+}
+
+std::atomic<std::uint64_t> checkAfterRefit{0};
+std::atomic<std::uint64_t> checkAfterBuild{0};
+
+bool KnownBvh(std::uint64_t pointer) {
+    auto& check = Bvh();
+    std::lock_guard lock(check.mutex);
+    return check.badLeaves.contains(pointer);
+}
+
+void CheckBvh(std::uint64_t pointer, bool linksOnly = false) {
+    const auto* blob = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(pointer));
+    const auto dword = [&](std::uint64_t offset) {
+        std::uint32_t value;
+        std::memcpy(&value, blob + offset, sizeof(value));
+        return value;
+    };
+    GuestMemory::FlushGpuWrites(pointer, 0x80);
+    if (std::memcmp(blob, "PSR_BVHL", 8) != 0) return;
+    const auto bytes = dword(0x10) | (static_cast<std::uint64_t>(dword(0x14)) << 32u);
+    GuestMemory::FlushGpuWrites(pointer, static_cast<std::size_t>(bytes));
+    const auto aOffset = dword(0x40) | (static_cast<std::uint64_t>(dword(0x44)) << 32u);
+    const auto nodes = dword(0x50);
+    const auto entries = dword(0x58);
+    const auto threads = dword(0x60);
+    Graphics::DebugWatchRange(pointer, pointer + bytes);
+    if (aOffset + 4ull * ((threads + 3) / 4) > bytes || 64ull * nodes > bytes || 8ull * entries > bytes) return;
+    std::size_t bad = 0;
+    std::string first;
+    for (std::uint32_t t = 0; t < threads && !linksOnly; ++t) {
+        const auto node = dword(aOffset + 4ull * (t >> 2u));
+        if (node >= nodes) continue;
+        const auto child = dword(64ull * node + 4ull * (t & 3u));
+        if (child == 30u || child == 0xffffffffu || (child & 7u) != 0) continue;
+        bool ended = false;
+        for (auto index = child >> 3u; index < entries && index - (child >> 3u) < 64u; ++index) {
+            if ((dword(8ull * index) & 7u) == 7u || (dword(8ull * index + 4) >> 31u) != 0) {
+                ended = true;
+                break;
+            }
+        }
+        if (ended) continue;
+        if (bad++ < 4) {
+            char item[96];
+            std::snprintf(item, sizeof(item), " node %u child 0x%08x;", node, child);
+            first += item;
+        }
+    }
+    // The per-node words at header 0x30 (slot << 30 | parent << 3 | count): the parent's child word in
+    // that slot must name the node, as the refit's walk to the root relies on.
+    const auto links = dword(0x30) | (static_cast<std::uint64_t>(dword(0x34)) << 32u);
+    std::size_t badLinks = 0;
+    if (links < bytes) {
+        for (std::uint32_t t = 0; t < threads; t += 4) {
+            const auto node = dword(aOffset + 4ull * (t >> 2u));
+            if (node >= nodes || links + 4ull * node + 4 > bytes) continue;
+            const auto word = dword(links + 4ull * node);
+            const auto parent = (word >> 3u) & 0x7ffffffu;
+            const auto slot = word >> 30u;
+            if (word == 0 || parent == 0 || parent >= nodes) continue;
+            const auto child = dword(64ull * parent + 4ull * slot);
+            if ((child >> 3u) == node && (child & 7u) != 0) continue;
+            if (badLinks++ < 4) {
+                char item[112];
+                std::snprintf(item, sizeof(item), " link of node %u: 0x%08x, parent slot 0x%08x;", node, word, child);
+                first += item;
+            }
+        }
+    }
+    bad += badLinks;
+    auto& check = Bvh();
+    std::lock_guard lock(check.mutex);
+    // APS5_CHECK_BVH_TRIGGER=<file>: the first check creates that file (APS5_CAPTURE_TRIGGER's), so a frame
+    // capture starts with the first frames a refit runs in.
+    if (check.badLeaves.empty()) {
+        if (const char* trigger = std::getenv("APS5_CHECK_BVH_TRIGGER"); trigger != nullptr && *trigger != '\0') {
+            if (FILE* file = std::fopen(trigger, "wb")) std::fclose(file);
+            std::fprintf(stderr, "[bvh] first check: created %s\n", trigger);
+        }
+    }
+    ++check.checks;
+    if (bad != 0) ++check.badChecks;
+    if (const auto now = TraceMs(); now - check.reportedAt >= 10000.0) {
+        std::fprintf(stderr, "[bvh] %.0f ms: %llu checks of %zu blobs so far, %llu with bad leaves\n", now, static_cast<unsigned long long>(check.checks), check.badLeaves.size() + (check.badLeaves.contains(pointer) ? 0 : 1), static_cast<unsigned long long>(check.badChecks));
+        check.reportedAt = now;
+    }
+    const auto key = linksOnly ? pointer | 1u : pointer;
+    if (linksOnly) {
+        if (bad != 0) std::fprintf(stderr, "[bvh] %.1f ms blob 0x%llx right after its build kernel: %zu bad parent links:%s\n", TraceMs(), static_cast<unsigned long long>(pointer), bad, first.c_str());
+        return;
+    }
+    auto& known = check.badLeaves[key];
+    auto& checkedAt = check.checkedAt[key];
+    const auto since = checkedAt;
+    // The dispatch being checked was noted already: the next check covers it.
+    checkedAt = check.sequence - 1;
+    if (bad <= known) {
+        check.lastBytes[pointer].assign(blob, blob + bytes);
+        return;
+    }
+    std::fprintf(stderr, "[bvh] %.1f ms blob 0x%llx: %zu bad leaves (was %zu):%s dispatches since its last check (the last one is the next to run), oldest first:\n", TraceMs(), static_cast<unsigned long long>(pointer), bad, known, first.c_str());
+    const auto newer = static_cast<std::size_t>(std::count_if(check.recent.begin(), check.recent.end(), [&](const auto& entry) { return entry.first > since; }));
+    std::size_t skipped = newer > 600 ? newer - 600 : 0;
+    if (skipped != 0) std::fprintf(stderr, "[bvh]   (%zu older ones left out)\n", skipped);
+    for (const auto& [sequence, text] : check.recent) {
+        if (sequence <= since || (skipped != 0 && skipped-- != 0)) continue;
+        std::fprintf(stderr, "[bvh]   %s\n", text.c_str());
+    }
+    known = bad;
+    // The blob as at its last check and now, for the first few reports (bvh_<blob>_<n>_{before,after}.bin).
+    static int dumps = 0;
+    if (dumps < 4) {
+        char name[96];
+        std::snprintf(name, sizeof(name), "bvh_%llx_%d_before.bin", static_cast<unsigned long long>(pointer), dumps);
+        if (FILE* file = std::fopen(name, "wb")) {
+            const auto& before = check.lastBytes[pointer];
+            std::fwrite(before.data(), 1, before.size(), file);
+            std::fclose(file);
+        }
+        std::snprintf(name, sizeof(name), "bvh_%llx_%d_after.bin", static_cast<unsigned long long>(pointer), dumps);
+        if (FILE* file = std::fopen(name, "wb")) {
+            std::fwrite(blob, 1, static_cast<std::size_t>(bytes), file);
+            std::fclose(file);
+        }
+        std::fprintf(stderr, "[bvh]   blob written to %s and the matching _before.bin\n", name);
+        ++dumps;
+    }
+    check.lastBytes[pointer].assign(blob, blob + bytes);
+}
+
+}
+
+namespace {
+
+// APS5_PIPELINE_DISPATCH=1 (with APS5_PIPELINED_DRAWS=1): a direct dispatch that is a cache hit with a recipe is a commit
+// item of the draw pipeline instead of a drain before it. Everything else drains as before.
+bool DispatchItemsEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_PIPELINE_DISPATCH");
+        return text != nullptr && text[0] != '\0' && text[0] != '0';
+    }();
+    return enabled;
+}
+
+// Why a direct dispatch on a pipelined queue 0 drained instead of becoming a commit item.
+enum class ItemFallback : std::size_t { Miss, Reads, NoRecipe, Writes, Verify, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(ItemFallback::Count)> ItemFallbackNames{"miss", "reads", "no recipe", "writes", "verify"};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ItemFallback::Count)> itemFallbacks{};
+std::atomic<std::uint64_t> itemCommits{0};
+std::atomic<std::uint64_t> itemRebuilds{0};
+
+void NoteItemFallback(ItemFallback reason) {
+    itemFallbacks[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// APS5_PROFILE_DRAW: one [dispatch-item] line per 10 s (the worker's dispatches are the only callers).
+void ReportDispatchItems(bool profile) {
+    static auto lastReport = std::chrono::steady_clock::now();
+    if (!profile) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    std::string drained;
+    for (std::size_t i = 0; i < ItemFallbackNames.size(); ++i) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s %llu", ItemFallbackNames[i], static_cast<unsigned long long>(itemFallbacks[i].load(std::memory_order_relaxed)));
+        drained += item;
+    }
+    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str());
+}
+
+}
+
+// Defined in WrittenBuffers.cpp.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded);
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
@@ -22,7 +279,50 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         --it;
         if (address - it->second->codeAddress < it->second->code.size() * sizeof(std::uint32_t)) registeredShader = it->second;
     }
+    // A program nobody registered (code in the game image) is read raw; APS5_CAPTURE_PASSES keeps it as memory then.
+    const bool rawProgram = registeredShader == nullptr;
     if (!registeredShader) registeredShader = ReadRawComputeShader(address);
+    // Debug aid: APS5_SKIP_PROGRAMS=<hex[:n],...> drops the dispatches of those compute programs (with :n
+    // only the program's n-th dispatch, counted from 0 over the process), to tell whether a GPU fault or
+    // hang comes from them. The list is parsed again whenever the variable's text changes, so a replay can
+    // set another list before each loop (agc_frame_replay --loop-skips).
+    struct Skip {
+        std::uint64_t program;
+        std::uint64_t nth;
+    };
+    static constexpr std::uint64_t EveryDispatch = ~std::uint64_t{0};
+    static std::mutex skipMutex;
+    static std::string skipText;
+    static std::vector<Skip> skipped;
+    static std::map<std::uint64_t, std::uint64_t> counts;
+    bool skip = false;
+    {
+        std::lock_guard lock(skipMutex);
+        const char* text = std::getenv("APS5_SKIP_PROGRAMS");
+        if (skipText != (text != nullptr ? text : "")) {
+            skipText = text != nullptr ? text : "";
+            skipped.clear();
+            for (const char* cursor = skipText.c_str(); *cursor != 0;) {
+                char* end = nullptr;
+                const auto value = std::strtoull(cursor, &end, 16);
+                if (end == cursor) break;
+                auto nth = EveryDispatch;
+                if (*end == ':') nth = std::strtoull(end + 1, &end, 10);
+                skipped.push_back({value, nth});
+                cursor = *end == ',' ? end + 1 : end;
+            }
+        }
+        if (!skipped.empty()) {
+            const auto nth = counts[address]++;
+            skip = std::any_of(skipped.begin(), skipped.end(), [&](const Skip& entry) { return entry.program == address && (entry.nth == EveryDispatch || entry.nth == nth); });
+        }
+    }
+    if (skip) {
+        // A skip the trace can count (tools/fidelity): every dispatch dropped, as reportSkip's own lines would read.
+        static const bool traceSkips = std::getenv("APS5_TRACE_SKIPS") != nullptr;
+        if (traceSkips) std::fprintf(stderr, "[gpu] skipped dispatch again: compute shader 0x%llx: APS5_SKIP_PROGRAMS\n", static_cast<unsigned long long>(address));
+        return;
+    }
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
@@ -30,10 +330,154 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     for (std::uint32_t i = 0; i < userCount; ++i) {
         userData.push_back(readUserData(queue.shader, 0x240 + i));
     }
+    // Debug aid: APS5_WATCH_PROGRAM=<hex> prints that compute program's dispatch size and user data, and
+    // the 16 qwords behind the pointer in user data 4-5 (guest memory as it is, GPU writes may be pending);
+    // APS5_WATCH_PROGRAM=1 prints every dispatch's program, size and user data.
+    static const std::uint64_t watchedProgram = [] {
+        const char* text = std::getenv("APS5_WATCH_PROGRAM");
+        return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+    }();
+    if (address == watchedProgram || watchedProgram == 1) {
+        std::string text;
+        char item[48];
+        for (const auto word : userData) {
+            std::snprintf(item, sizeof(item), " %08x", word);
+            text += item;
+        }
+        std::fprintf(stderr, "[watch] program 0x%llx dispatch %u x %u x %u, user data%s\n", static_cast<unsigned long long>(address), packet.size() > 1 ? packet[1] : 0, packet.size() > 2 ? packet[2] : 0, packet.size() > 3 ? packet[3] : 0, text.c_str());
+        if (address == watchedProgram && userData.size() >= 6) {
+            const auto pointer = (userData[4] | (static_cast<std::uint64_t>(userData[5]) << 32u)) & 0xffffffffffffull;
+            text.clear();
+            for (std::size_t i = 0; i < 16; ++i) {
+                std::snprintf(item, sizeof(item), " %016llx", static_cast<unsigned long long>(reinterpret_cast<const volatile std::uint64_t*>(pointer)[i]));
+                text += item;
+            }
+            std::fprintf(stderr, "[watch]   0x%llx:%s\n", static_cast<unsigned long long>(pointer), text.c_str());
+        }
+    }
+    static const bool checkBvh = std::getenv("APS5_CHECK_BVH") != nullptr;
+    if (checkBvh) {
+        // The blob a refit just used is checked again at the next dispatch, after the refit ran.
+        if (const auto refitted = checkAfterRefit.exchange(0, std::memory_order_acq_rel); refitted != 0) CheckBvh(refitted);
+        if (const auto built = checkAfterBuild.exchange(0, std::memory_order_acq_rel); built != 0) CheckBvh(built, true);
+        NoteDispatchForBvh(submission.queue, submission.serial, address, userData);
+        static constexpr std::array<std::uint32_t, 6> RefitStart{0xbfa00003u, 0xd7460001u, 0x04010c06u, 0xf4041a82u, 0xfa000040u, 0xbf8cc07fu};
+        const auto word = (address - snapshot.codeAddress) / sizeof(std::uint32_t);
+        const auto pointer = userData.size() >= 6 ? (userData[4] | (static_cast<std::uint64_t>(userData[5]) << 32u)) & 0xffffffffffffull : 0;
+        const bool refit = word + RefitStart.size() <= snapshot.code.size() && std::equal(RefitStart.begin(), RefitStart.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(word));
+        if (pointer != 0 && (refit || KnownBvh(pointer))) CheckBvh(pointer);
+        if (refit && pointer != 0) checkAfterRefit.store(pointer, std::memory_order_release);
+        // The pass before a frame's BVH updates (its blob in user data 0-1) shows the blob as built.
+        static constexpr std::array<std::uint32_t, 6> SetupStart{0xbfa00003u, 0xd7460001u, 0x04010c0bu, 0xf4041a80u, 0xfa000048u, 0xbf8cc07fu};
+        if (userData.size() >= 2 && word + SetupStart.size() <= snapshot.code.size() && std::equal(SetupStart.begin(), SetupStart.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(word))) {
+            CheckBvh((userData[0] | (static_cast<std::uint64_t>(userData[1]) << 32u)) & 0xffffffffffffull);
+        }
+        // APS5_CHECK_BVH_BUILD_TRIGGER=<file>: the first dispatch of the BVH build kernel creates that file
+        // (APS5_CAPTURE_TRIGGER's), so a frame capture holds the builds of the following frames.
+        static constexpr std::array<std::uint32_t, 6> BuildStart{0xbfa00003u, 0xd7460003u, 0x04010c0fu, 0x7d06060eu, 0xbeea086au, 0xbefe046au};
+        static std::atomic<bool> buildTriggered{false};
+        if (userData.size() >= 2 && word + BuildStart.size() <= snapshot.code.size() && std::equal(BuildStart.begin(), BuildStart.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(word))) {
+            const auto blob = (userData[0] | (static_cast<std::uint64_t>(userData[1]) << 32u)) & 0xffffffffffffull;
+            GuestMemory::FlushGpuWrites(blob, 0x80);
+            const auto* header = reinterpret_cast<const char*>(static_cast<std::uintptr_t>(blob));
+            std::uint64_t bytes = 0;
+            if (std::memcmp(header, "PSR_BVHL", 8) == 0) std::memcpy(&bytes, header + 0x10, sizeof(bytes));
+            std::fprintf(stderr, "[bvh] %.1f ms queue 0x%x: build of blob 0x%llx (%llu bytes)\n", TraceMs(), submission.queue, static_cast<unsigned long long>(blob), static_cast<unsigned long long>(bytes));
+            if (bytes != 0 && bytes < (1ull << 30u)) Graphics::DebugWatchRange(blob, blob + bytes);
+            if (bytes != 0) checkAfterBuild.store(blob, std::memory_order_release);
+        }
+        if (word + BuildStart.size() <= snapshot.code.size() && std::equal(BuildStart.begin(), BuildStart.end(), snapshot.code.begin() + static_cast<std::ptrdiff_t>(word)) && !buildTriggered.exchange(true)) {
+            if (const char* trigger = std::getenv("APS5_CHECK_BVH_BUILD_TRIGGER"); trigger != nullptr && *trigger != '\0') {
+                if (FILE* file = std::fopen(trigger, "wb")) std::fclose(file);
+                std::fprintf(stderr, "[bvh] %.1f ms: first BVH build dispatch, created %s\n", TraceMs(), trigger);
+            }
+        }
+    }
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const bool resolving = resolvingAhead();
     std::vector<ShaderRecompiler::MemoryRegion> memory{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}};
     if (!snapshot.header.empty()) memory.push_back({snapshot.headerAddress, snapshot.header});
+    // Subroutine calls (s_swappc_b64, the recompiler's InlineSubroutineCalls): the callees a program reaches through
+    // function pointers in its user data are registered shader code too; their code goes into the request. Programs
+    // without the call opcode skip the scan. APS5_SUBROUTINE_CALLS=1, as the recompiler's inlining.
+    static const bool subroutineCalls = [] {
+        const char* value = std::getenv("APS5_SUBROUTINE_CALLS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    const auto codeWords = std::span(snapshot.code).subspan(static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t)));
+    if (subroutineCalls && std::any_of(codeWords.begin(), codeWords.end(), [](std::uint32_t word) { return (word & 0xff80ff00u) == 0xbe802100u; })) {
+        for (std::size_t i = 0; i + 1 < userData.size(); ++i) {
+            const auto pointer = static_cast<std::uint64_t>(userData[i]) | (static_cast<std::uint64_t>(userData[i + 1]) << 32u);
+            auto callee = submission.shaders->upper_bound(pointer);
+            if (callee == submission.shaders->begin()) continue;
+            --callee;
+            const auto& code = *callee->second;
+            if (&code == &snapshot || pointer - code.codeAddress >= code.code.size() * sizeof(std::uint32_t)) continue;
+            const bool listed = std::any_of(memory.begin(), memory.end(), [&](const auto& region) { return region.guestAddress == code.codeAddress; });
+            if (!listed) memory.push_back({code.codeAddress, std::as_bytes(std::span(code.code))});
+        }
+        // Function tables (the recompiler's TableTargets): a 64-bit pointer loaded at an immediate offset from a user
+        // data pair, pointing at a table of 16-byte entries {target, arguments} the program calls through per wave
+        // (Wolverine's 0x11d049aa00). The pointer, the leading entries that hold registered code (or null) and those
+        // targets' code go into the request, as live guest memory. The pointers are found by scanning the code for SMEM
+        // loads based on a user data pair without an offset register; a word that only looks like one costs a read.
+        // APS5_TRACE_CALL_TABLES=1 prints each table once.
+        static const bool traceTables = std::getenv("APS5_TRACE_CALL_TABLES") != nullptr;
+        const auto readable = [](std::uint64_t at, std::size_t bytes) {
+            if (at < 0x200000000ull || at >= 0x7200000000ull) return false;
+            try {
+                return GuestMemory::DescribeCommitted(at, bytes).whole;
+            } catch (const std::exception&) {
+                return false;
+            }
+        };
+        const auto registeredCode = [&](std::uint64_t target) -> const ShaderSnapshot* {
+            auto owner = submission.shaders->upper_bound(target);
+            if (owner == submission.shaders->begin()) return nullptr;
+            --owner;
+            if (target % sizeof(std::uint32_t) != 0 || target - owner->second->codeAddress >= owner->second->code.size() * sizeof(std::uint32_t)) return nullptr;
+            return owner->second.get();
+        };
+        std::set<std::uint64_t> pointers;
+        for (std::size_t word = 0; word + 1 < codeWords.size(); ++word) {
+            const auto first = codeWords[word];
+            const auto second = codeWords[word + 1];
+            if ((first >> 26u) != 0x3du || (second >> 25u) != 0x7du) continue;
+            const auto base = (first & 0x3fu) * 2u;
+            if (base + 1u >= userData.size()) continue;
+            const auto offset = static_cast<std::int64_t>(static_cast<std::int32_t>((second & 0x1fffffu) << 11u) >> 11);
+            const auto pointer = ((static_cast<std::uint64_t>(userData[base + 1u] & 0xffffu) << 32u) | userData[base]) + offset;
+            if (!pointers.insert(pointer).second || !readable(pointer, sizeof(std::uint64_t))) continue;
+            std::uint64_t table = 0;
+            GuestMemory::ReadCommitted(pointer, std::as_writable_bytes(std::span(&table, 1)));
+            table &= 0xffffffffffffull;
+            constexpr std::size_t MaxEntries = 256;
+            constexpr std::size_t EntryBytes = 16;
+            std::size_t entries = 0;
+            std::set<const ShaderSnapshot*> targets;
+            for (; entries < MaxEntries && readable(table + entries * EntryBytes, EntryBytes); ++entries) {
+                std::uint64_t target = 0;
+                GuestMemory::ReadCommitted(table + entries * EntryBytes, std::as_writable_bytes(std::span(&target, 1)));
+                if (target == 0) continue;
+                const auto* code = registeredCode(target);
+                if (code == nullptr || code == &snapshot) break;
+                targets.insert(code);
+            }
+            if (targets.empty()) continue;
+            memory.push_back({pointer, std::as_bytes(std::span(reinterpret_cast<const std::uint64_t*>(pointer), 1))});
+            memory.push_back({table, std::span(reinterpret_cast<const std::byte*>(table), entries * EntryBytes)});
+            for (const auto* code : targets) {
+                const bool listed = std::any_of(memory.begin(), memory.end(), [&](const auto& region) { return region.guestAddress == code->codeAddress; });
+                if (!listed) memory.push_back({code->codeAddress, std::as_bytes(std::span(code->code))});
+            }
+            if (traceTables) {
+                static std::mutex tracedMutex;
+                static std::set<std::pair<std::uint64_t, std::uint64_t>> traced;
+                std::lock_guard lock(tracedMutex);
+                if (traced.insert({address, table}).second) std::fprintf(stderr, "[call-table] 0x%llx: pointer 0x%llx (user s%u + 0x%llx) -> table 0x%llx, %zu entries, %zu registered programs\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(pointer), base, static_cast<unsigned long long>(offset), static_cast<unsigned long long>(table), entries, targets.size());
+            }
+        }
+    }
 
     static const bool unlockedDevice = std::getenv("APS5_NO_UNLOCKED_DEVICE") == nullptr;
     std::shared_ptr<VulkanDevice> localDevice = unlockedDevice ? device.Load() : nullptr;
@@ -79,19 +523,28 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
-        if (indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
-            pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
-            return;
-        }
     }
+    // A pipelined queue 0 keeps its draws in flight through DISPATCH_DIRECT packets only for the fill
+    // HLE above (an ordered commit item); every other dispatch waits for them here. With APS5_PIPELINE_DISPATCH=1, a
+    // direct dispatch that is not a copy keeps them in flight through the cache lookup (below), which decides whether
+    // it is a commit item; otherwise, or when the lookup's reads could see a pending write, it drains as before.
+    const bool pipelineCandidate = !resolving && DispatchItemsEnabled() && DrawPipeline::Active() && indirectArguments == 0 && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
+    if (!resolving && DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+    if (!resolving && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
+        pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
+        return;
+    }
+    const bool threadIndirect = indirectArguments != 0 && (packet[4] & 0x20u) != 0;
     if (indirectArguments == 0 && (packet[4] & 0x20u) != 0) {
         const std::array<std::uint32_t, 3> threads{packet[1], packet[2], packet[3]};
         for (std::uint32_t axis = 0; axis < 3; ++axis) {
             if (threads[axis] % compute.numThreads[axis] != 0) compute.partialThreads = threads;
         }
+    } else if (threadIndirect) {
+        compute.partialThreads = {0xffffffffu, 0xffffffffu, 0xffffffffu};
     }
     ShaderRecompiler::RecompileRequest request{
-        {ShaderRecompiler::ShaderStage::Compute, address, std::span(snapshot.code).subspan(codeOffset), snapshot.headerAddress, snapshot.header},
+        {ShaderRecompiler::ShaderStage::Compute, address, std::span(snapshot.code).subspan(codeOffset), snapshot.headerAddress, snapshot.header, SnapshotCodeHash(snapshot, codeOffset)},
         {(packet[4] & 0x8000u) != 0 ? 32u : 64u, 0, userData, compute, std::nullopt, std::nullopt, memory, RegisteredFloatMode(snapshot)},
         localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u),
         {0, 0, 0, 128}
@@ -211,6 +664,29 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     phaseTiming.Phase(PhaseKey);
     timing.Mark("decode_key_device_setup");
+    // The lookup validates the entry against guest memory, where the pipeline's pending writes are not yet. A candidate
+    // reads the entry's regions first: an overlap with a pending write, or no entry to validate, drains as before.
+    bool readsClear = false;
+    if (pipelineCandidate) {
+        std::vector<ShaderRecompiler::MemoryRegion> reads;
+        bool entryFound = false;
+        {
+            std::lock_guard cacheLock(dispatchCacheMutex);
+            if (const auto found = dispatchCache.find(key); found != dispatchCache.end()) {
+                entryFound = true;
+                for (const auto& variant : found->second->variants) appendEntryRegions(*variant, reads);
+            }
+        }
+        if (!entryFound || noDispatchCache || stampValidate()) {
+            NoteItemFallback(ItemFallback::Miss);
+        } else if (verifyDataHits()) {
+            NoteItemFallback(ItemFallback::Verify);
+        } else {
+            readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
+            if (!readsClear) NoteItemFallback(ItemFallback::Reads);
+        }
+        if (!readsClear) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+    }
     if (fromAhead) {
         compiledResult = std::move(ahead.compiledResult);
         keepVariant = std::move(ahead.keepVariant);
@@ -231,6 +707,21 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
     }
     timing.Mark("lookup_cache");
+    // A candidate whose reads were clear is a commit item only as a hit with a recipe whose writes can be ranged; the
+    // rest drains here, before the capture and the device call (the lookup read nothing pending).
+    std::vector<DrawPipeline::Range> itemWrites;
+    bool pipelined = false;
+    if (readsClear) {
+        if (cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr) {
+            bool bounded = false;
+            itemWrites = DispatchWriteRanges(*compiledResult, bounded);
+            pipelined = bounded;
+            if (!bounded) NoteItemFallback(ItemFallback::Writes);
+        } else {
+            NoteItemFallback(ItemFallback::NoRecipe);
+        }
+        if (!pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+    }
     if (cached) {
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
         captureMs += phaseTiming.Elapsed();
@@ -239,6 +730,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         std::uint64_t forgetAtCapture = 0;
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
+        // APS5_DUMP_SHADERS=<hex address> (not 1): that program's request as it enters preparation (its code, header,
+        // callees and call tables), before a preparation that fails or runs away.
+        static const std::uint64_t dumpBeforePrepare = [] {
+            const char* text = std::getenv("APS5_DUMP_SHADERS");
+            const auto value = text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+            return value > 1u ? value : 0ull;
+        }();
+        if (dumpBeforePrepare == address) std::fprintf(stderr, "[gpu] request of 0x%llx before preparation: %s\n", static_cast<unsigned long long>(address), dumpRequest(address, request, "_prepare").c_str());
         try {
             const auto invocation = InvocationFor(snapshot, codeOffset, request);
             timing.Mark("prepared_invocation");
@@ -333,7 +832,62 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 words += text;
             }
         }
-        std::fprintf(stderr, "[dispatch-io] shader 0x%llx%s\n", static_cast<unsigned long long>(address), words.c_str());
+        std::fprintf(stderr, "[dispatch-io] queue 0x%x submission %llu groups %ux%ux%u shader 0x%llx%s\n", submission.queue, static_cast<unsigned long long>(submission.serial), groups[0], groups[1], groups[2], static_cast<unsigned long long>(address), words.c_str());
+    }
+    // APS5_CAPTURE_PASSES (see PassCapture.hpp): this instance's packet with its queue state, and its request with its
+    // own user data and memory (a cache hit has no captured regions of its own), taken here like a miss would; the
+    // ranges are saved under the GPU lock below.
+    PassCapture::Pass* passCapture = nullptr;
+    std::vector<PassCapture::Range> requestRanges;
+    std::optional<PassCapture::RecordScope> recordPass;
+    if (PassCapture::Active()) {
+        const auto instance = NextDispatchInstance(address);
+        passCapture = PassCapture::ForDispatch(address, instance);
+        if (passCapture != nullptr) {
+            recordPass.emplace(passCapture);
+            if (pipelined) {
+                pipelined = false;
+                DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+            }
+            std::error_code ignored;
+            std::filesystem::create_directories(passCapture->directory, ignored);
+            auto dumped = request;
+            try {
+                auto dumpMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+                static_cast<void>(dumpMemory->Capture(InvocationFor(snapshot, codeOffset, dumped)));
+                // context.memory is a span: the regions live here until the request is written. Initial regions are
+                // spans over live guest memory, which may hold unmapped pages the shader never reads; they are left out.
+                auto regions = dumpMemory->Regions();
+                std::erase_if(regions, [](const ShaderRecompiler::MemoryRegion& region) { return !GuestMemory::Accessible(region.bytes.data(), region.bytes.size()); });
+                dumped.context.memory = regions;
+                for (const auto& region : regions) requestRanges.emplace_back(region.guestAddress, region.bytes.size());
+                const auto text = ShaderRecompiler::RequestSerializer{}.Serialize(dumped);
+                if (std::FILE* file = std::fopen((std::filesystem::path(passCapture->directory) / "shader.req").string().c_str(), "wb")) {
+                    std::fwrite(text.data(), 1, text.size(), file);
+                    std::fclose(file);
+                }
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[capture-pass] program 0x%llx #%llu: no request: %s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(instance), error.what());
+            }
+            // The program and every registered shader whose code the request holds (callees of s_swappc must be
+            // registered where the pass runs alone, not only present in memory).
+            std::vector<std::shared_ptr<const ShaderSnapshot>> programs;
+            if (!rawProgram) programs.push_back(registeredShader);
+            else requestRanges.emplace_back(address, registeredShader->code.size() * sizeof(std::uint32_t));
+            if (submission.shaders != nullptr) {
+                for (const auto& [rangeAddress, rangeBytes] : requestRanges) {
+                    auto found = submission.shaders->upper_bound(rangeAddress);
+                    if (found == submission.shaders->begin()) continue;
+                    --found;
+                    const auto& candidate = found->second;
+                    if (candidate != nullptr && candidate != registeredShader && rangeAddress - candidate->codeAddress < candidate->code.size() * sizeof(std::uint32_t)) programs.push_back(candidate);
+                }
+            }
+            // An indirect dispatch reaches here as {DISPATCH_DIRECT 0, 0, 0, initiator} with its argument address apart:
+            // the pass keeps a DISPATCH_INDIRECT with the address in the packet (the 4-dword form) instead.
+            const std::array<std::uint32_t, 4> indirectPacket{0xc0021600u, static_cast<std::uint32_t>(indirectArguments), static_cast<std::uint32_t>(indirectArguments >> 32u), packet.back()};
+            PassCapture::SavePacket(*passCapture, queue, submission.queue, indirectArguments != 0 ? std::span<const std::uint32_t>(indirectPacket) : packet, programs);
+        }
     }
 
     const auto rethrow = [&](const std::exception& error) {
@@ -348,16 +902,77 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     };
     phaseTiming.Phase(PhaseSnapshots);
 
+    if (pipelined) {
+        // The commit item: the recipe pre-check, the GPU lock, the labels and the device call (DispatchRecipe; the full
+        // dispatch when the recipe is rebuilt), on the committer after the items before it, as the drained path runs them.
+        const auto recipe = keepVariant->recipe.load(std::memory_order_acquire);
+        const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        const auto queueId = submission.queue;
+        itemCommits.fetch_add(1, std::memory_order_relaxed);
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), groups, address, queueId, recipe, keepVariant, dataHit, epoch] {
+            DrawPipeline::FollowEpoch(epoch);
+            GuestMemory::SetCurrentPacket(0x15, queueId);
+            const auto& compiledCommit = *result;
+            const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
+            try {
+                std::shared_ptr<RecipeHit> recipeHit = localDevice->PrepareRecipe(recipe, false);
+                std::shared_ptr<const Recipe> builtRecipe;
+                bool writersNoted = false;
+                for (;;) {
+                    std::shared_ptr<PreparedDispatch> prepared;
+                    if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) prepared = localDevice->PrepareDispatch(compiledCommit, snapshots);
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    recordLabelsForPacket(localDevice.get(), queueId);
+                    if (noteWrites && writerKeyedEvidence() && !writersNoted) {
+                        noteWrittenBuffers(address, queueId, compiledCommit);
+                        writersNoted = true;
+                    }
+                    if (recipeHit != nullptr) {
+                        VulkanDevice::IndirectOutcome outcome{0, 0};
+                        const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit);
+                        if (recipeResult == RecipeOutcome::Rebuild) {
+                            recipeHit = nullptr;
+                            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
+                            itemRebuilds.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                    } else {
+                        localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), &builtRecipe);
+                    }
+                    break;
+                }
+                if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
+                if (builtRecipe != nullptr) {
+                    if (dataHit) {
+                        auto own = std::make_shared<Recipe>(*builtRecipe);
+                        own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, keepVariant->compiled.get(), 0});
+                        builtRecipe = std::move(own);
+                    }
+                    keepVariant->recipe.store(std::move(builtRecipe), std::memory_order_release);
+                    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
+                }
+            } catch (const std::exception& error) {
+                char where[64];
+                std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
+                throw std::runtime_error(where + std::string(error.what()));
+            }
+        }, std::move(itemWrites));
+        ReportDispatchItems(profile);
+        return;
+    }
+
     std::shared_ptr<RecipeHit> recipeHit;
-    if (cached && keepVariant != nullptr && !stampValidate()) {
+    if (cached && keepVariant != nullptr && !stampValidate() && !threadIndirect) {
         recipeHit = localDevice->PrepareRecipe(keepVariant->recipe.load(std::memory_order_acquire), indirectArguments != 0);
         phaseTiming.Phase(PhaseRecipePrecheck);
     }
 
     std::shared_ptr<const Recipe> builtRecipe;
-    auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
+    auto* const attachTo = stampValidate() || threadIndirect ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
+    auto deviceStart = std::chrono::steady_clock::now();
 
     for (;;) {
 
@@ -396,6 +1011,78 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             writersNoted = true;
         }
         phaseTiming.Phase(PhaseNoteWriters);
+        deviceStart = std::chrono::steady_clock::now();
+        // Debug aid: APS5_CAPTURE_INPUTS=<program hex> with APS5_CAPTURE_RANGES=<file of "address:bytes" hex lines>
+        // saves those guest ranges (GPU results flushed) just before the program's first dispatch as
+        // inputs_<program>/<address>.bin, for agc_dispatch_run --inputs.
+        static const std::uint64_t captureInputs = [] { const char* text = std::getenv("APS5_CAPTURE_INPUTS"); return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull; }();
+        static bool inputsCaptured = false;
+        // Debug aid: APS5_POISON_BEFORE=1 with APS5_DUMP_AFTER fills the dumped range with 0xa5 bytes (GPU results
+        // flushed first) just before the program's dispatch, so the dump after it shows what the dispatch wrote.
+        static const bool poisonBefore = std::getenv("APS5_POISON_BEFORE") != nullptr;
+        if (poisonBefore && DumpAfter()[0] == address && DumpAfter()[2] != 0) {
+            localDevice->WaitIdle();
+            GuestMemory::FlushGpuWrites(DumpAfter()[1], static_cast<std::size_t>(DumpAfter()[2]));
+            localDevice->WaitIdle();
+            std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(DumpAfter()[1])), 0xa5, static_cast<std::size_t>(DumpAfter()[2]));
+            std::fprintf(stderr, "[dump-after] program 0x%llx: poisoned 0x%llx+0x%llx before the dispatch\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(DumpAfter()[1]), static_cast<unsigned long long>(DumpAfter()[2]));
+        }
+        if (DumpAfter()[0] == address && DumpAfter()[2] != 0) {
+            for (const auto& image : Graphics::StorageTexture::DescribePendingOverlaps(DumpAfter()[1], static_cast<std::size_t>(DumpAfter()[2]))) std::fprintf(stderr, "[dump-after] program 0x%llx: pending before the dispatch: %s\n", static_cast<unsigned long long>(address), image.c_str());
+        }
+        if (passCapture != nullptr) {
+            // The listed bindings, the request's memory and the indirect records, GPU results flushed.
+            std::vector<PassCapture::Range> reads = requestRanges, writes;
+            for (const auto& [range, output] : passCapture->listed) {
+                reads.push_back(range);
+                if (output) writes.push_back(range);
+            }
+            if (indirectArguments != 0) reads.emplace_back(indirectArguments, 12);
+            localDevice->WaitIdle();
+            for (const auto& [rangeAddress, rangeBytes] : reads) {
+                if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(rangeAddress)), static_cast<std::size_t>(rangeBytes))) GuestMemory::FlushGpuWrites(rangeAddress, static_cast<std::size_t>(rangeBytes));
+            }
+            localDevice->WaitIdle();
+            const std::filesystem::path directory = passCapture->directory;
+            PassCapture::SaveBefore(*passCapture, reads, writes);
+            // The groups an indirect dispatch reads, as guest memory holds them now (results flushed above).
+            std::array<std::uint32_t, 3> launched = groups;
+            if (indirectArguments != 0) {
+                GuestMemory::FlushGpuWrites(indirectArguments, 12);
+                localDevice->WaitIdle();
+                if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(indirectArguments)), 12)) std::memcpy(launched.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(indirectArguments)), 12);
+            }
+            if (std::FILE* file = std::fopen((directory / "dispatch.txt").string().c_str(), "w")) {
+                std::fprintf(file, "program %llx\ngroups %u,%u,%u\nindirect %llx\nthread_indirect %d\nqueue %x\nsubmission %llu\n", static_cast<unsigned long long>(address), launched[0], launched[1], launched[2], static_cast<unsigned long long>(indirectArguments), threadIndirect ? 1 : 0, submission.queue, static_cast<unsigned long long>(submission.serial));
+                std::fclose(file);
+            }
+        }
+        if (captureInputs == address && !inputsCaptured) {
+            inputsCaptured = true;
+            localDevice->WaitIdle();
+            char directory[64];
+            std::snprintf(directory, sizeof(directory), "inputs_%llx", static_cast<unsigned long long>(address));
+            std::error_code ignored;
+            std::filesystem::create_directories(directory, ignored);
+            std::size_t saved = 0;
+            if (FILE* list = std::fopen(std::getenv("APS5_CAPTURE_RANGES") != nullptr ? std::getenv("APS5_CAPTURE_RANGES") : "", "r")) {
+                unsigned long long rangeAddress = 0, rangeBytes = 0;
+                while (std::fscanf(list, "%llx:%llx", &rangeAddress, &rangeBytes) == 2) {
+                    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(rangeAddress)), static_cast<std::size_t>(rangeBytes))) continue;
+                    GuestMemory::FlushGpuWrites(rangeAddress, static_cast<std::size_t>(rangeBytes));
+                    localDevice->WaitIdle();
+                    char name[128];
+                    std::snprintf(name, sizeof(name), "%s/%llx.bin", directory, rangeAddress);
+                    if (FILE* file = std::fopen(name, "wb")) {
+                        std::fwrite(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(rangeAddress)), 1, static_cast<std::size_t>(rangeBytes), file);
+                        std::fclose(file);
+                        ++saved;
+                    }
+                }
+                std::fclose(list);
+            }
+            std::fprintf(stderr, "[capture-inputs] program 0x%llx: saved %zu ranges into %s\n", static_cast<unsigned long long>(address), saved, directory);
+        }
         try {
             if (recipeHit != nullptr) {
                 VulkanDevice::IndirectOutcome outcome{0, 0};
@@ -408,13 +1095,42 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 }
                 if (indirectArguments != 0) countIndirect(outcome.cpuReason, outcome.argumentReadMs);
             } else if (indirectArguments != 0) {
-                const auto outcome = localDevice->DispatchIndirect(compiled, indirectArguments, snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
+                const auto outcome = localDevice->DispatchIndirect(compiled, indirectArguments, snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr, threadIndirect ? compute.numThreads : std::array<std::uint32_t, 3>{});
                 countIndirect(outcome.cpuReason, outcome.argumentReadMs);
             } else {
                 localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
             }
         } catch (const std::exception& error) {
             if (rethrow(error)) return;
+        }
+        // Debug aid: APS5_DUMP_AFTER=<program hex>:<address hex>:<bytes hex> waits for that program's dispatch
+        // and saves the guest range after it (GPU results flushed) as after_<program>_<address>_<n>.bin.
+        if (passCapture != nullptr) {
+            localDevice->WaitIdle();
+            for (const auto& [rangeAddress, rangeBytes] : passCapture->outputs) {
+                if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(rangeAddress)), static_cast<std::size_t>(rangeBytes))) GuestMemory::FlushGpuWrites(rangeAddress, static_cast<std::size_t>(rangeBytes));
+            }
+            // The write-back of an imported image is recorded behind the dispatch: finish it before reading.
+            if (auto* recorder = Graphics::Recorder::Active()) recorder->Sync();
+            localDevice->WaitIdle();
+            PassCapture::Finish(*passCapture);
+        }
+        const auto& dumpAfter = DumpAfter();
+        if (dumpAfter[0] == address && dumpAfter[2] != 0) {
+            static int dumpsAfter = 0;
+            for (const auto& image : Graphics::StorageTexture::DescribePendingOverlaps(dumpAfter[1], static_cast<std::size_t>(dumpAfter[2]))) std::fprintf(stderr, "[dump-after] program 0x%llx: pending after the dispatch: %s\n", static_cast<unsigned long long>(address), image.c_str());
+            localDevice->WaitIdle();
+            GuestMemory::FlushGpuWrites(dumpAfter[1], static_cast<std::size_t>(dumpAfter[2]));
+            // The write-back of an imported image is recorded behind the dispatch: finish it before reading.
+            if (auto* recorder = Graphics::Recorder::Active()) recorder->Sync();
+            localDevice->WaitIdle();
+            char name[96];
+            std::snprintf(name, sizeof(name), "after_%llx_%llx_%d.bin", static_cast<unsigned long long>(address), static_cast<unsigned long long>(dumpAfter[1]), dumpsAfter++);
+            if (FILE* file = std::fopen(name, "wb")) {
+                std::fwrite(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(dumpAfter[1])), 1, static_cast<std::size_t>(dumpAfter[2]), file);
+                std::fclose(file);
+            }
+            std::fprintf(stderr, "[dump-after] program 0x%llx: saved 0x%llx+0x%llx as %s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(dumpAfter[1]), static_cast<unsigned long long>(dumpAfter[2]), name);
         }
         if (builtRecipe != nullptr) {
             if (dataHit) {
@@ -429,6 +1145,35 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         break;
     }
     phaseTiming.Phase(PhaseDevice);
+    if (profile) {
+        // APS5_PROFILE_DRAW: the device call by program, every 10 s ([device-call] line, costliest first).
+        struct Cost { std::uint64_t count = 0; double ms = 0; double maxMs = 0; };
+        static std::mutex costsMutex;
+        static std::map<std::uint64_t, Cost> costs;
+        static auto lastReport = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration<double, std::milli>(now - deviceStart).count();
+        std::lock_guard lock(costsMutex);
+        auto& cost = costs[address];
+        ++cost.count;
+        cost.ms += ms;
+        cost.maxMs = std::max(cost.maxMs, ms);
+        if (now - lastReport > std::chrono::seconds(10)) {
+            lastReport = now;
+            std::vector<std::pair<std::uint64_t, Cost>> sorted(costs.begin(), costs.end());
+            std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+            double total = 0;
+            for (const auto& entry : sorted) total += entry.second.ms;
+            std::string text;
+            char item[96];
+            for (std::size_t i = 0; i < std::min<std::size_t>(sorted.size(), 15); ++i) {
+                std::snprintf(item, sizeof(item), " 0x%llx x%llu %.0fms (max %.1f)", static_cast<unsigned long long>(sorted[i].first), static_cast<unsigned long long>(sorted[i].second.count), sorted[i].second.ms, sorted[i].second.maxMs);
+                text += item;
+            }
+            std::fprintf(stderr, "[device-call] %.0f ms in %zu programs (10 s), costliest:%s\n", total, sorted.size(), text.c_str());
+            costs.clear();
+        }
+    }
     if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, submission.queue, compiled);
     deviceMs += phaseTiming.Elapsed();
     phaseTiming.Phase(PhaseTail);

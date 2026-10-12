@@ -3,6 +3,7 @@
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 
@@ -11,8 +12,13 @@ namespace {
 using AgcDriver::Graphics::Require;
 using namespace ShaderRecompiler;
 
+// With APS5_WIDE_BINDLESS the table has 300 entries, the textures at keys 5 and 290 (past the slot heap) and key
+// 150 empty; without it the 4 entries hold the textures at keys 0 and 1.
+constexpr std::uint32_t WideEntries = 300u;
+constexpr std::array<std::uint32_t, 3> WideKeys{5u, 290u, 150u};
+
 struct alignas(4096) GuestData {
-    std::array<std::array<std::uint32_t, 8>, 4> heap{};
+    std::array<std::array<std::uint32_t, 8>, WideEntries> heap{};
     std::array<std::uint32_t, 12> material{};
     std::array<std::uint32_t, 16> srt{};
     std::array<std::uint32_t, 64> output{};
@@ -31,10 +37,14 @@ void Run(AgcDriver::VulkanDevice& device) {
     textures[0].fill(0x40000000u);
     textures[1].fill(0x40400000u);
     const auto threads = std::min(32u, device.Target().subgroupSize);
+    const bool wide = std::getenv("APS5_WIDE_BINDLESS") != nullptr;
+    const bool feedback = wide && std::getenv("APS5_NO_WIDE_FEEDBACK") == nullptr;
+    const auto entries = wide ? WideEntries : 4u;
+    const auto heapKey = [&](std::uint32_t key) { return wide && key < WideKeys.size() ? WideKeys[key] : key; };
     CompiledShaderArtifact artifact;
     for (std::uint32_t iteration = 0u; iteration < guest.size(); ++iteration) {
         auto& data = guest[iteration];
-        const auto table = Buffer(data.heap.data(), 32u, 4u);
+        const auto table = Buffer(data.heap.data(), 32u, entries);
         const auto material = Buffer(data.material.data(), 16u, 3u);
         std::copy(table.begin(), table.end(), data.srt.begin());
         std::copy(material.begin(), material.end(), data.srt.begin() + 8u);
@@ -45,10 +55,10 @@ void Run(AgcDriver::VulkanDevice& device) {
         if (key < 2u) {
             for (std::uint32_t texture = 0u; texture < textures.size(); ++texture) {
                 const auto address = reinterpret_cast<std::uintptr_t>(textures[texture].data());
-                data.heap[texture] = {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>(address >> 40u) | ((texture == 0u ? 20u : 22u) << 20u) | (3u << 30u), 7u, 0x90000facu, 0u, 0u, 0u, 0u};
+                data.heap[heapKey(texture)] = {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>(address >> 40u) | ((texture == 0u ? 20u : 22u) << 20u) | (3u << 30u), 7u, 0x90000facu, 0u, 0u, 0u, 0u};
             }
         }
-        data.material[1] = key == 3u ? 0xffffffffu : key;
+        data.material[1] = key == 3u ? 0xffffffffu : heapKey(key);
         data.material[5] = 0u;
         data.material[9] = 1u;
         data.output.fill(0xdeadbeefu);
@@ -59,7 +69,15 @@ void Run(AgcDriver::VulkanDevice& device) {
         const auto shader = Recompile(request);
         if (artifact.variantId == 0u) artifact = shader;
         else Require(shader.cacheHit && shader.variantId == artifact.variantId, "bindless table changed the compiled artifact");
-        if (iteration == 1u) {
+        if (wide) {
+            // A wide table reads no runtime metadata: its entries are WideImages elements at the key.
+            Require(shader.runtimeImageResources.empty(), "wide bindless table kept runtime image metadata");
+            const auto binding = std::ranges::find_if(shader.bindings, [](const DescriptorBinding& value) { return RuntimeAbi::IsWideImages(static_cast<RuntimeAbi::Binding>(value.binding % static_cast<std::uint32_t>(RuntimeAbi::Binding::Count))); });
+            Require(binding != shader.bindings.end(), "wide bindless table has no WideImages binding");
+            // Only bound entries take elements: at least the 16 of the smallest array.
+            const auto least = 16u;
+            Require(binding->count >= least && binding->guestDescriptor.size() == binding->count * 8u, "wide bindless table binds " + std::to_string(binding->count) + " WideImages elements with " + std::to_string(binding->guestDescriptor.size()) + " words at " + std::to_string(iteration));
+        } else if (iteration == 1u) {
             auto invalid = shader;
             auto binding = std::ranges::find_if(invalid.bindings, [](const DescriptorBinding& value) { return value.role == DescriptorRole::ShaderData; });
             Require(binding != invalid.bindings.end(), "bindless shader has no runtime metadata");
@@ -75,12 +93,22 @@ void Run(AgcDriver::VulkanDevice& device) {
         }
         device.Dispatch(shader, 1u, 1u, 1u);
         device.SubmitRecorded(false);
+        if (feedback) {
+            // The first dispatch over a table samples null entries and flags the keys it reads; once it is done,
+            // the table binds them and the dispatch reads the textures.
+            device.WaitIdle();
+            data.output.fill(0xdeadbeefu);
+            device.Dispatch(Recompile(request), 1u, 1u, 1u);
+            device.SubmitRecorded(false);
+        }
     }
     device.WaitIdle();
+    std::string failures;
     for (std::uint32_t iteration = 0u; iteration < guest.size(); ++iteration) {
         const auto expected = iteration % 6u == 0u ? 0xdeadbeefu : iteration % 4u < 2u ? textures[iteration % 2u][0] : 0u;
-        Require(guest[iteration].output[0] == expected, "bindless resource selection or lifetime failed at " + std::to_string(iteration) + " value=" + std::to_string(guest[iteration].output[0]) + " expected=" + std::to_string(expected));
+        if (guest[iteration].output[0] != expected) failures += " " + std::to_string(iteration) + ": value=" + std::to_string(guest[iteration].output[0]) + " expected=" + std::to_string(expected);
     }
+    Require(failures.empty(), "bindless resource selection or lifetime failed at" + failures);
 }
 
 }

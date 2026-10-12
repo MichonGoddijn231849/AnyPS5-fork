@@ -11,6 +11,8 @@
 namespace ShaderRecompiler {
 
 using SrtMemoryReader = bool (*)(void* userData, std::uint64_t address, std::uint32_t* value);
+// Reads `words` consecutive dwords as `words` SrtMemoryReader calls would (the same tracking), in one call.
+using SrtBlockReader = bool (*)(void* userData, std::uint64_t address, std::uint32_t* values, std::size_t words);
 using SrtMemoryProbe = bool (*)(void* userData, std::uint64_t address, std::uint64_t bytes);
 
 // The guest addresses a walk dereferenced (Detail::Evaluator::EvaluateRawRead): the leaf read of
@@ -30,6 +32,8 @@ struct SrtRuntime {
     SrtMemoryReader readMemory = nullptr;
     void* userContext = nullptr;
     SrtMemoryReader readSpecializationMemory = nullptr;
+    // Optional: a bulk form of readMemory (wide bindless tables read thousands of entries per capture).
+    SrtBlockReader readMemoryBlock = nullptr;
     SrtReadTrace* readTrace = nullptr;
     SrtMemoryProbe accessible = nullptr;
 };

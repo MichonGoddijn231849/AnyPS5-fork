@@ -39,6 +39,12 @@ std::uint32_t read(const Registers& registers, std::uint32_t offset, RegisterBan
     return it->second;
 }
 
+std::uint32_t readOr(const Registers& registers, std::uint32_t offset, RegisterBank bank, std::uint32_t fallback) {
+    NoteRegisterRead(bank, offset);
+    const auto it = registers.find(offset);
+    return it == registers.end() ? fallback : it->second;
+}
+
 template <typename T> T _readHeaderPod(std::span<const std::byte> header, std::uint64_t headerAddress, const void* pointer, std::size_t bytes = sizeof(T)) {
     if (pointer == nullptr) throw std::runtime_error("AGC graphics: null AGC header pointer");
     const auto address = reinterpret_cast<std::uint64_t>(pointer);
@@ -63,6 +69,51 @@ template <typename T> void _readHeaderArray(std::span<const std::byte> header, s
 
 }
 
+bool PixelStateFromShaderEnabled() {
+    static const bool value = [] { const char* text = std::getenv("APS5_PS_STATE_FROM_SHADER"); return text != nullptr && text[0] != '\0' && text[0] != '0'; }();
+    return value;
+}
+
+bool ApplyPixelHeaderRegisters(Registers& context, std::span<const std::byte> header, std::uint64_t headerAddress) {
+    if (header.size() < sizeof(Shader)) return false;
+    Shader shader;
+    std::memcpy(&shader, header.data(), sizeof(Shader));
+    if (shader.num_cx_registers == 0 || shader.cx_registers == nullptr) return false;
+    std::vector<ShaderRegister> registers(shader.num_cx_registers);
+    _readHeaderArray(header, headerAddress, shader.cx_registers, shader.num_cx_registers, registers.data());
+    const auto control = std::find_if(registers.begin(), registers.end(), [](const ShaderRegister& reg) { return reg.offset == spiPsInControl; });
+    if (control == registers.end()) return false;
+    const auto it = context.find(spiPsInControl);
+    const auto contextInputs = it == context.end() ? 0u : it->second & 0x3Fu;
+    if ((control->value & 0x3Fu) <= contextInputs) return false;
+    for (const auto& reg : registers) {
+        if (reg.offset >= 0x400u) throw std::runtime_error("AGC graphics: pixel shader header context register 0x" + std::to_string(reg.offset) + " is outside the context bank");
+    }
+    for (const auto& reg : registers) context.insert_or_assign(reg.offset, reg.value);
+    return true;
+}
+
+ShaderRecompiler::ShaderPixelStageInfo LinkPixelInputs(const ShaderRecompiler::ShaderPixelStageInfo& pixel, std::span<const std::uint32_t> parameterExports, std::uint32_t& defaulted) {
+    constexpr std::uint32_t inputOffset = 0x1fu;
+    constexpr std::uint32_t inputDefault = 0x20u;
+    constexpr std::uint32_t inputDefaultValue = 0x300u;
+    if (pixel.interpolatorCount > pixel.interpolatorSettings.size()) {
+        throw std::runtime_error("AGC graphics: pixel interpolator count " + std::to_string(pixel.interpolatorCount) + " exceeds the SPI_PS_INPUT_CNTL registers");
+    }
+    auto linked = pixel;
+    defaulted = 0;
+    for (std::uint32_t i = 0; i < pixel.interpolatorCount; ++i) {
+        const auto control = pixel.interpolatorSettings[i];
+        // Already a default, or a passthrough (DEFAULT with FLAT_SHADE) that reads no parameter.
+        if ((control & inputDefault) != 0u) continue;
+        if (std::find(parameterExports.begin(), parameterExports.end(), control & inputOffset) != parameterExports.end()) continue;
+        // The previous stage does not export this parameter: the input reads its DEFAULT_VAL constant.
+        linked.interpolatorSettings[i] = (control & inputDefaultValue) | inputDefault;
+        ++defaulted;
+    }
+    return linked;
+}
+
 ShaderRecompiler::ShaderComputeStageInfo DecodeComputeStageInfo(const Registers& shader, std::span<const std::byte> header) {
     const auto numThreadX = read(shader, computeNumThreadX, RegisterBank::Shader);
     const auto numThreadY = read(shader, computeNumThreadY, RegisterBank::Shader);
@@ -71,6 +122,8 @@ ShaderRecompiler::ShaderComputeStageInfo DecodeComputeStageInfo(const Registers&
         throw std::runtime_error("AGC graphics: COMPUTE_NUM_THREAD_X/Y/Z must be nonzero");
     }
     const auto rsrc2 = read(shader, computePgmRsrc2, RegisterBank::Shader);
+    // SCRATCH_EN: the per-lane private size is the AGC header's scratch_size_dw_per_thread; the
+    // recompiler gives every invocation a private array of that many dwords.
     std::uint32_t scratchDwords = 0;
     if ((rsrc2 & 0x1u) != 0) {
         if (header.size() < sizeof(Shader)) throw std::runtime_error("AGC graphics: COMPUTE_PGM_RSRC2.SCRATCH_EN without an AGC shader header");
@@ -132,7 +185,11 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     const bool pixelKillEnable = ((shaderControl >> 6u) & 0x1u) != 0;
     const bool depthExportEnable = (shaderControl & 0x1u) != 0;
     const bool sampleMaskExportEnable = ((shaderControl >> 8u) & 0x1u) != 0;
+    const bool stencilExportEnable = ((shaderControl >> 1u) & 0x1u) != 0;
     const auto zOrder = (shaderControl >> 4u) & 0x3u;
+    const auto aaMask = readOr(context, 0x30e, RegisterBank::Context, 0xffffffffu);
+    const auto aaMaskBottom = readOr(context, 0x30f, RegisterBank::Context, 0xffffffffu);
+    const auto quadPixelMask = static_cast<std::uint8_t>((aaMask & 1u) | (((aaMask >> 16u) & 1u) << 1u) | ((aaMaskBottom & 1u) << 2u) | (((aaMaskBottom >> 16u) & 1u) << 3u));
     const auto loaded = [&](PixelInput input) { return (activeInputs & PixelInputBit(input)) != 0; };
     return ShaderRecompiler::ShaderPixelStageInfo{
         .interpolatorCount = inputNum,
@@ -153,12 +210,14 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
         .pixelKillEnable = pixelKillEnable,
         .depthExportEnable = depthExportEnable,
         .sampleMaskExportEnable = sampleMaskExportEnable,
-        .earlyZ = zOrder == 1u && !pixelKillEnable && !depthExportEnable && !sampleMaskExportEnable,
+        .earlyZ = zOrder == 1u && !pixelKillEnable && !depthExportEnable && !sampleMaskExportEnable && !stencilExportEnable,
         .executeOnNoop = ((shaderControl >> 10u) & 0x1u) != 0,
         .conservativeZExport = static_cast<ShaderRecompiler::ConservativeZExport>(conservativeZExport),
         .orderedPixelShader = ((shaderControl >> 16u) & 0x1u) != 0,
         .targetOutputMode = targetOutputMode,
-        .targetExportMapping = nullProgram ? std::array<std::uint8_t, 8>{} : exportMappings
+        .targetExportMapping = nullProgram ? std::array<std::uint8_t, 8>{} : exportMappings,
+        .quadPixelMask = quadPixelMask,
+        .stencilExportEnable = stencilExportEnable
     };
 }
 

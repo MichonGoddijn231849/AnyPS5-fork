@@ -1,0 +1,123 @@
+# Frame capture and replay
+
+Capture what the AGC driver consumes for a few frames of a running title, then replay it through the same driver without the game.
+
+## Capture
+
+Set two environment variables before starting the title:
+
+| Variable | Meaning |
+|---|---|
+| `APS5_CAPTURE=<dir>` | Output directory (created). |
+| `APS5_CAPTURE_FRAMES=a-b` | Capture starts after flip `a` was submitted and ends after flip `b`; `a-b` records `b - a + 1` frames. Default `60-62`. |
+| `APS5_CAPTURE_MAX_GB=<n>` | Abort the capture (not the game) when the files pass `n` GiB. Default 20. |
+
+At flip `a` the submitting thread waits until every earlier submission completed (3 s; otherwise it retries after the next flip), drains the device, and writes the base snapshot. The game keeps running after the capture finishes. Progress lines start with `[frame-capture]`.
+
+A submission still blocked in a wait at that point (GTA V's queue 0 on its closing REWIND) is carried. Every blocked wait is held until the start is recorded, even once satisfied. Otherwise the game releasing the REWIND during the base snapshot ran the next frame live, unrecorded, while the snapshot was read. The replay then ran that frame a second time over its own results (doubled exposure adaptation, broken temporal history), and the tail ran unpaced at each loop start (loops differing from each other). A queue found running instead of blocked makes the attempt retry at the next flip. `WARNING: queue ... executed ... packets while the base snapshot was written` marks a capture that is still inconsistent.
+
+Output:
+
+- `capture.txt`: status, frames, submissions per queue, address-space size and changes, base/delta sizes per frame, timings.
+- `events.bin`: the ordered event stream.
+- `pages.bin`: every distinct non-zero 4 KiB page, stored once.
+- `live/frame_NNNNN.png`: the frames the game presented, read back on the GPU.
+
+## Replay
+
+`build/core/libs/libs/unpatched/agc_frame_replay.exe <capture dir> [options]` (it loads the unpatched modules next to it).
+
+| Option | Meaning |
+|---|---|
+| `--loop N` | Replay N times; between loops memory, mappings, queue state and GDS return to the capture's start. |
+| `--png DIR` | Write the replayed frames of the first loop (`--png-all-loops` for all) as PNG; `--png-scale N` subsamples. |
+| `--compare DIR` | After the replay, compare `--png` frames with DIR (default `<capture>/live` when `--png` is given): PSNR, mean and max difference per frame. |
+| `--no-pacing` | Submit without waiting for the recorded per-queue packet progress. |
+| `--settle` | Also drain the device before every memory delta. |
+| `--shader-cache DIR` | Shader/pipeline disk cache (default: next to the exe); point it at the game's run dir cache for a warm first loop. |
+| `--hidden` | Do not show the presentation window. |
+| `--cold[=classes]` | Between loops clear the driver's in-memory caches so every loop misses them like new frames do in the game. Classes: `dispatch` (dispatch cache and its recipes), `draw` (draw cache and recipes), `resources` (resource cache), `textures` (sampled/storage textures, flushed first), `tables` (bindless sampled tables, BDA tables), `space` (address-space cache); presets `live` (everything but textures, the default of `--cold`) and `all`. The shader disk cache, compiled shaders and pipelines stay warm. |
+| `--for-seconds S` | Loop until S seconds have passed after loop 0 (instead of `--loop`). |
+| `--no-restore-collect` | Leave the restore's write-watch walk to the first frame (by default the replay collects the pages it rewrote before the loop starts). |
+| `--no-delta-merge` | Copy each delta page whole instead of only the words the capture changed since the page's previous captured version (by default the words the replay's GPU wrote ahead of the capture are kept). |
+| `--hash-check[=N]` | Hash guest memory per 64 KiB block (GPU results flushed) at each loop's start and end, and with `--settle` at the first N pacing points; later loops print `[hash]` lines naming the blocks that differ from loop 0 at the same point. Finds where loops stop repeating each other. |
+| `--flush-check` | At each loop's end, list the blocks that change when every cached texture is written back after the access hook's flush: GPU results a capture's base snapshot would miss. |
+| `--free-run` | Later loops start from the previous loop's end instead of the capture's start: only the pages the CPU wrote during the capture (every delta page) and the queue and driver state are restored, so GPU-written history (exposure, TAA, bloom) accumulates as in the game. Setup drops to ~12 ms a loop and frames run like the game's (GTA V Lombank: ~36 ms against 23.6 fps live); with `--png-all-loops` it shows effects that need many frames. Effects that feed back through the game's CPU cannot appear: the CPU's writes are the captured ones. |
+
+With `--png-all-loops`, `--compare` also compares every later loop's frames (`loop N frame M`); only loop 0 decides the exit status. `APS5_REPLAY_COMPARE_CURVE=1` adds the mean replayed value per 16-value band of the reference: a smooth curve is a tone or exposure difference, noise is content. Presents recorded past the captured flips are dropped (the game presents behind its flips). The per-frame `cpu ms` lines read the worker's and the committer's thread cycle counts.
+
+Each loop also prints `frame ms` (every frame's time: from the loop start, or the previous frame's GPU completion, to its own) and the time spent writing the capture's memory deltas. Deltas of 256 pages or more are written by four threads, as the title's own threads write them in the game. `APS5_TRACE_PACING=ms` lists the pacing waits longer than that with every queue's progress.
+
+All driver environment variables apply (`APS5_PROFILE_DRAW=1`, `APS5_PROFILE_GPU=1`, ...). Profile lines report every 10 s, so profile with enough loops. Exit code: 0 on success, 2 when commands differed from the capture or queues were left blocked, 1 on errors or missing/different frames in `--compare`.
+
+## Benchmarking a driver change
+
+`ps5run\tools\replay-bench.ps1 -Capture <name> [-Build] [-Cold live|all|warm] [-Seconds 22 | -Loops N] [-Libs <build dir>]` builds `agc_frame_replay` (with `-Build`, which relinks the driver), replays with `APS5_PROFILE_DRAW=1 APS5_PROFILE_GPU=1`, and prints loop 0, median/min/max loop time, command mismatches, GPU ms per frame, the `bench_summary.py` lines of the last 10 s profile window, and which other processes used CPU during the run. A run takes about a minute (build 5 s, setup 10 s, loop 0 15-30 s, 22 s of loops).
+
+Wolverine intro, frames 400-402, ms per dispatch (live = one profiling run of the same build at the same frames):
+
+| Class | Live | Warm loops | `--cold=live` | `--cold=all` |
+|---|---|---|---|---|
+| other queues indirect | 9.11 | 8.43 | 10.5 | 29.2 |
+| queue 0 indirect | 39.6 | 22.7 | 37.0 | 36.6 |
+| queue 0 direct | 0.38 | 0.45 | 0.54 | 1.17 |
+| other queues direct | 0.52 | 0.88 | 0.92 | 1.38 |
+| loop of 3 frames | ~0.88 s | 0.75 s | ~1.0-1.2 s | 2.78 s |
+
+GPU time per frame: live 4.2 ms, replay 4.1-4.5 ms. `--cold=all` re-uploads the ~7000 bindless textures that stay resident in the game.
+
+### Frames after the first
+
+The first frame of every loop carries the restore: every page the previous loop changed is written back (several times what the game writes between two frames), and its stamps make the first frame's lookups miss. The later frames see only the capture's own changes, like the game. `replay-bench.ps1` prints the per-frame medians and "frames after the first" in ms and FPS: judge a change by that line and by the loop median. Use a capture whose frames show something (Wolverine frames 250-252, the PlayStation logo; frames 400-402 and 885-887 are black, so `--compare` proves nothing on them). `ps5run	ools
+eplay-verify.sh <capture>` replays three loops with PNGs and checks that every frame of loops 1 and 2 is byte-identical to the capture's `live` frames.
+
+Wolverine frames 250-252, `-Cold 'dispatch,draw,resources,space'` (tables stay warm: the game rebuilds them incrementally, ~14 full builds against ~8500 incremental ones), no profiling:
+
+| Build | Loop | Frames after the first | Last frame |
+|---|---|---|---|
+| frame-capture cb9c1434 (2026-10-04 15:05) | 385 ms | 66.7 ms | ~62 ms |
+| frame-capture 1a48ebde | 183 ms | 39.2 ms (25.5 FPS) | 33.6 ms |
+
+The game itself ran the intros at ~24 FPS on 1a48ebde (~3 FPS on 4885945d).
+
+### How to measure a driver change
+
+1. Keep the PC quiet: no game, no build of another tree. `replay-bench.ps1` prints the CPU time other processes used during the run; anything above a few seconds (`cc1plus`, `eboot`) invalidates the timings.
+2. Baseline: `replay-bench.ps1 -Capture wolverine-400 -Cold live -Loops 12 -Label base`. Change the driver, then `replay-bench.ps1 -Capture wolverine-400 -Cold live -Loops 12 -Build -Label change`. Use `-Cold live` (new frames miss the dispatch/draw/resource/table caches as in the game); `-Cold warm` isolates the cache-hit path; never `-Cold all` for comparisons with the game.
+3. Compare, in this order: command mismatches (must stay 0); the median loop time of loops 1..N (loop 0 is one-time work: pipeline creation, first texture uploads, and depends on the shader cache); the per-class ms per dispatch (`replay_phases.py`, averaged over every window after loop 0) and its top phases; GPU ms per frame.
+4. Repeat each side twice when the difference is under ~10%: single runs vary by that much.
+
+Every 10 s the driver's profile report (`APS5_PROFILE_DRAW`) stalls the workers for about a second; with ~3 s per loop including the restore, roughly every third loop takes 2-2.5 s. The median ignores those loops; the per-dispatch averages include them. The replay opts out of Windows power throttling (efficiency mode and ignored timer resolution), which otherwise doubled loop times when its window was not in the foreground.
+
+Known biases: with no game CPU between submissions the queues overlap more than in the game, so direct dispatches wait longer for the GPU mutex behind queue 0 (about 1.4-1.8x live). Shader-memory walks that meet pending GPU writes wait for them depending on GPU timing, which makes single runs vary (cold loops 0.85-2.8 s in the worst runs); compare medians of repeated runs.
+
+## Format (version 2)
+
+`events.bin` starts with `APS5CAP1` and a version word, followed by records `{u32 type, u32 0, u64 bytes, payload}`:
+
+| Event | Payload |
+|---|---|
+| Begin | first/last frame, flips before the capture |
+| AddressSpace | new backings, removed/added pieces, removed/added registry ranges (the first one is the whole space) |
+| Memory | kind (base, delta, mapped), page runs, page indices into `pages.bin` (`0xffffffff` = zero page) |
+| Progress | per queue: packets executed since the capture start, observed before the following delta |
+| Submit | queue, flips, original packet address/size, flattened words and their hash |
+| Suspend | a suspend point |
+| Shader | code/header address, type, the driver's copies of code and header |
+| QueueState | queue registers, constant RAM and draw state at the capture start |
+| DriverState | the pending graphics reset flag and GDS |
+| VideoOutput | handle registered/unregistered |
+| Present | flip index, display buffer (or a blank flip) |
+| End | flips and submissions recorded |
+
+A piece is a mapped run of guest memory: private arena memory, direct memory (a backing id and offset, so aliases of one physical page stay aliases), or memory outside the arena (the main image).
+
+## Limitations
+
+- Looping the same frames makes every dispatch, draw and texture hit the driver's caches after loop 0, while live frames with new content miss them; `--cold` clears the caches between loops.
+- Loop 0 starts with cold driver caches (the shader disk cache can be warm).
+- Pacing waits for packets the workers executed, not for deferred labels or GPU completion; `--settle` is the strict variant.
+- CPU writes to memory outside the write-watched arena (the main image's data sections) after the base snapshot are not recorded.
+- Timing-dependent driver decisions (validation sampling, waits, label polling) can take other paths than in the game.
+- Mapping changes are recorded at submission granularity; the replay maps and unmaps whole pieces at the recorded physical offsets.
+- The replay process must be able to reserve the captured image range (it fails loudly if a DLL occupies it).

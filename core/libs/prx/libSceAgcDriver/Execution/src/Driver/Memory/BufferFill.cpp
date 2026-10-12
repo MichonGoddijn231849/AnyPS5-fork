@@ -2,8 +2,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferFill.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
@@ -15,10 +18,12 @@ namespace AgcDriver::DriverDetail {
 bool Driver::matchesFillKernel(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
     static const bool enabled = std::getenv("APS5_NO_FILL_HLE") == nullptr;
     static const bool patternEnabled = std::getenv("APS5_NO_PATTERN_FILL_HLE") == nullptr;
-    if (!enabled || userData.size() < 8 || compute.numThreads[0] != 64 || compute.numThreads[1] != 1 || compute.numThreads[2] != 1) return false;
+    if (!enabled || userData.size() < 4 || compute.numThreads[0] != 64 || compute.numThreads[1] != 1 || compute.numThreads[2] != 1) return false;
     if (patternEnabled && MatchesPatternFillKernel(code, userData, compute)) return true;
     static constexpr std::array<std::uint32_t, 9> fillKernel{0xd7460004u, 0x04010c08u, 0x7e000204u, 0x7e020205u, 0x7e040206u, 0x7e060207u, 0xe01c2000u, 0x80000004u, 0xbf810000u};
-    if (code.size() < fillKernel.size() || !std::equal(fillKernel.begin(), fillKernel.end(), code.begin())) return false;
+    static constexpr std::array<std::uint32_t, 9> zeroKernel{0xd7460004u, 0x04010c04u, 0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e060280u, 0xe01c2000u, 0x80000004u, 0xbf810000u};
+    const auto matches = [&](const auto& kernel) { return code.size() >= kernel.size() && std::equal(kernel.begin(), kernel.end(), code.begin()); };
+    if (!(userData.size() >= 8 && matches(fillKernel)) && !matches(zeroKernel)) return false;
 
     const auto stride = (userData[1] >> 16u) & 0x3fffu;
     const bool swizzled = ((userData[1] >> 31u) & 1u) != 0;
@@ -163,7 +168,8 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         const auto records = std::min<std::uint64_t>(static_cast<std::uint64_t>(groups[0]) * 64u, numRecords);
         base = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
         bytes = static_cast<std::size_t>(records * 16u);
-        pattern = {userData[4], userData[5], userData[6], userData[7]};
+        const bool zero = code[2] == 0x7e000280u;
+        pattern = zero ? std::array<std::uint32_t, 4>{} : std::array<std::uint32_t, 4>{userData[4], userData[5], userData[6], userData[7]};
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static std::atomic<std::uint64_t> fills{0}, filledBytes{0}, cpuFills{0};
@@ -179,7 +185,8 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     static auto fillReport = std::chrono::steady_clock::now();
     ++fills;
     filledBytes += bytes;
-    if (bytes != 0) {
+    if (bytes == 0) return true;
+    const auto store = [this, queueId, base, bytes, pattern, localDevice] {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         const auto holdStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -232,6 +239,11 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         }
         phase(FillFlush);
         const bool stored = cleared || localDevice->FillBuffer(base, bytes, pattern);
+        if (stored && pattern[0] == pattern[1] && pattern[1] == pattern[2] && pattern[2] == pattern[3]) {
+            Graphics::NoteDepthMetadataFill(base, bytes, pattern[0]);
+            Graphics::NoteDepthPlaneFill(base, bytes, pattern[0]);
+            Graphics::NoteColorMetadataFill(base, bytes, pattern[0]);
+        }
         phase(FillDevice);
         if (uniformKeysFill && stored && !cleared) {
             Graphics::DccKeys filled = Graphics::DccKeys::Mixed;
@@ -241,6 +253,12 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
                 case 0x80: filled = Graphics::DccKeys::Clear1110; break;
                 case 0xc0: filled = Graphics::DccKeys::Clear1111; break;
                 case 0x20: filled = Graphics::DccKeys::ClearRegister; break;
+                case 0x10: {
+                    const char* single = std::getenv("APS5_DCC_SINGLE");
+                    if (single != nullptr && std::strcmp(single, "0000") == 0) filled = Graphics::DccKeys::Clear0000;
+                    else if (single != nullptr && std::strcmp(single, "reg") == 0) filled = Graphics::DccKeys::ClearRegister;
+                    break;
+                }
                 case 0xff: filled = Graphics::DccKeys::Uncompressed; break;
                 default: break;
             }
@@ -286,7 +304,18 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
                 std::fprintf(stderr, "[fill] %llu buffer fills (%.0f MiB), %llu stored by the CPU; hold phases ms (cumulative):%s; pre-store flushes %llu (%llu stored an image); stored on the GPU: uniform %llu (%.0f MiB), pattern %llu (%.0f MiB), chain copies %llu\n", static_cast<unsigned long long>(fills.load()), filledBytes.load() / 1048576.0, static_cast<unsigned long long>(cpuFills.load()), line.c_str(), static_cast<unsigned long long>(flushes), static_cast<unsigned long long>(flushed), static_cast<unsigned long long>(uniformFills), uniformBytes / 1048576.0, static_cast<unsigned long long>(patternFills), patternBytes / 1048576.0, static_cast<unsigned long long>(chainCopies));
             }
         }
+    };
+    // Queue 0's pipelined draws: the fill is an ordered commit item (writing its range, which a
+    // later capture over it waits for) instead of a drain before the dispatch packet.
+    static const bool orderedFills = std::getenv("APS5_PIPELINE_DRAIN_FILLS") == nullptr;
+    if (orderedFills && queueId == 0 && DrawPipeline::Active()) {
+        DrawPipeline::Queue0().Enqueue([store, queueId] {
+            GuestMemory::SetCurrentPacket(0x15, queueId);
+            store();
+        }, {{base, base + bytes}});
+        return true;
     }
+    store();
     return true;
 }
 

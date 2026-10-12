@@ -6,6 +6,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Recompiler.hpp"
+#include "SceShaders.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
 #if ANYPS5_ENABLE_SPIRV_TOOLS
@@ -13,6 +14,7 @@
 #endif
 
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <sstream>
@@ -52,6 +54,20 @@ bool Replay(const char* path) {
         const auto& compute = *request.request.context.compute;
         std::printf("  compute: threads %ux%ux%u, lds %u dwords, group ids %d%d%d, tg size %d, thread id components %u\n", compute.numThreads[0], compute.numThreads[1], compute.numThreads[2], compute.ldsSizeDwords, compute.groupIdEnable[0], compute.groupIdEnable[1], compute.groupIdEnable[2], compute.tgSizeEnable, compute.threadIdComponentCount);
         if (compute.PartialGroups()) std::printf("  partial groups: dispatch of %ux%ux%u threads\n", compute.partialThreads[0], compute.partialThreads[1], compute.partialThreads[2]);
+        if (compute.scratchDwords != 0) std::printf("  scratch: %u dwords per lane\n", compute.scratchDwords);
+        // The AGC header's dispatch modifier (DISPATCH_INITIATOR bits; bit 15 is CS_W32_EN).
+        const auto header = request.request.shader.header;
+        if (header.size() >= sizeof(Shader)) {
+            Shader agc;
+            std::memcpy(&agc, header.data(), sizeof(Shader));
+            const auto specials = reinterpret_cast<std::uint64_t>(agc.specials);
+            const auto offset = specials - request.request.shader.headerAddress;
+            if (specials != 0 && specials >= request.request.shader.headerAddress && offset + sizeof(ShaderSpecialRegs) <= header.size()) {
+                ShaderSpecialRegs regs;
+                std::memcpy(&regs, header.data() + offset, sizeof(regs));
+                std::printf("  header: dispatch modifier 0x%x, scratch %u dwords per thread\n", regs.dispatch_modifier, agc.scratch_size_dw_per_thread);
+            }
+        }
     }
     if (request.request.graphics.has_value()) {
         const auto& graphics = *request.request.graphics;

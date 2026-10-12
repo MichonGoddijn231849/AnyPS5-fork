@@ -217,6 +217,10 @@ RdnaOperand DecodeRdnaScalarSource(std::uint32_t code, std::uint32_t programCoun
         case 125u: operand.kind = RdnaOperandKind::Null; return operand;
         case 126u: operand.kind = RdnaOperandKind::ExecLo; return operand;
         case 127u: operand.kind = RdnaOperandKind::ExecHi; return operand;
+        case 235u:
+        case 236u:
+        case 237u:
+        case 238u: operand.kind = RdnaOperandKind::ApertureRegister; operand.reg = code; return operand;
         case 239u: operand.kind = RdnaOperandKind::PopsExitingWaveId; return operand;
         case 248u:
             operand.kind = RdnaOperandKind::FloatInlineConstant;

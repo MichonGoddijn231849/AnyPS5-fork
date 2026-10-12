@@ -26,6 +26,19 @@ class Recorder;
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
+// APS5_LOOKUP_MEMO: Revalidate calls answered by the template's last fast proof, and those that were not.
+struct LookupMemoCounts {
+    std::uint64_t hits;
+    std::uint64_t misses;
+};
+LookupMemoCounts LookupMemoCounters();
+struct RevalidateCounts {
+    std::uint64_t fast;
+    std::uint64_t full;
+    std::uint64_t noRecord;
+};
+RevalidateCounts RevalidateCounters();
+void ClearSampledTables(VkDevice device);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
 std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes);
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport);
@@ -76,6 +89,11 @@ public:
     };
     SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false);
     void Free(const SetAllocation& allocation) noexcept;
+    // Sets whose every binding the user rewrites (a recorded draw's snapshot set, PrepareDrawBindings)
+    // go back to a per-layout list instead of their pool, and Allocate's twin takes them from it: a
+    // set per recorded draw otherwise allocates and frees inside the driver each time.
+    SetAllocation AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes);
+    void Recycle(VkDescriptorSetLayout layout, const SetAllocation& allocation) noexcept;
     // APS5_PROFILE_DRAW counters: layouts served from the map / created, sets allocated, pools opened.
     struct Stats {
         std::uint64_t layoutHits = 0;
@@ -94,6 +112,7 @@ private:
     mutable std::mutex mutex;
     std::map<std::vector<std::uint32_t>, VkDescriptorSetLayout> layouts;
     std::vector<VkDescriptorPool> pools;
+    std::unordered_map<VkDescriptorSetLayout, std::vector<SetAllocation>> recycled;
     std::vector<VkDescriptorPool> updateAfterBindPools;
     std::vector<VkDescriptorPool> dedicated;
     Stats stats;
@@ -116,27 +135,54 @@ public:
     ShaderResources(const ShaderResources&) = delete;
     ShaderResources& operator=(const ShaderResources&) = delete;
     VkDescriptorSetLayout Layout() const;
+    // The set layout's bindings and update-after-bind choice as built (APS5_DUMP_PIPELINE_DIR writes them out).
+    const std::vector<VkDescriptorSetLayoutBinding>& LayoutBindings() const { return layoutBindings; }
+    bool LayoutUpdateAfterBind() const { return layoutUpdateAfterBind; }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
         DrawBindings& operator=(const DrawBindings&) = delete;
+        // The snapshot's bytes are `bytes` at `offset` in `buffer` (a snapshot arena's slice under
+        // APS5_SNAPSHOT_RING, else a Buffer of its own at offset 0).
         struct Snapshot {
             std::uint64_t address;
             std::shared_ptr<Buffer> buffer;
+            VkDeviceSize offset = 0;
+            std::size_t bytes = 0;
+            std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
         };
         DescriptorCache* cache = nullptr;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        // Textures a template hit rebinds (MovedImage), kept with the set that names their views.
+        std::vector<std::shared_ptr<Texture>> textures;
         ~DrawBindings();
     };
     struct MovedBuffer {
         std::size_t allocation;
         std::uint64_t address;
         std::size_t size;
-        std::vector<std::uint32_t> words;
+        // A data binding's new words: a view of the draw's compiled program (CompiledShader::program, held for the
+        // whole draw), not a copy, since the moved list lives only for that draw.
+        std::span<const std::uint32_t> words;
     };
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    // A sampled image element of a template hit whose T# names another texture than the build's
+    // (APS5_MOVED_IMAGES: the content key leaves texture base addresses out): the draw's own texture,
+    // written over that element of the hit's descriptor set.
+    struct MovedImage {
+        std::uint32_t binding;
+        std::uint32_t element;
+        std::shared_ptr<Texture> texture;
+        bool firstLayer = false;
+    };
+    static bool MovableImages();
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, std::span<const MovedImage> movedImages = {}) const;
+    // The sampled image elements of `shaders` (the draw's stages, the shapes this template was built
+    // for) whose descriptors differ from the build's, each looked up as the build would; nullopt when
+    // one cannot be rebound (another dimension, a missing texture, an address-based set).
+    std::optional<std::vector<MovedImage>> MovedSampledImages(std::span<const CompiledShader> shaders) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
@@ -162,6 +208,9 @@ public:
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
     // Debug aid: each bound guest resource with the fraction of sampled bytes that are nonzero.
     std::string Describe() const;
+    // The guest ranges the bindings read and the ones they may write (images with their DCC keys, guest buffers), as
+    // Describe lists them (APS5_CAPTURE_PASSES saves them for tools/fidelity).
+    void GuestRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads, std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes) const;
 
     // Reuse across dispatches of identical content (see the resource cache in VulkanDevice): the
     // key is everything a compute build consumes from its compiled shader (variant, and per binding
@@ -174,7 +223,9 @@ public:
     // Without `dataWords` the ShaderData and FlattenedSrt descriptor words stay out of the key
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
-    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
+    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false, bool movableImages = false);
+    // ContentKey's words appended to `key` (the per-draw key without a vector per stage).
+    static void AppendContentKey(std::vector<std::uint32_t>& key, const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false, bool movableImages = false);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
@@ -205,6 +256,7 @@ public:
     // as the recorded work will find them (maintained by addDataBuffer and RefreshData), and of a
     // compiled shader's descriptors. A recipe hit refreshes the template iff the two differ.
     std::uint64_t DataWordsHash() const { return dataWordsHash; }
+    std::optional<std::pair<VkBuffer, VkDeviceSize>> ThreadLimitTarget() const;
     static std::uint64_t DataWordsHash(const CompiledShader& shader);
     void PatchPushConstants(std::span<std::byte, PipelinePushConstantBytes> bytes) const {
         for (const auto& [position, adjustment] : pushPatches) bytes[position] = static_cast<std::byte>(adjustment);
@@ -251,6 +303,9 @@ private:
         std::uint32_t format = 0;
         int tileMode = 0;
         std::uint64_t dccAddress = 0;
+        // Array layers, or depth slices of a volume (Describe prints WxHxN, with a v for a volume).
+        std::uint32_t layers = 1;
+        bool volume = false;
     };
     std::vector<DescribedRange> describedRanges;
     struct Allocation {
@@ -372,7 +427,10 @@ private:
         // Storage-sourced textures: the image the view follows (kept alive by the texture).
         const StorageTexture* source = nullptr;
         bool valid = false;
+        bool nullDescriptor = false;
+        bool depthSurface = false;
     };
+    bool depthTexturesHold();
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element
     // (index into textures, or into storageTextures when `storage`) whose own object stands in for
@@ -414,6 +472,8 @@ private:
     bool usesBda = false;
     bool usesFaultBuffer = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
+    bool layoutUpdateAfterBind = false;
     // Whether the layout is this object's own (no cache) and destroyed with it.
     bool ownsLayout = false;
     VkDescriptorSet _set = VK_NULL_HANDLE;
@@ -429,6 +489,9 @@ private:
     std::uint64_t dispatchThreads = 0;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<bool> textureFirstLayer;
+    // The T# each entry of `textures` was built from (MovedSampledImages compares a hit's against them;
+    // Revalidate proves the build's own objects with them).
+    std::vector<std::array<std::uint32_t, 8>> textureWords;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
     std::vector<std::uint32_t> storageMips;
     std::vector<std::uint64_t> storageKeys;
@@ -456,8 +519,28 @@ private:
     std::uint64_t pendingSerialSeen = 0;
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
+    // APS5_LOOKUP_MEMO: the last fast proof's stamp checks (the surfaces at their generations, the
+    // DCC key ranges at their proofs'), the images whose cache residency it checked and what else it
+    // stood on; `epoch` 0: none (see lookupMemoHolds).
+    struct RangeStamp {
+        std::uint64_t address;
+        std::size_t bytes;
+        std::uint64_t generation;
+    };
+    struct LookupMemo {
+        std::uint64_t epoch = 0;
+        std::uint64_t unwatched = 0;
+        std::uint64_t pendingSerial = 0;
+        std::uint64_t registryGeneration = 0;
+        std::vector<RangeStamp> stamps;
+        std::vector<const StorageTexture*> images;
+        bool keysKept = true;
+    };
+    LookupMemo lookupMemo;
+    bool lookupMemoHolds(std::uint64_t serialBefore);
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
     std::uint64_t dataWordsHash = 14695981039346656037ull;
+    std::int64_t shaderDataAllocation = -1;
     void rehashDataWords();
     std::vector<std::pair<std::uint32_t, std::uint32_t>> pushPatches;
     std::vector<DataPatch> dataPatches;

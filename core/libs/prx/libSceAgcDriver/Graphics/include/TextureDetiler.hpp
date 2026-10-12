@@ -60,6 +60,9 @@ namespace AgcDriver::Graphics {
         void release() noexcept;
         VkDescriptorSet allocateSet(bool image = false);
         void checkWindow(const TileMipLayout& layout, const DetileWindow& window, std::uint32_t& columnEnd, std::uint32_t& rowEnd) const;
+        // The first set of each layout's pools (APS5_NULL_SUBMIT reuses it for every dispatch).
+        VkDescriptorSet firstSet = VK_NULL_HANDLE;
+        VkDescriptorSet firstImageSet = VK_NULL_HANDLE;
 
         const Context context;
         VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;

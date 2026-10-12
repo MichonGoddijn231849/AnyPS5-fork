@@ -1,0 +1,2023 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Capture/CaptureFormat.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Capture/Replay.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DriverThreadClock.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
+#define SDL_MAIN_HANDLED
+#include <SDL.h>
+#include <SDL_vulkan.h>
+#include "ReplayPlatform.hpp"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#include <cstdlib>
+#include <new>
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <cerrno>
+#include <csignal>
+#include <sys/time.h>
+#include <ucontext.h>
+#endif
+
+// APS5_COUNT_ALLOCS=1 (docs/dev/NIGHT_SHIFT.md B6): the replay replaces the global operator new and counts the
+// allocations (and bytes) of the driver threads by role (DriverThreadClock), the driver's library included (its
+// operator new binds to this one). On Linux, one committer allocation in SampleEvery (queue 0's worker's with
+// APS5_COUNT_ALLOCS=worker) also records its five callers,
+// printed per loop as module offsets (symbolize with addr2line against the module). Without the switch the
+// replacement only forwards to malloc.
+namespace ReplayAllocations {
+
+bool Enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_COUNT_ALLOCS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+struct Counts {
+    std::atomic<std::uint64_t> allocations{0};
+    std::atomic<std::uint64_t> bytes{0};
+};
+
+// Index role + 1 (0: any other thread).
+std::array<Counts, static_cast<std::size_t>(AgcDriver::DriverThread::Count) + 1> byRole;
+
+// The role whose call sites are sampled: the committer, or queue 0's worker with APS5_COUNT_ALLOCS=worker.
+int SampledRole() {
+    static const int role = [] {
+        const char* value = std::getenv("APS5_COUNT_ALLOCS");
+        return value != nullptr && std::strcmp(value, "worker") == 0 ? static_cast<int>(AgcDriver::DriverThread::Queue0Worker) : static_cast<int>(AgcDriver::DriverThread::Committer);
+    }();
+    return role;
+}
+
+constexpr unsigned SampleEvery = 31;
+constexpr std::size_t SiteFrames = 5;
+using SiteKey = std::array<std::uintptr_t, SiteFrames>;
+std::mutex sitesMutex;
+std::map<SiteKey, std::pair<std::uint64_t, std::uint64_t>>* sites = nullptr;
+thread_local bool inside = false;
+
+void Note(std::size_t bytes) {
+    if (!Enabled() || inside) return;
+    inside = true;
+    const int role = AgcDriver::CurrentDriverThreadRole();
+    auto& counts = byRole[static_cast<std::size_t>(role + 1)];
+    counts.allocations.fetch_add(1, std::memory_order_relaxed);
+    counts.bytes.fetch_add(bytes, std::memory_order_relaxed);
+#ifndef _WIN32
+    thread_local unsigned sampled = 0;
+    if (role == SampledRole() && ++sampled % SampleEvery == 0) {
+        void* raw[SiteFrames + 2];
+        const int captured = backtrace(raw, static_cast<int>(SiteFrames + 2));
+        SiteKey key{};
+        for (int i = 2; i < captured && static_cast<std::size_t>(i - 2) < SiteFrames; ++i) key[static_cast<std::size_t>(i - 2)] = reinterpret_cast<std::uintptr_t>(raw[i]);
+        std::lock_guard lock(sitesMutex);
+        if (sites == nullptr) sites = new std::map<SiteKey, std::pair<std::uint64_t, std::uint64_t>>();
+        auto& site = (*sites)[key];
+        site.first += SampleEvery;
+        site.second += bytes * SampleEvery;
+    }
+#endif
+    inside = false;
+}
+
+std::array<std::uint64_t, 2> Take(AgcDriver::DriverThread role) {
+    auto& counts = byRole[static_cast<std::size_t>(role) + 1];
+    return {counts.allocations.load(std::memory_order_relaxed), counts.bytes.load(std::memory_order_relaxed)};
+}
+
+// The sampled committer sites by estimated allocations, most first, as one line; the samples are cleared.
+std::string SiteReport(std::size_t limit) {
+    std::vector<std::pair<SiteKey, std::pair<std::uint64_t, std::uint64_t>>> sorted;
+    {
+        std::lock_guard lock(sitesMutex);
+        if (sites == nullptr) return {};
+        sorted.assign(sites->begin(), sites->end());
+        sites->clear();
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+    std::string report;
+    for (std::size_t i = 0; i < sorted.size() && i < limit; ++i) {
+        char text[96];
+        std::snprintf(text, sizeof(text), " [%llu allocs %.0f KiB:", static_cast<unsigned long long>(sorted[i].second.first), static_cast<double>(sorted[i].second.second) / 1024.0);
+        report += text;
+        for (const auto frame : sorted[i].first) {
+            if (frame == 0) continue;
+#ifndef _WIN32
+            Dl_info info{};
+            if (dladdr(reinterpret_cast<void*>(frame), &info) != 0 && info.dli_fname != nullptr) {
+                const char* name = std::strrchr(info.dli_fname, '/');
+                std::snprintf(text, sizeof(text), " %s+0x%llx", name != nullptr ? name + 1 : info.dli_fname, static_cast<unsigned long long>(frame - reinterpret_cast<std::uintptr_t>(info.dli_fbase)));
+                report += text;
+                continue;
+            }
+#endif
+            std::snprintf(text, sizeof(text), " 0x%llx", static_cast<unsigned long long>(frame));
+            report += text;
+        }
+        report += "]";
+    }
+    return report;
+}
+
+}
+
+// APS5_CPU_SAMPLE=1 (Linux): a CPU profile of the driver threads. A process-wide ITIMER_PROF delivers SIGPROF to the
+// thread that is using the CPU every SamplePeriodUs of the process's CPU time (as gperftools' profiler does); the
+// handler keeps the stack of a sample landing on a registered driver thread (DriverThreadClock), so the profile counts
+// only the worker's and the committer's running time, not their waits, nor this tool's own restore work (gdb sampling
+// of the replay mostly catches the driver threads idle). Samples go to APS5_CPU_SAMPLE_FILE (default
+// cpu-samples.txt) after each loop from the second on, as module offsets; tools/perf/cpu-profile.py symbolizes and
+// sums them by function (self and inclusive) per role.
+namespace ReplayCpuSamples {
+
+bool Enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_CPU_SAMPLE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+#ifndef _WIN32
+constexpr long SamplePeriodUs = 1000;
+constexpr std::size_t Frames = 32;
+constexpr std::size_t Capacity = std::size_t{1} << 17;
+
+struct Sample {
+    std::atomic<std::uint32_t> ready{0};
+    std::int32_t role = -1;
+    std::uint32_t count = 0;
+    std::array<void*, Frames> frames{};
+};
+
+Sample* samples = nullptr;
+std::atomic<std::size_t> reserved{0};
+std::atomic<std::uint64_t> dropped{0};
+std::size_t written = 0;
+FILE* output = nullptr;
+
+void Handler(int, siginfo_t*, void* context) {
+    const int role = AgcDriver::CurrentDriverThreadRole();
+    if (role < 0) return;
+    const int savedErrno = errno;
+    const auto index = reserved.fetch_add(1, std::memory_order_relaxed);
+    if (index >= Capacity) {
+        dropped.fetch_add(1, std::memory_order_relaxed);
+        errno = savedErrno;
+        return;
+    }
+    auto& sample = samples[index];
+    sample.role = role;
+    // backtrace's frames 0 and 1 are this handler and the signal trampoline, frame 2 the interrupted PC. On x86-64
+    // that PC is taken from the signal context instead, which is exact wherever the unwinder is not.
+    std::array<void*, Frames + 3> raw{};
+    const int captured = backtrace(raw.data(), static_cast<int>(raw.size()));
+    std::uint32_t count = 0;
+    int first = 2;
+#if defined(__x86_64__)
+    sample.frames[count++] = reinterpret_cast<void*>(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]);
+    first = 3;
+#else
+    static_cast<void>(context);
+#endif
+    for (int i = first; i < captured && count < Frames; ++i) sample.frames[count++] = raw[static_cast<std::size_t>(i)];
+    sample.count = count;
+    sample.ready.store(1, std::memory_order_release);
+    errno = savedErrno;
+}
+
+// Arms the timer once (the first call); later calls do nothing.
+void Start() {
+    if (!Enabled() || samples != nullptr) return;
+    samples = new Sample[Capacity];
+    void* warm[4];
+    static_cast<void>(backtrace(warm, 4)); // loads the unwinder outside the handler
+    const char* path = std::getenv("APS5_CPU_SAMPLE_FILE");
+    output = std::fopen(path != nullptr && path[0] != '\0' ? path : "cpu-samples.txt", "w");
+    if (output == nullptr) {
+        std::fprintf(stderr, "[cpu-sample] cannot open the sample file\n");
+        return;
+    }
+    std::fprintf(output, "# period_us %ld\n", SamplePeriodUs);
+    struct sigaction action{};
+    action.sa_sigaction = &Handler;
+    action.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGPROF, &action, nullptr);
+    itimerval timer{};
+    timer.it_interval.tv_usec = SamplePeriodUs;
+    timer.it_value.tv_usec = SamplePeriodUs;
+    setitimer(ITIMER_PROF, &timer, nullptr);
+    std::fprintf(stderr, "[cpu-sample] sampling the driver threads every %ld us of process CPU\n", SamplePeriodUs);
+}
+
+// Writes the samples finished since the last call: "S <role> <module>+0x<offset> ...", innermost frame first.
+void Flush(unsigned loop) {
+    if (output == nullptr) return;
+    const auto end = std::min(reserved.load(std::memory_order_relaxed), Capacity);
+    std::array<std::uint64_t, 2> byRole{};
+    while (written < end && samples[written].ready.load(std::memory_order_acquire) != 0) {
+        const auto& sample = samples[written++];
+        if (sample.role >= 0 && sample.role < 2) ++byRole[static_cast<std::size_t>(sample.role)];
+        std::fprintf(output, "S %d", sample.role);
+        for (std::uint32_t i = 0; i < sample.count; ++i) {
+            Dl_info info{};
+            if (dladdr(sample.frames[i], &info) != 0 && info.dli_fname != nullptr && info.dli_fbase != nullptr) {
+                // Return addresses point after the call: one byte back names the call's own line.
+                const auto offset = reinterpret_cast<std::uintptr_t>(sample.frames[i]) - reinterpret_cast<std::uintptr_t>(info.dli_fbase) - (i == 0 ? 0u : 1u);
+                std::fprintf(output, " %s+0x%llx", info.dli_fname, static_cast<unsigned long long>(offset));
+            } else {
+                std::fprintf(output, " ?+0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(sample.frames[i])));
+            }
+        }
+        std::fputc('\n', output);
+    }
+    std::fprintf(output, "L %u\n", loop);
+    std::fflush(output);
+    std::fprintf(stderr, "[cpu-sample] loop %u: %llu worker and %llu committer samples written (%zu in all, %llu dropped: buffer full)\n", loop, static_cast<unsigned long long>(byRole[0]), static_cast<unsigned long long>(byRole[1]), written, static_cast<unsigned long long>(dropped.load()));
+}
+#else
+void Start() {}
+void Flush(unsigned) {}
+#endif
+
+}
+
+void* operator new(std::size_t bytes) {
+    ReplayAllocations::Note(bytes);
+    if (void* pointer = std::malloc(bytes != 0 ? bytes : 1)) return pointer;
+    throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t bytes) {
+    ReplayAllocations::Note(bytes);
+    if (void* pointer = std::malloc(bytes != 0 ? bytes : 1)) return pointer;
+    throw std::bad_alloc();
+}
+
+void* operator new(std::size_t bytes, const std::nothrow_t&) noexcept {
+    ReplayAllocations::Note(bytes);
+    return std::malloc(bytes != 0 ? bytes : 1);
+}
+
+void* operator new[](std::size_t bytes, const std::nothrow_t&) noexcept {
+    ReplayAllocations::Note(bytes);
+    return std::malloc(bytes != 0 ? bytes : 1);
+}
+
+void operator delete(void* pointer) noexcept { std::free(pointer); }
+void operator delete[](void* pointer) noexcept { std::free(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
+void operator delete[](void* pointer, std::size_t) noexcept { std::free(pointer); }
+void operator delete(void* pointer, const std::nothrow_t&) noexcept { std::free(pointer); }
+void operator delete[](void* pointer, const std::nothrow_t&) noexcept { std::free(pointer); }
+
+namespace {
+
+using namespace AgcDriver::Capture;
+using Clock = std::chrono::steady_clock;
+
+constexpr std::uint64_t ViewBytes = 0x4000;
+constexpr std::uint64_t ReserveGranule = 0x10000;
+
+[[noreturn]] void Fail(const std::string& reason) {
+    throw std::runtime_error(reason);
+}
+
+std::string Hex(std::uint64_t value) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
+    return text;
+}
+
+struct Options {
+    std::filesystem::path capture;
+    std::uint32_t loops = 1;
+    double forSeconds = 0;
+    std::optional<std::filesystem::path> png;
+    std::uint32_t pngScale = 1;
+    bool pngAllLoops = false;
+    bool deltaMerge = true;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> dumpRanges;
+    // --loop-skips FILE: line n is APS5_SKIP_PROGRAMS for loop n (the last line holds for later loops), so one
+    // setup covers a whole bisect of compute programs.
+    std::vector<std::string> loopSkips;
+    // --dump-bvh DIR: every PSR_BVHL blob in guest memory at the end of the first loop.
+    std::optional<std::filesystem::path> dumpBvh;
+    std::optional<std::filesystem::path> compare;
+    bool pacing = true;
+    bool settle = false;
+    // --hash-check: hash guest memory (64 KiB blocks, GPU results flushed) at the loop's start, after every
+    // pacing point under --settle, and at its end; later loops report the blocks that differ from loop 0.
+    bool hashCheck = false;
+    // --hash-check=N: only the first N pacing points are hashed (the start and the end always are).
+    std::size_t hashPointLimit = ~std::size_t{0};
+    // --flush-check: at each loop's end, the blocks a texture write-back changes after the access hook's flush.
+    bool flushCheck = false;
+    // --free-run: later loops start from the previous loop's end state instead of the capture's start (no restore).
+    bool freeRun = false;
+    bool hidden = false;
+    // Collect the restore's writes before the loop starts (see restore()).
+    bool restoreCollect = true;
+    std::optional<std::filesystem::path> shaderCache;
+    std::uint32_t cold = 0;
+    // --summary: list what the capture holds and exit, without a device or guest memory.
+    bool summary = false;
+};
+
+struct Event {
+    EventType type;
+    std::span<const std::byte> payload;
+};
+
+class CaptureFile {
+public:
+    explicit CaptureFile(const std::filesystem::path& directory) {
+        std::ifstream input(directory / "events.bin", std::ios::binary);
+        if (!input) Fail("cannot open " + (directory / "events.bin").string());
+        input.seekg(0, std::ios::end);
+        bytes.resize(static_cast<std::size_t>(input.tellg()));
+        input.seekg(0);
+        input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!input) Fail("cannot read events.bin");
+        constexpr std::size_t headerBytes = Magic.size() + 8;
+        if (bytes.size() < headerBytes || std::memcmp(bytes.data(), Magic.data(), Magic.size()) != 0) Fail("events.bin is not an AnyPS5 capture");
+        std::uint32_t version;
+        std::memcpy(&version, bytes.data() + Magic.size(), 4);
+        if (version != Version) Fail("capture format version " + std::to_string(version) + " is not supported");
+        for (std::size_t cursor = headerBytes; cursor < bytes.size();) {
+            if (bytes.size() - cursor < sizeof(EventHeader)) Fail("events.bin ends inside an event header (the capture did not finish)");
+            EventHeader header;
+            std::memcpy(&header, bytes.data() + cursor, sizeof(header));
+            cursor += sizeof(header);
+            if (header.bytes > bytes.size() - cursor) Fail("events.bin ends inside an event (the capture did not finish)");
+            events.push_back({header.type, std::span(bytes).subspan(cursor, static_cast<std::size_t>(header.bytes))});
+            cursor += static_cast<std::size_t>(header.bytes);
+        }
+        if (events.empty() || events.back().type != EventType::End) Fail("the capture has no End event: it failed or did not finish (see capture.txt)");
+        pagesFile.emplace(directory / "pages.bin");
+        pageCount = pagesFile->Size() / PageBytes;
+        pages = pagesFile->Data();
+    }
+
+    CaptureFile(const CaptureFile&) = delete;
+    CaptureFile& operator=(const CaptureFile&) = delete;
+
+    const std::byte* Page(std::uint32_t index) const {
+        if (index == ZeroPage) return nullptr;
+        if (index >= pageCount) Fail("capture references page " + std::to_string(index) + " beyond pages.bin");
+        return pages + static_cast<std::uint64_t>(index) * PageBytes;
+    }
+
+    std::uint64_t PageCount() const { return pageCount; }
+
+    std::vector<Event> events;
+
+private:
+    std::vector<std::byte> bytes;
+    std::optional<ReplayPlatform::MappedFile> pagesFile;
+    const std::byte* pages = nullptr;
+    std::uint64_t pageCount = 0;
+};
+
+ReplayPlatform::Protection Protection(const Piece& piece) {
+    if (piece.readable && piece.writable) return ReplayPlatform::ReadWrite();
+    if (piece.readable) return ReplayPlatform::ReadOnly();
+    return ReplayPlatform::NoAccess();
+}
+
+bool PieceLess(const Piece& a, const Piece& b) {
+    return std::tie(a.address, a.bytes, a.kind, a.backing, a.backingOffset, a.readable, a.writable, a.gpu, a.memoryType) < std::tie(b.address, b.bytes, b.kind, b.backing, b.backingOffset, b.readable, b.writable, b.gpu, b.memoryType);
+}
+
+bool RegistryLess(const RegistryRange& a, const RegistryRange& b) {
+    return std::tie(a.address, a.bytes, a.readable, a.writable, a.gpu, a.sceProtection) < std::tie(b.address, b.bytes, b.readable, b.writable, b.gpu, b.sceProtection);
+}
+
+class GuestSpace {
+public:
+    ~GuestSpace() {
+        for (const auto& [id, section] : sections) ReplayPlatform::CloseSection(section);
+    }
+
+    void Apply(std::span<const Backing> backings, std::span<const Piece> removed, std::span<const Piece> added, std::span<const RegistryRange> registryRemoved, std::span<const RegistryRange> registryAdded) {
+        for (const auto& backing : backings) {
+            if (sections.contains(backing.id)) continue;
+            const auto section = ReplayPlatform::CreateSection(backing.bytes);
+            if (section == nullptr) Fail("cannot create a direct memory section of " + Hex(backing.bytes) + " bytes");
+            sections.emplace(backing.id, section);
+        }
+        {
+            GuestAllocations::Mutation mutation;
+            for (const auto& range : registryRemoved) mutation.Remove(reinterpret_cast<const void*>(range.address));
+        }
+        for (const auto& piece : removed) unmap(piece);
+        std::vector<Piece> external;
+        for (const auto& piece : added) {
+            if (piece.kind == PieceKind::External) external.push_back(piece);
+        }
+        reserveExternal(external);
+        for (const auto& piece : added) {
+            map(piece);
+            if (Protection(piece) != ReplayPlatform::ReadWrite()) pendingProtections.push_back(piece);
+        }
+        {
+            GuestAllocations::Mutation mutation;
+            std::uintptr_t arenaBase = 0;
+            std::size_t arenaBytes = 0;
+            GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+            for (const auto& range : registryAdded) {
+                const bool image = range.address < arenaBase || range.address + range.bytes > arenaBase + arenaBytes;
+                if (image) mutation.AddImage(reinterpret_cast<void*>(range.address), static_cast<std::size_t>(range.bytes), range.readable != 0, range.writable != 0);
+                else mutation.Add(reinterpret_cast<void*>(range.address), static_cast<std::size_t>(range.bytes), range.readable != 0, range.writable != 0, range.gpu != 0, range.sceProtection);
+            }
+        }
+        for (const auto& piece : removed) erase(pieces, piece, PieceLess);
+        for (const auto& piece : added) insert(pieces, piece, PieceLess);
+        for (const auto& range : registryRemoved) erase(registry, range, RegistryLess);
+        for (const auto& range : registryAdded) insert(registry, range, RegistryLess);
+    }
+
+    void ApplyProtections() {
+        for (const auto& piece : pendingProtections) protect(piece, Protection(piece));
+        pendingProtections.clear();
+    }
+
+    // A merge writes only the words the capture changed since `previous` (the page's earlier captured
+    // version, null for zeros): the others may hold what the replay's GPU wrote ahead of the capture
+    // (labels, buffers), which the capture saw only later or never.
+    void Write(std::uint64_t address, const std::byte* source, std::size_t bytes, bool compareFirst, bool merge = false, const std::byte* previous = nullptr) {
+        auto* target = reinterpret_cast<std::byte*>(address);
+        if (compareFirst) {
+            const bool same = source != nullptr ? std::memcmp(target, source, bytes) == 0 : std::all_of(target, target + bytes, [](std::byte value) { return value == std::byte{0}; });
+            if (same) return;
+            ++restoredPages;
+            restoredRanges.emplace_back(address & ~std::uint64_t{4095}, (address + bytes + 4095) & ~std::uint64_t{4095});
+        }
+        const auto* piece = find(address);
+        if (piece == nullptr) Fail("capture writes " + Hex(address) + " outside every mapped piece");
+        const bool applied = std::find(pendingProtections.begin(), pendingProtections.end(), *piece) == pendingProtections.end();
+        const auto store = [&] {
+            if (merge) mergeWords(target, source, previous, bytes);
+            else copy(target, source, bytes);
+        };
+        if (!applied || piece->writable) {
+            store();
+            return;
+        }
+        const auto page = address & ~(ViewBytes - 1);
+        ReplayPlatform::Protection protection;
+        if (!ReplayPlatform::Protect(reinterpret_cast<void*>(page), ViewBytes, ReplayPlatform::ReadWrite(), &protection)) Fail("cannot open read-only guest page " + Hex(page) + " for a capture write");
+        store();
+        if (!ReplayPlatform::Protect(reinterpret_cast<void*>(page), ViewBytes, protection, &protection)) Fail("cannot restore guest page protection at " + Hex(page));
+        AgcDriver::GuestMemory::ForgetPageStates(static_cast<std::uintptr_t>(page), ViewBytes);
+    }
+
+    const std::vector<Piece>& Pieces() const { return pieces; }
+    const std::vector<RegistryRange>& Registry() const { return registry; }
+    std::uint64_t restoredPages = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> restoredRanges;
+
+private:
+    template<typename T, typename TLess>
+    static void insert(std::vector<T>& values, const T& value, TLess less) {
+        values.insert(std::upper_bound(values.begin(), values.end(), value, less), value);
+    }
+
+    template<typename T, typename TLess>
+    static void erase(std::vector<T>& values, const T& value, TLess less) {
+        const auto found = std::lower_bound(values.begin(), values.end(), value, less);
+        if (found == values.end() || less(value, *found) || less(*found, value)) Fail("capture removes a range the replay never mapped");
+        values.erase(found);
+    }
+
+    static void copy(std::byte* target, const std::byte* source, std::size_t bytes) {
+        if (source != nullptr) std::memcpy(target, source, bytes);
+        else std::memset(target, 0, bytes);
+    }
+
+    static void mergeWords(std::byte* target, const std::byte* source, const std::byte* previous, std::size_t bytes) {
+        for (std::size_t offset = 0; offset < bytes; offset += sizeof(std::uint32_t)) {
+            std::uint32_t now = 0;
+            std::uint32_t before = 0;
+            if (source != nullptr) std::memcpy(&now, source + offset, sizeof(now));
+            if (previous != nullptr) std::memcpy(&before, previous + offset, sizeof(before));
+            if (now != before) std::memcpy(target + offset, &now, sizeof(now));
+        }
+    }
+
+    const Piece* find(std::uint64_t address) const {
+        auto it = std::upper_bound(pieces.begin(), pieces.end(), address, [](std::uint64_t value, const Piece& piece) { return value < piece.address; });
+        if (it == pieces.begin()) return nullptr;
+        --it;
+        return address < it->address + it->bytes ? &*it : nullptr;
+    }
+
+    void reserveExternal(const std::vector<Piece>& external) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+        for (const auto& piece : external) spans.emplace_back(piece.address & ~(ReserveGranule - 1), (piece.address + piece.bytes + ReserveGranule - 1) & ~(ReserveGranule - 1));
+        std::sort(spans.begin(), spans.end());
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+        for (const auto& span : spans) {
+            if (!merged.empty() && span.first <= merged.back().second) merged.back().second = std::max(merged.back().second, span.second);
+            else merged.push_back(span);
+        }
+        for (const auto& [begin, end] : merged) {
+            for (auto cursor = begin; cursor < end;) {
+                ReplayPlatform::Region memory;
+                if (!ReplayPlatform::Query(reinterpret_cast<const void*>(cursor), memory)) Fail("cannot query the replay address space at " + Hex(cursor));
+                const auto stop = std::min<std::uint64_t>(end, memory.base + memory.bytes);
+                if (memory.free) {
+                    if (!ReplayPlatform::Reserve(reinterpret_cast<void*>(cursor), static_cast<std::size_t>(stop - cursor))) Fail("cannot reserve the captured image range " + Hex(cursor) + "-" + Hex(stop) + " (the replay process already uses it)");
+                } else if (!memory.privateMemory || externalReserved.find(memory.allocationBase) == externalReserved.end()) {
+                    Fail("captured image range " + Hex(cursor) + "-" + Hex(stop) + " collides with memory of the replay process (a DLL?)");
+                }
+                externalReserved.insert(memory.free ? static_cast<std::uintptr_t>(cursor) : memory.allocationBase);
+                cursor = stop;
+            }
+        }
+    }
+
+    void map(const Piece& piece) {
+        auto* pointer = reinterpret_cast<void*>(piece.address);
+        const auto bytes = static_cast<std::size_t>(piece.bytes);
+        // The driver's cached page states of the range (SetGuestPagesRange) describe what was there before.
+        struct Forget {
+            std::uint64_t address;
+            std::size_t bytes;
+            ~Forget() { AgcDriver::GuestMemory::ForgetPageStates(static_cast<std::uintptr_t>(address), bytes); }
+        } forget{piece.address, bytes};
+#ifndef _WIN32
+        // The game's direct memory is write-watched (DirectMemory registers its maps); the replay's must be too, or
+        // the driver sees every range as untracked and re-uploads and writes back each surface at every use.
+        struct Watch {
+            const Piece& piece;
+            ~Watch() {
+                if (piece.readable || piece.writable) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(piece.address), static_cast<std::size_t>(piece.bytes));
+            }
+        } watch{piece};
+#endif
+        if (piece.kind == PieceKind::External) {
+            if (!ReplayPlatform::Commit(pointer, bytes)) Fail("cannot commit the captured image range " + Hex(piece.address));
+            return;
+        }
+        GuestArena::GuestArenaMarkUsed_nid_postfix(pointer, bytes);
+        if (piece.kind == PieceKind::Direct) {
+            const auto section = sections.find(piece.backing);
+            if (section == sections.end()) Fail("capture maps an unknown direct memory backing");
+            ReplayPlatform::ArenaMap(pointer, bytes, section->second, piece.backingOffset);
+        } else if (piece.readable || piece.writable) {
+            ReplayPlatform::ArenaCommit(pointer, bytes, ViewBytes);
+        }
+    }
+
+    void unmap(const Piece& piece) {
+        auto* pointer = reinterpret_cast<void*>(piece.address);
+        const auto bytes = static_cast<std::size_t>(piece.bytes);
+        struct Forget {
+            std::uint64_t address;
+            std::size_t bytes;
+            ~Forget() { AgcDriver::GuestMemory::ForgetPageStates(static_cast<std::uintptr_t>(address), bytes); }
+        } forget{piece.address, bytes};
+#ifndef _WIN32
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(pointer, bytes);
+#endif
+        std::erase(pendingProtections, piece);
+        if (piece.kind == PieceKind::External) {
+            if (!ReplayPlatform::Decommit(pointer, bytes)) Fail("cannot decommit the captured image range " + Hex(piece.address));
+            return;
+        }
+        ReplayPlatform::ArenaReset(pointer, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(pointer, bytes);
+    }
+
+    void protect(const Piece& piece, ReplayPlatform::Protection protection) {
+        if (piece.kind == PieceKind::Private && !piece.readable && !piece.writable) return;
+        const auto step = piece.kind == PieceKind::External ? piece.bytes : ViewBytes;
+        for (auto cursor = piece.address; cursor < piece.address + piece.bytes; cursor += step) {
+            ReplayPlatform::Protection previous;
+            const auto bytes = std::min<std::uint64_t>(step, piece.address + piece.bytes - cursor);
+            if (!ReplayPlatform::Protect(reinterpret_cast<void*>(cursor), static_cast<std::size_t>(bytes), protection, &previous)) Fail("cannot protect guest memory at " + Hex(cursor));
+        }
+        if (piece.kind == PieceKind::Direct) ReplayPlatform::ArenaSetProtection(piece.address, static_cast<std::size_t>(piece.bytes), protection);
+        AgcDriver::GuestMemory::ForgetPageStates(static_cast<std::uintptr_t>(piece.address), static_cast<std::size_t>(piece.bytes));
+    }
+
+    std::map<std::uint32_t, ReplayPlatform::Section> sections;
+    std::vector<Piece> pieces;
+    std::vector<RegistryRange> registry;
+    std::vector<Piece> pendingProtections;
+    std::set<std::uintptr_t> externalReserved;
+};
+
+struct PresentJob {
+    bool clear = false;
+    std::optional<PresentEvent> present;
+    std::string dump;
+    std::shared_ptr<AgcDriver::FrameTiming> timing;
+};
+
+class Presenter {
+public:
+    Presenter(std::uint32_t width, std::uint32_t height, bool hidden) : width(width), height(height), hidden(hidden) {
+        thread = std::thread([this] { run(); });
+    }
+
+    ~Presenter() {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        changed.notify_all();
+        thread.join();
+    }
+
+    void Enqueue(PresentJob job) {
+        {
+            std::lock_guard lock(mutex);
+            if (failure) std::rethrow_exception(failure);
+            jobs.push_back(std::move(job));
+            ++queued;
+        }
+        changed.notify_all();
+    }
+
+    void WaitDone() {
+        std::unique_lock lock(mutex);
+        changed.wait(lock, [&] { return failure != nullptr || done == queued; });
+        if (failure) std::rethrow_exception(failure);
+    }
+
+    std::uint64_t Presented() {
+        std::lock_guard lock(mutex);
+        return done;
+    }
+
+private:
+    void run() {
+        try {
+            if (SDL_Init(SDL_INIT_VIDEO) != 0) Fail(std::string("SDL_Init failed: ") + SDL_GetError());
+            int x = SDL_WINDOWPOS_CENTERED;
+            int y = SDL_WINDOWPOS_CENTERED;
+            for (int display = 0; display < SDL_GetNumVideoDisplays(); ++display) {
+                SDL_Rect bounds{};
+                if (SDL_GetDisplayBounds(display, &bounds) == 0 && bounds.x < 0) {
+                    x = bounds.x + 40;
+                    y = bounds.y + 40;
+                }
+            }
+            window = SDL_CreateWindow("agc_frame_replay", x, y, 1280, 720, SDL_WINDOW_VULKAN | (hidden ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN));
+            if (window == nullptr) Fail(std::string("SDL_CreateWindow failed: ") + SDL_GetError());
+            unsigned count = 0;
+            if (!SDL_Vulkan_GetInstanceExtensions(window, &count, nullptr)) Fail(std::string("SDL_Vulkan_GetInstanceExtensions failed: ") + SDL_GetError());
+            extensions.resize(count);
+            if (!SDL_Vulkan_GetInstanceExtensions(window, &count, extensions.data())) Fail(std::string("SDL_Vulkan_GetInstanceExtensions failed: ") + SDL_GetError());
+            for (;;) {
+                PresentJob job;
+                {
+                    std::unique_lock lock(mutex);
+                    while (!stopping && jobs.empty()) {
+                        lock.unlock();
+                        SDL_PumpEvents();
+                        lock.lock();
+                        changed.wait_for(lock, std::chrono::milliseconds(16), [&] { return stopping || !jobs.empty(); });
+                    }
+                    if (jobs.empty()) break;
+                    job = std::move(jobs.front());
+                    jobs.pop_front();
+                }
+                SDL_PumpEvents();
+                present(job);
+                {
+                    std::lock_guard lock(mutex);
+                    ++done;
+                }
+                changed.notify_all();
+            }
+            SDL_DestroyWindow(window);
+        } catch (...) {
+            {
+                std::lock_guard lock(mutex);
+                failure = std::current_exception();
+            }
+            changed.notify_all();
+        }
+    }
+
+    void present(const PresentJob& job) {
+        const bool buffer = job.present && job.present->hasBuffer;
+        const AgcDriver::PresentationWindow target{window, extensions, [](void* context, VkInstance instance) {
+            VkSurfaceKHR surface = VK_NULL_HANDLE;
+            if (!SDL_Vulkan_CreateSurface(static_cast<SDL_Window*>(context), instance, &surface)) Fail(std::string("SDL_Vulkan_CreateSurface failed: ") + SDL_GetError());
+            return surface;
+        }, [](void* context, std::uint32_t* drawableWidth, std::uint32_t* drawableHeight) {
+            int w = 0;
+            int h = 0;
+            SDL_Vulkan_GetDrawableSize(static_cast<SDL_Window*>(context), &w, &h);
+            *drawableWidth = w > 0 ? static_cast<std::uint32_t>(w) : 0;
+            *drawableHeight = h > 0 ? static_cast<std::uint32_t>(h) : 0;
+        }, buffer ? job.present->buffer.width : width, buffer ? job.present->buffer.height : height, job.timing};
+        if (!attached) {
+            AgcDriverAttachWindow_nid_postfix(target);
+            attached = true;
+        }
+        std::atomic<bool> ready{false};
+        const auto gpuReady = [](void* context) { static_cast<std::atomic<bool>*>(context)->store(true); };
+        if (buffer) {
+            const auto& record = job.present->buffer;
+            const AgcDriver::DisplayBuffer display{record.address, record.pixelFormat, record.width, record.height, record.tilingMode, record.pitchInPixel};
+            if (!job.dump.empty()) ReplayDumpNextPresent(job.dump, dumpScale);
+            AgcDriverPresentBuffer_nid_postfix(target, display, gpuReady, &ready);
+        } else {
+            AgcDriverPresentClear_nid_postfix(target, job.clear || !job.present || job.present->opaque, gpuReady, &ready);
+        }
+    }
+
+public:
+    std::uint32_t dumpScale = 1;
+
+private:
+    std::uint32_t width;
+    std::uint32_t height;
+    bool hidden;
+    bool attached = false;
+    SDL_Window* window = nullptr;
+    std::vector<const char*> extensions;
+    std::thread thread;
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::deque<PresentJob> jobs;
+    std::uint64_t queued = 0;
+    std::uint64_t done = 0;
+    bool stopping = false;
+    std::exception_ptr failure;
+};
+
+// APS5_TRACE_PACING=ms: the pacing waits longer than that, with every queue's progress, and the events that
+// touch what queue 0 waits on.
+double TracePacingMs() {
+    static const double traceMs = [] {
+        const char* value = std::getenv("APS5_TRACE_PACING");
+        return value != nullptr ? std::strtod(value, nullptr) : -1.0;
+    }();
+    return traceMs;
+}
+
+class Replayer;
+
+// Helper threads for large memory events: Run hands out `parts` indices to them and to the caller,
+// and returns once every part ran (rethrowing the first part's failure).
+class WritePool {
+public:
+    explicit WritePool(std::size_t threads) {
+        for (std::size_t i = 0; i < threads; ++i) workers.emplace_back([this] { work(); });
+    }
+    WritePool(const WritePool&) = delete;
+    WritePool& operator=(const WritePool&) = delete;
+    ~WritePool() {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        wake.notify_all();
+        for (auto& worker : workers) worker.join();
+    }
+
+    void Run(std::size_t parts, const std::function<void(std::size_t)>& job) {
+        {
+            std::lock_guard lock(mutex);
+            current = &job;
+            total = parts;
+            next = 0;
+            finished = 0;
+            failure = nullptr;
+            ++generation;
+        }
+        wake.notify_all();
+        claim();
+        std::unique_lock lock(mutex);
+        done.wait(lock, [&] { return finished == total; });
+        current = nullptr;
+        if (failure) std::rethrow_exception(failure);
+    }
+
+private:
+    // Runs parts until none is left (the caller and the workers alike).
+    void claim() {
+        for (;;) {
+            std::size_t part = 0;
+            const std::function<void(std::size_t)>* job = nullptr;
+            {
+                std::lock_guard lock(mutex);
+                if (current == nullptr || next >= total) return;
+                part = next++;
+                job = current;
+            }
+            std::exception_ptr error;
+            try {
+                (*job)(part);
+            } catch (...) {
+                error = std::current_exception();
+            }
+            std::lock_guard lock(mutex);
+            if (error && !failure) failure = error;
+            if (++finished == total) done.notify_all();
+        }
+    }
+
+    void work() {
+        std::uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock lock(mutex);
+                wake.wait(lock, [&] { return stopping || (generation != seen && current != nullptr); });
+                if (stopping) return;
+                seen = generation;
+            }
+            claim();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable done;
+    std::vector<std::thread> workers;
+    const std::function<void(std::size_t)>* current = nullptr;
+    std::size_t total = 0;
+    std::size_t next = 0;
+    std::size_t finished = 0;
+    std::uint64_t generation = 0;
+    std::exception_ptr failure;
+    bool stopping = false;
+};
+
+class ReplayFlip final : public AgcDriver::IFlipRequest {
+public:
+    ReplayFlip(Replayer& owner, std::uint64_t flip) : owner(owner), flip(flip) {}
+    void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& timing) override;
+    void Fail(std::exception_ptr error) noexcept override;
+
+private:
+    Replayer& owner;
+    std::uint64_t flip;
+};
+
+class NoRenderingWait final : public AgcDriver::IRenderingWait {
+public:
+    void Wait() override {}
+};
+
+class ReplayOutput final : public AgcDriver::IVideoOutput {
+public:
+    explicit ReplayOutput(Replayer& owner) : owner(owner) {}
+    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo& info) override;
+    std::shared_ptr<AgcDriver::IRenderingWait> CaptureRenderingWait(std::uint32_t) override { return std::make_shared<NoRenderingWait>(); }
+    void Fail(std::exception_ptr error) noexcept override;
+
+private:
+    Replayer& owner;
+};
+
+struct Image {
+    int width = 0;
+    int height = 0;
+    std::vector<std::uint8_t> pixels;
+};
+
+std::optional<Image> LoadPng(const std::filesystem::path& path, std::chrono::seconds wait) {
+    const auto deadline = Clock::now() + wait;
+    for (;;) {
+        int width = 0;
+        int height = 0;
+        int channels = 0;
+        if (auto* data = stbi_load(path.string().c_str(), &width, &height, &channels, 4)) {
+            Image image{width, height, std::vector<std::uint8_t>(data, data + static_cast<std::size_t>(width) * height * 4)};
+            stbi_image_free(data);
+            return image;
+        }
+        if (Clock::now() >= deadline) return std::nullopt;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+std::filesystem::path FramePath(const std::filesystem::path& directory, std::uint32_t loop, std::uint64_t flip) {
+    char name[48];
+    if (loop == 0) std::snprintf(name, sizeof(name), "frame_%05llu.png", static_cast<unsigned long long>(flip));
+    else std::snprintf(name, sizeof(name), "loop%u_frame_%05llu.png", loop, static_cast<unsigned long long>(flip));
+    return directory / name;
+}
+
+class Replayer {
+public:
+    Replayer(const Options& options, const CaptureFile& capture) : options(options), capture(capture) {
+        // APS5_REPLAY_FLIP_SERIALS=1: a present is the flip its recorded serial names (the capture's flips after the
+        // start, in FLIP packet order, as the replay reserves them) instead of its place among the Present calls,
+        // which a Present that is not a captured flip shifts (docs/dev/perf/NIGHT_PROGRESS.md, B8c). Presents
+        // without a serial (older captures) keep their place.
+        static const bool bySerial = std::getenv("APS5_REPLAY_FLIP_SERIALS") != nullptr;
+        std::uint64_t flipsBefore = 0;
+        std::size_t shifted = 0;
+        for (std::size_t i = 0; i < capture.events.size(); ++i) {
+            const auto& event = capture.events[i];
+            if (event.type == EventType::Begin) {
+                Reader reader(event.payload);
+                flipsBefore = reader.Get<BeginEvent>().flipsBefore;
+            }
+            if (event.type == EventType::Present) {
+                Reader reader(event.payload);
+                const auto present = reader.Get<PresentEvent>();
+                std::uint64_t serial = 0;
+                for (std::size_t k = 0; k < sizeof(present.flipSerial); ++k) serial |= static_cast<std::uint64_t>(present.flipSerial[k]) << (8u * k);
+                auto index = present.flip;
+                if (bySerial && serial > flipsBefore) {
+                    index = serial - 1 - flipsBefore;
+                    if (index != present.flip) ++shifted;
+                } else if (bySerial && serial != 0) {
+                    continue;
+                }
+                if (presents.size() <= index) presents.resize(static_cast<std::size_t>(index) + 1);
+                presents[static_cast<std::size_t>(index)] = present;
+            }
+            if (prologueEnd == 0 && (event.type == EventType::Progress || event.type == EventType::Submit)) prologueEnd = i;
+        }
+        if (prologueEnd == 0) Fail("the capture has no submissions");
+        // The game presents behind its flips: a present recorded while the capture finished can name a flip past
+        // the captured ones, which the replay never makes.
+        if (!capture.events.empty() && capture.events.back().type == EventType::End) {
+            Reader reader(capture.events.back().payload);
+            const auto end = reader.Get<EndEvent>();
+            if (presents.size() > end.flips) {
+                std::fprintf(stderr, "[replay] %zu presents name flips past the %llu captured; not replayed\n", static_cast<std::size_t>(std::count_if(presents.begin() + static_cast<std::ptrdiff_t>(end.flips), presents.end(), [](const auto& present) { return present.has_value(); })), static_cast<unsigned long long>(end.flips));
+                presents.resize(static_cast<std::size_t>(end.flips));
+            }
+        }
+        if (shifted != 0) std::fprintf(stderr, "[replay] %zu presents placed by their flip serial differ from their Present count (APS5_REPLAY_FLIP_SERIALS)\n", shifted);
+    }
+
+    void Run() {
+        std::uint32_t width = 1920;
+        std::uint32_t height = 1080;
+        for (const auto& present : presents) {
+            if (present && present->hasBuffer) {
+                width = present->buffer.width;
+                height = present->buffer.height;
+                break;
+            }
+        }
+        if (options.png) std::filesystem::create_directories(*options.png);
+        setImageRange();
+        presenter = std::make_unique<Presenter>(width, height, options.hidden);
+        presenter->dumpScale = options.pngScale;
+        presenter->Enqueue({true, std::nullopt, {}, nullptr});
+        presenter->WaitDone();
+        std::optional<Clock::time_point> measuredSince;
+        for (loop = 0; options.forSeconds > 0 ? (loop < 2 || std::chrono::duration<double>(Clock::now() - *measuredSince).count() < options.forSeconds) : loop < options.loops; ++loop) {
+            if (loop == 1) measuredSince = Clock::now();
+            const auto started = Clock::now();
+            if (!options.loopSkips.empty()) {
+                const auto& skips = options.loopSkips[std::min<std::size_t>(loop, options.loopSkips.size() - 1)];
+#ifdef _WIN32
+                _putenv_s("APS5_SKIP_PROGRAMS", skips.c_str());
+#else
+                setenv("APS5_SKIP_PROGRAMS", skips.c_str(), 1);
+#endif
+                std::fprintf(stderr, "[replay] loop %u skips programs: %s\n", loop, skips.empty() ? "none" : skips.c_str());
+            }
+            ReplayFeedRewindTails(true);
+            if (loop == 0) {
+                for (std::size_t i = 0; i < prologueEnd; ++i) apply(capture.events[i]);
+                initialPieces = space.Pieces();
+                initialRegistry = space.Registry();
+                // From here every change to lastPage is logged, and restore() rewinds the log: the loop's
+                // own pages, instead of a copy of the map of every page the prologue wrote.
+                lastPageLogged = true;
+            } else if (options.freeRun) {
+                freeRunRestore();
+            } else {
+                restore();
+            }
+            dumpRanges("start");
+            hashPoints = 0;
+            hashDifferingPoints = 0;
+            if (options.hashCheck) hashPoint("start");
+            for (std::size_t queue = 0; queue < QueueCount; ++queue) base[queue] = ReplayPacketsExecuted(static_cast<std::uint32_t>(queue));
+            nextFlip.store(0);
+            const auto presentedBefore = presenter->Presented();
+            {
+                std::lock_guard lock(flipTimesMutex);
+                cpuAtStart = DriverCpu();
+                drawPacketsAtStart = AgcDriver::DriverDrawPackets();
+                drawsCommittedAtStart = AgcDriver::DriverDrawsCommitted();
+                batchesAtStart = AgcDriver::DriverBatchesSubmitted();
+                allocsAtStart[0] = ReplayAllocations::Take(AgcDriver::DriverThread::Queue0Worker);
+                allocsAtStart[1] = ReplayAllocations::Take(AgcDriver::DriverThread::Committer);
+                static_cast<void>(ReplayAllocations::SiteReport(0));
+            }
+            if (loop == 1) ReplayCpuSamples::Start();
+            const auto replayStarted = Clock::now();
+            pacingMs = 0;
+            memoryMs = 0;
+            memoryBytes = 0;
+            stallReleases = 0;
+            submits = 0;
+            mappingChanges = 0;
+            piecesMapped = 0;
+            piecesUnmapped = 0;
+            for (std::size_t i = prologueEnd; i < capture.events.size(); ++i) apply(capture.events[i]);
+            // Every tail of the capture is fed: a REWIND still waiting is for commands of the next frame.
+            ReplayAbandonRewinds();
+            const bool finished = drain();
+            presenter->WaitDone();
+            loopFlips.push_back(nextFlip.load());
+            rethrowFailure();
+            if (!options.dumpRanges.empty()) {
+                ReplaySettle();
+                dumpRanges("end");
+            }
+            if (options.hashCheck) {
+                ReplaySettle();
+                hashPoint("end");
+            }
+            if (options.flushCheck) flushCheck();
+            if (options.dumpBvh.has_value() && loop == 0) {
+                ReplaySettle();
+                dumpBvhs();
+            }
+            const auto replayMs = std::chrono::duration<double, std::milli>(Clock::now() - replayStarted).count();
+            const auto setupMs = std::chrono::duration<double, std::milli>(replayStarted - started).count();
+            const auto frames = presenter->Presented() - presentedBefore;
+            std::fprintf(stderr, "[replay] loop %u: %llu submissions, %llu frames in %.1f ms (%.2f FPS); setup %.1f ms; pacing waits %.1f ms, %llu stall releases; mapping changes %llu (+%llu/-%llu pieces); command mismatches %llu%s\n", loop, static_cast<unsigned long long>(submits), static_cast<unsigned long long>(frames), replayMs, frames != 0 ? 1000.0 * static_cast<double>(frames) / replayMs : 0.0, setupMs, pacingMs, static_cast<unsigned long long>(stallReleases), static_cast<unsigned long long>(mappingChanges), static_cast<unsigned long long>(piecesMapped), static_cast<unsigned long long>(piecesUnmapped), static_cast<unsigned long long>(ReplayCommandMismatches()), finished ? "" : "; QUEUES STILL BLOCKED at the end");
+            {
+                // Each frame's time: from the loop's start (frame 0) or the previous frame's GPU
+                // completion to its own. Frame 0 carries the loop's restore effects (every page the
+                // loop wrote is written back), later frames see only the capture's own changes.
+                std::lock_guard lock(flipTimesMutex);
+                std::string text;
+                auto previous = replayStarted;
+                for (const auto& at : flipTimes) {
+                    char item[32];
+                    std::snprintf(item, sizeof(item), " %.1f", std::chrono::duration<double, std::milli>(at - previous).count());
+                    text += item;
+                    previous = at;
+                }
+                std::fprintf(stderr, "[replay] loop %u: frame ms:%s\n", loop, text.c_str());
+                // The driver's critical path per frame: the CPU time queue 0's worker and the committer spent
+                // between the previous flip (or the loop's start) and this one, from their own thread clocks, so
+                // an A/B run shows the driver's cost even when this tool's thread dominates the frame time.
+                const char* const roles[2] = {"queue 0 worker", "committer"};
+                std::array<double, 2> roleMs{};
+                for (std::size_t role = 0; role < 2; ++role) {
+                    std::string cpu;
+                    auto before = cpuAtStart[role];
+                    double total = 0;
+                    for (const auto& at : flipCpu) {
+                        char item[32];
+                        if (before < 0 || at[role] < 0) {
+                            std::snprintf(item, sizeof(item), " -");
+                        } else {
+                            const double ms = static_cast<double>(at[role] - before) / 1e6;
+                            total += ms;
+                            std::snprintf(item, sizeof(item), " %.1f", ms);
+                        }
+                        cpu += item;
+                        before = at[role];
+                    }
+                    std::fprintf(stderr, "[replay] loop %u: %s cpu ms per frame:%s (%.1f ms in %zu frames)\n", loop, roles[role], cpu.c_str(), total, flipCpu.size());
+                    roleMs[role] = total;
+                }
+                // Per draw: the worker's CPU over the draw packets it took, the committer's over the draws it
+                // committed (both over the frames whose clocks were read).
+                const auto packets = AgcDriver::DriverDrawPackets() - drawPacketsAtStart;
+                const auto committed = AgcDriver::DriverDrawsCommitted() - drawsCommittedAtStart;
+                const auto frames = std::max<std::size_t>(flipCpu.size(), 1);
+                std::fprintf(stderr, "[replay] loop %u: draws %llu packets, %llu committed (%.0f per frame); worker %.2f us per packet, committer %.2f us per committed draw\n", loop, static_cast<unsigned long long>(packets), static_cast<unsigned long long>(committed), static_cast<double>(committed) / static_cast<double>(frames), packets != 0 ? roleMs[0] * 1000.0 / static_cast<double>(packets) : 0.0, committed != 0 ? roleMs[1] * 1000.0 / static_cast<double>(committed) : 0.0);
+                const auto batches = AgcDriver::DriverBatchesSubmitted() - batchesAtStart;
+                std::fprintf(stderr, "[replay] loop %u: %llu recorded batches submitted (%.1f per frame)\n", loop, static_cast<unsigned long long>(batches), static_cast<double>(batches) / static_cast<double>(frames));
+                if (ReplayAllocations::Enabled()) {
+                    const auto committerAllocs = ReplayAllocations::Take(AgcDriver::DriverThread::Committer);
+                    const auto workerAllocs = ReplayAllocations::Take(AgcDriver::DriverThread::Queue0Worker);
+                    const auto newCommitter = committerAllocs[0] - allocsAtStart[1][0];
+                    const auto newWorker = workerAllocs[0] - allocsAtStart[0][0];
+                    std::fprintf(stderr, "[replay] loop %u: heap: committer %.1f allocations (%.0f bytes) per committed draw, worker %.1f allocations (%.0f bytes) per draw packet; %s sites (sampled):%s\n", loop, committed != 0 ? static_cast<double>(newCommitter) / static_cast<double>(committed) : 0.0, committed != 0 ? static_cast<double>(committerAllocs[1] - allocsAtStart[1][1]) / static_cast<double>(committed) : 0.0, packets != 0 ? static_cast<double>(newWorker) / static_cast<double>(packets) : 0.0, packets != 0 ? static_cast<double>(workerAllocs[1] - allocsAtStart[0][1]) / static_cast<double>(packets) : 0.0, ReplayAllocations::SampledRole() == static_cast<int>(AgcDriver::DriverThread::Committer) ? "committer" : "worker", ReplayAllocations::SiteReport(16).c_str());
+                }
+                if (ReplayCpuSamples::Enabled()) ReplayCpuSamples::Flush(loop);
+                flipCpu.clear();
+                std::fprintf(stderr, "[replay] loop %u: memory deltas written in %.1f ms (%.1f MiB)\n", loop, memoryMs, static_cast<double>(memoryBytes) / 1048576.0);
+                flipTimes.clear();
+            }
+            if (!finished) {
+                stuck = true;
+                break;
+            }
+        }
+        ReplaySettle();
+        if (options.png) waitForFrames();
+    }
+
+    std::shared_ptr<AgcDriver::IFlipRequest> ReserveFlip() {
+        return std::make_shared<ReplayFlip>(*this, nextFlip.fetch_add(1));
+    }
+
+    void FlipReady(std::uint64_t flip, const std::shared_ptr<AgcDriver::FrameTiming>& timing) {
+        {
+            std::lock_guard lock(flipTimesMutex);
+            if (flipTimes.size() <= flip) flipTimes.resize(static_cast<std::size_t>(flip) + 1);
+            flipTimes[static_cast<std::size_t>(flip)] = Clock::now();
+            if (flipCpu.size() <= flip) flipCpu.resize(static_cast<std::size_t>(flip) + 1, {-1, -1});
+            flipCpu[static_cast<std::size_t>(flip)] = DriverCpu();
+        }
+        PresentJob job;
+        job.timing = timing;
+        if (flip < presents.size()) job.present = presents[static_cast<std::size_t>(flip)];
+        if (job.present && job.present->hasBuffer && options.png && (loop == 0 || options.pngAllLoops)) job.dump = FramePath(*options.png, loop, flip).string();
+        presenter->Enqueue(std::move(job));
+    }
+
+    void NoteFailure(std::exception_ptr error) {
+        std::lock_guard lock(failureMutex);
+        if (!failure) failure = error;
+    }
+
+    bool Stuck() const { return stuck; }
+    const std::vector<std::optional<PresentEvent>>& Presents() const { return presents; }
+
+private:
+    void waitForFrames() {
+        const auto loops = options.pngAllLoops ? loop : std::min<std::uint32_t>(loop, 1);
+        for (std::uint32_t written = 0; written < loops; ++written) {
+            const auto flips = written < loopFlips.size() ? std::min<std::size_t>(presents.size(), static_cast<std::size_t>(loopFlips[written])) : presents.size();
+            for (std::size_t flip = 0; flip < flips; ++flip) {
+                if (!presents[flip] || !presents[flip]->hasBuffer) continue;
+                const auto path = FramePath(*options.png, written, flip);
+                if (!LoadPng(path, std::chrono::seconds(5))) std::fprintf(stderr, "[replay] %s was not written\n", path.string().c_str());
+            }
+        }
+    }
+
+    void setImageRange() {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+        for (std::size_t i = 0; i < prologueEnd; ++i) {
+            if (capture.events[i].type != EventType::AddressSpace) continue;
+            Reader reader(capture.events[i].payload);
+            static_cast<void>(reader.GetSpan<Backing>());
+            static_cast<void>(reader.GetSpan<Piece>());
+            for (const auto& piece : reader.GetSpan<Piece>()) {
+                if (piece.kind != PieceKind::External) continue;
+                if (!runs.empty() && piece.address >= runs.back().second && piece.address - runs.back().second < (16u << 20u)) runs.back().second = piece.address + piece.bytes;
+                else runs.emplace_back(piece.address, piece.address + piece.bytes);
+            }
+            break;
+        }
+#ifndef _WIN32
+        // No guest arena here: the span of the captured non-image pieces is where the driver caches page states (the
+        // checks otherwise reread /proc/self/maps every time). Protection changes below forget them (forget()).
+        {
+            std::uint64_t first = ~0ull;
+            std::uint64_t last = 0;
+            for (std::size_t i = 0; i < prologueEnd; ++i) {
+                if (capture.events[i].type != EventType::AddressSpace) continue;
+                Reader reader(capture.events[i].payload);
+                static_cast<void>(reader.GetSpan<Backing>());
+                static_cast<void>(reader.GetSpan<Piece>());
+                for (const auto& piece : reader.GetSpan<Piece>()) {
+                    if (piece.kind == PieceKind::External) continue;
+                    first = std::min<std::uint64_t>(first, piece.address);
+                    last = std::max<std::uint64_t>(last, piece.address + piece.bytes);
+                }
+                break;
+            }
+            if (first < last) {
+                AgcDriver::GuestMemory::SetGuestPagesRange(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first));
+                std::fprintf(stderr, "[replay] guest pages %s-%s (page-state cached)\n", Hex(first).c_str(), Hex(last).c_str());
+            }
+        }
+#endif
+        if (runs.empty()) return;
+        const auto largest = std::max_element(runs.begin(), runs.end(), [](const auto& a, const auto& b) { return a.second - a.first < b.second - b.first; });
+        AgcDriver::GuestMemory::SetImageRange(static_cast<std::uintptr_t>(largest->first), static_cast<std::size_t>(largest->second - largest->first));
+        std::fprintf(stderr, "[replay] guest image %s-%s (page-state cached as the game's main image)\n", Hex(largest->first).c_str(), Hex(largest->second).c_str());
+    }
+
+    void rethrowFailure() {
+        std::lock_guard lock(failureMutex);
+        if (failure) std::rethrow_exception(failure);
+    }
+
+    void apply(const Event& event) {
+        try {
+            applyEvent(event);
+        } catch (const std::exception& error) {
+            Fail("event " + std::to_string(&event - capture.events.data()) + " (type " + std::to_string(static_cast<std::uint32_t>(event.type)) + ", " + std::to_string(event.payload.size()) + " bytes): " + error.what());
+        }
+    }
+
+    void applyEvent(const Event& event) {
+        Reader reader(event.payload);
+        switch (event.type) {
+        case EventType::Begin:
+        case EventType::Present:
+        case EventType::End:
+            break;
+        case EventType::AddressSpace: {
+            const auto backings = reader.GetSpan<Backing>();
+            const auto removed = reader.GetSpan<Piece>();
+            const auto added = reader.GetSpan<Piece>();
+            const auto registryRemoved = reader.GetSpan<RegistryRange>();
+            const auto registryAdded = reader.GetSpan<RegistryRange>();
+            space.Apply(backings, removed, added, registryRemoved, registryAdded);
+            ++mappingChanges;
+            piecesMapped += added.size();
+            piecesUnmapped += removed.size();
+            break;
+        }
+        case EventType::Memory: {
+            const auto kind = reader.Get<MemoryKind>();
+            const auto runs = reader.GetSpan<MemoryRun>();
+            for (std::uint32_t queue = 0; queue < QueueCount && TracePacingMs() >= 0; ++queue) {
+                const auto awaited = ReplayQueueAwaited(queue) & ~std::uint64_t{3};
+                if (awaited == 0) continue;
+                Reader again(event.payload);
+                static_cast<void>(again.Get<MemoryKind>());
+                static_cast<void>(again.GetSpan<MemoryRun>());
+                const auto indices = again.GetSpan<std::uint32_t>();
+                std::size_t next = 0;
+                for (const auto& run : runs) {
+                    const auto end = run.address + static_cast<std::uint64_t>(run.pages) * PageBytes;
+                    if (awaited >= run.address && awaited < end) {
+                        const auto page = next + static_cast<std::size_t>((awaited - run.address) / PageBytes);
+                        std::uint32_t value = 0;
+                        if (page < indices.size()) std::memcpy(&value, capture.Page(indices[page]) + (awaited % PageBytes), sizeof(value));
+                        std::fprintf(stderr, "[pacing] memory event writes queue %u's awaited 0x%llx: 0x%x -> 0x%x\n", queue, static_cast<unsigned long long>(awaited), *reinterpret_cast<const volatile std::uint32_t*>(static_cast<std::uintptr_t>(awaited)), value);
+                    }
+                    next += run.pages;
+                }
+            }
+            const auto memoryStarted = Clock::now();
+            {
+                std::unique_lock replayWrites(ReplayMemoryWriteMutex());
+                writeRuns(runs, reader.GetSpan<std::uint32_t>(), false, options.deltaMerge && kind == MemoryKind::Delta);
+            }
+            memoryMs += std::chrono::duration<double, std::milli>(Clock::now() - memoryStarted).count();
+            for (const auto& run : runs) memoryBytes += static_cast<std::uint64_t>(run.pages) * PageBytes;
+            if (kind == MemoryKind::Base || kind == MemoryKind::Mapped) space.ApplyProtections();
+            break;
+        }
+        case EventType::Progress:
+            pace(reader.GetSpan<std::uint64_t>());
+            break;
+        case EventType::Submit: {
+            space.ApplyProtections();
+            const auto submit = reader.Get<SubmitEvent>();
+            const auto recorded = reader.GetSpan<std::uint32_t>();
+            // A submission the capture carried unfinished records the driver's copy of its commands; the
+            // game may have reused that command buffer before the capture began, so guest memory is
+            // brought back to the recorded words.
+            auto* guestWords = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(submit.packetAddress));
+            if (recorded.size() == submit.packetWords && HashWords(std::span<const std::uint32_t>(guestWords, submit.packetWords)) != submit.hash && HashWords(recorded) == submit.hash) {
+                std::memcpy(guestWords, recorded.data(), recorded.size_bytes());
+            }
+            if (TracePacingMs() >= 0) std::fprintf(stderr, "[pacing] submit queue %u, %u words at 0x%llx\n", submit.queue, submit.packetWords, static_cast<unsigned long long>(submit.packetAddress));
+            // A carried submission's hash covers its guest words, which the driver's copy may stop short of
+            // (at a REWIND, whose tail runs on its own): those words matching is the check.
+            if (recorded.size() != submit.packetWords || HashWords(std::span<const std::uint32_t>(guestWords, submit.packetWords)) != submit.hash) ReplayExpectCommands(submit.hash);
+            Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(submit.packetAddress)), submit.packetWords, 0, {}};
+            AgcDriver::Submit(&packet, submit.queue);
+            ++submits;
+            rethrowFailure();
+            break;
+        }
+        case EventType::RewindTail: {
+            const auto tail = reader.Get<RewindTailEvent>();
+            if (TracePacingMs() >= 0) std::fprintf(stderr, "[pacing] rewind tail queue %u, next tail 0x%llx\n", tail.queue, static_cast<unsigned long long>(tail.nextTail));
+            ReplayPushRewindTail(tail.queue, reader.GetSpan<std::uint32_t>(), tail.nextTail, tail.nextWords);
+            break;
+        }
+        case EventType::Suspend:
+            AgcDriverSuspendPoint_nid_postfix();
+            break;
+        case EventType::Shader: {
+            const auto codeAddress = reader.Get<std::uint64_t>();
+            const auto headerAddress = reader.Get<std::uint64_t>();
+            const auto type = reader.Get<std::uint8_t>();
+            const auto code = reader.GetSpan<std::uint32_t>();
+            ReplayRegisterShader(codeAddress, headerAddress, type, code, reader.GetSpan<std::byte>());
+            break;
+        }
+        case EventType::QueueState: {
+            const auto queue = reader.Get<std::uint32_t>();
+            ReplayRestoreQueueState(queue, reader.GetSpan<std::byte>());
+            break;
+        }
+        case EventType::DriverState: {
+            const bool reset = reader.Get<std::uint8_t>() != 0;
+            ReplayRestoreDriverState(reset, reader.GetSpan<std::byte>());
+            break;
+        }
+        case EventType::VideoOutput: {
+            const auto output = reader.Get<VideoOutputEvent>();
+            if (output.registered != 0) {
+                auto created = std::make_shared<ReplayOutput>(*this);
+                AgcDriverRegisterVideoOutput_nid_postfix(output.handle, created);
+                outputs[output.handle] = created;
+            } else {
+                const auto found = outputs.find(output.handle);
+                if (found == outputs.end()) Fail("capture unregisters an unknown video output");
+                AgcDriverUnregisterVideoOutput_nid_postfix(output.handle, found->second);
+                outputs.erase(found);
+            }
+            break;
+        }
+        default:
+            Fail("unknown capture event type " + std::to_string(static_cast<std::uint32_t>(event.type)));
+        }
+    }
+
+    // A delta (`merge`) writes only what the capture changed in each page since its last captured version;
+    // a base, a mapping or a restore writes whole pages.
+    // `track`: note the pages' captured contents in lastPage (what a later merged delta compares against); restore()
+    // does not, as it rewinds lastPage afterwards and a compare-first write never merges.
+    void writeRuns(std::span<const MemoryRun> runs, std::span<const std::uint32_t> indices, bool compareFirst, bool merge = false, bool track = true) {
+        std::size_t total = 0;
+        for (const auto& run : runs) total += run.pages;
+        if (total > indices.size()) Fail("capture memory event has fewer pages than its runs");
+        auto& addresses = writeAddresses;
+        addresses.clear();
+        addresses.reserve(total);
+        for (const auto& run : runs) {
+            if (compareFirst) AgcDriver::GuestMemory::FlushGpuWrites(run.address, static_cast<std::size_t>(run.pages) * PageBytes);
+            for (std::uint32_t page = 0; page < run.pages; ++page) addresses.push_back(run.address + static_cast<std::uint64_t>(page) * PageBytes);
+        }
+        constexpr std::uint64_t NoPage = std::uint64_t{1} << 32u;
+        auto& previous = writePrevious;
+        previous.assign(total, NoPage);
+        for (std::size_t i = 0; i < total && track; ++i) {
+            auto& last = lastPage[addresses[i]];
+            if (lastPageLogged) lastPageUndo.emplace_back(addresses[i], last);
+            if (merge && last != 0) previous[i] = last - 1;
+            last = std::uint64_t{indices[i]} + 1;
+        }
+        const auto writePage = [&](std::size_t i) {
+            if (previous[i] == NoPage) {
+                space.Write(addresses[i], capture.Page(indices[i]), PageBytes, compareFirst);
+            } else if (previous[i] != indices[i]) {
+                space.Write(addresses[i], capture.Page(indices[i]), PageBytes, false, true, capture.Page(static_cast<std::uint32_t>(previous[i])));
+            }
+        };
+        if (!compareFirst && total >= ParallelWritePages) {
+            // A large delta (a video frame, a streamed buffer): the game's threads wrote it alongside
+            // the GPU work, and the first store to each watched page costs a write-watch fault, so
+            // the pages are written by several threads. The event still completes before the next.
+            writers.Run((total + WriteChunkPages - 1) / WriteChunkPages, [&](std::size_t chunk) {
+                const auto end = std::min(total, (chunk + 1) * WriteChunkPages);
+                for (auto i = chunk * WriteChunkPages; i < end; ++i) writePage(i);
+            });
+            return;
+        }
+        for (std::size_t i = 0; i < total; ++i) writePage(i);
+    }
+
+    void pace(std::span<const std::uint64_t> target) {
+        if (!options.pacing) return;
+        const auto started = Clock::now();
+        std::optional<Clock::time_point> stalledAt;
+        for (;;) {
+            bool reached = true;
+            for (std::size_t queue = 0; queue < target.size() && queue < QueueCount; ++queue) {
+                if (target[queue] != 0 && ReplayPacketsExecuted(static_cast<std::uint32_t>(queue)) - base[queue] < target[queue]) {
+                    reached = false;
+                    break;
+                }
+            }
+            if (reached) break;
+            rethrowFailure();
+            if (ReplayStalled()) {
+                if (!stalledAt) stalledAt = Clock::now();
+                else if (Clock::now() - *stalledAt > std::chrono::milliseconds(2)) {
+                    ++stallReleases;
+                    break;
+                }
+            } else {
+                stalledAt.reset();
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        if (options.settle) ReplaySettle();
+        if (options.settle && options.hashCheck && hashPoints <= options.hashPointLimit) hashPoint("pacing point");
+        const auto waitedMs = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+        pacingMs += waitedMs;
+        const double traceMs = TracePacingMs();
+        if (traceMs >= 0 && waitedMs > traceMs) {
+            std::string text;
+            for (std::size_t queue = 0; queue < target.size() && queue < QueueCount; ++queue) {
+                if (target[queue] == 0) continue;
+                char item[96];
+                std::snprintf(item, sizeof(item), " queue %zu %llu/%llu", queue, static_cast<unsigned long long>(ReplayPacketsExecuted(static_cast<std::uint32_t>(queue)) - base[queue]), static_cast<unsigned long long>(target[queue]));
+                text += item;
+                if (const auto awaited = ReplayQueueAwaited(static_cast<std::uint32_t>(queue)); awaited != 0) {
+                    std::snprintf(item, sizeof(item), " (awaits 0x%llx = 0x%x)", static_cast<unsigned long long>(awaited), *reinterpret_cast<const volatile std::uint32_t*>(static_cast<std::uintptr_t>(awaited & ~std::uint64_t{3})));
+                    text += item;
+                }
+            }
+            std::fprintf(stderr, "[pacing] waited %.2f ms until%s\n", waitedMs, text.c_str());
+        }
+    }
+
+    // --dump-range: the range's guest bytes (GPU writes flushed) into range_<address>_loop<n>_<when>.bin.
+    // --hash-check: one hash per committed readable 64 KiB block of every registered range, GPU results
+    // flushed first. Loop 0 keeps each point's hashes; a later loop reports the blocks that differ at the
+    // same point (the first points in full, later ones as a count).
+    static constexpr std::uint64_t HashBlockBytes = 64 * 1024;
+
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> blockHashes() {
+        constexpr std::uint64_t BlockBytes = HashBlockBytes;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> hashes;
+        for (const auto& range : space.Registry()) {
+            if (!range.readable) continue;
+            const auto end = range.address + range.bytes;
+            for (auto cursor = range.address; cursor < end;) {
+                ReplayPlatform::Region info;
+                if (!ReplayPlatform::Query(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), info)) break;
+                const auto regionEnd = std::min<std::uint64_t>(end, info.base + info.bytes);
+                if (info.readable) {
+                    AgcDriver::GuestMemory::FlushGpuWrites(cursor, static_cast<std::size_t>(regionEnd - cursor));
+                    for (auto block = cursor; block < regionEnd; block = std::min(regionEnd, (block & ~(BlockBytes - 1)) + BlockBytes)) {
+                        const auto stop = std::min(regionEnd, (block & ~(BlockBytes - 1)) + BlockBytes);
+                        std::uint64_t hash = 0x9e3779b97f4a7c15ull;
+                        const auto* bytes = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(block));
+                        for (std::uint64_t at = 0; at + 8 <= stop - block; at += 8) {
+                            std::uint64_t word;
+                            std::memcpy(&word, bytes + at, sizeof(word));
+                            hash = (hash ^ word) * 0x100000001b3ull;
+                            hash ^= hash >> 29u;
+                        }
+                        hashes.emplace_back(block, hash);
+                    }
+                }
+                cursor = regionEnd;
+            }
+        }
+        return hashes;
+    }
+
+    // The blocks whose hashes differ between two block-hash lists, merged into ranges; `blocks` counts them.
+    static std::vector<std::pair<std::uint64_t, std::uint64_t>> differingRanges(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& reference, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& hashes, std::size_t& blocks) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> differing;
+        blocks = 0;
+        std::size_t r = 0;
+        for (const auto& [block, hash] : hashes) {
+            while (r < reference.size() && reference[r].first < block) ++r;
+            if (r < reference.size() && reference[r].first == block && reference[r].second == hash) continue;
+            ++blocks;
+            const auto blockEnd = (block & ~(HashBlockBytes - 1)) + HashBlockBytes;
+            if (!differing.empty() && differing.back().second >= block) differing.back().second = blockEnd;
+            else differing.emplace_back(block, blockEnd);
+        }
+        return differing;
+    }
+
+    static std::string rangeList(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::size_t limit) {
+        std::string text;
+        for (std::size_t i = 0; i < ranges.size() && i < limit; ++i) {
+            char item[64];
+            std::snprintf(item, sizeof(item), " %llx+%llx", static_cast<unsigned long long>(ranges[i].first), static_cast<unsigned long long>(ranges[i].second - ranges[i].first));
+            text += item;
+        }
+        if (ranges.size() > limit) text += " ...";
+        return text;
+    }
+
+    void hashPoint(const char* what) {
+        auto hashes = blockHashes();
+        const auto point = hashPoints++;
+        if (loop == 0) {
+            if (hashReference.size() <= point) hashReference.resize(point + 1);
+            hashReference[point] = std::move(hashes);
+            return;
+        }
+        if (point >= hashReference.size()) {
+            std::fprintf(stderr, "[hash] loop %u point %zu (%s): loop 0 has no such point\n", loop, point, what);
+            return;
+        }
+        std::size_t blocks = 0;
+        const auto differing = differingRanges(hashReference[point], hashes, blocks);
+        if (blocks == 0) return;
+        ++hashDifferingPoints;
+        const auto text = hashDifferingPoints <= 4 ? rangeList(differing, 24) : std::string();
+        std::fprintf(stderr, "[hash] loop %u point %zu (%s): %zu blocks differ from loop 0 in %zu ranges%s\n", loop, point, what, blocks, differing.size(), text.c_str());
+    }
+
+    // --flush-check: what a capture's base snapshot would miss. The memory as the access hook leaves it
+    // (every pending GPU result an access stores) against the memory after every cached texture is
+    // written back and dropped; a block that differs holds results the hook keeps on the GPU.
+    void flushCheck() {
+        ReplaySettle();
+        const auto hooked = blockHashes();
+        ReplayClearCaches(CacheTextures);
+        ReplaySettle();
+        std::size_t blocks = 0;
+        const auto differing = differingRanges(hooked, blockHashes(), blocks);
+        std::fprintf(stderr, "[flush-check] loop %u: %zu blocks change when every texture is written back, in %zu ranges%s\n", loop, blocks, differing.size(), rangeList(differing, 48).c_str());
+    }
+
+    void dumpRanges(const char* when) {
+        for (const auto& [address, bytes] : options.dumpRanges) {
+            AgcDriver::GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
+            char name[96];
+            std::snprintf(name, sizeof(name), "range_%llx_loop%u_%s.bin", static_cast<unsigned long long>(address), loop, when);
+            std::ofstream file(name, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(static_cast<std::uintptr_t>(address)), static_cast<std::streamsize>(bytes));
+        }
+    }
+
+    // --dump-bvh: scans the committed readable pages of every registered range for the RDNA BVH
+    // header ("PSR_BVHL" at a 256-byte boundary, size at +0x10) and writes each blob whole into
+    // DIR/bvh_<address>_<bytes>.bin, with an index (blobs.txt) of address, size and header words.
+    static bool committedReadable(std::uint64_t address, std::uint64_t bytes) {
+        for (auto cursor = address; cursor < address + bytes;) {
+            ReplayPlatform::Region info;
+            if (!ReplayPlatform::Query(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), info)) return false;
+            if (!info.readable) return false;
+            cursor = info.base + info.bytes;
+        }
+        return true;
+    }
+
+    void dumpBvhs() {
+        std::filesystem::create_directories(*options.dumpBvh);
+        std::ofstream index(*options.dumpBvh / "blobs.txt");
+        std::size_t count = 0;
+        std::uint64_t total = 0;
+        for (const auto& range : space.Registry()) {
+            if (!range.readable) continue;
+            std::uint64_t cursor = range.address;
+            const auto end = range.address + range.bytes;
+            while (cursor < end) {
+                ReplayPlatform::Region info;
+                if (!ReplayPlatform::Query(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), info)) break;
+                const auto regionEnd = std::min<std::uint64_t>(end, info.base + info.bytes);
+                const bool readable = info.readable;
+                if (readable) {
+                    for (auto at = (cursor + 255u) & ~std::uint64_t{255u}; at + 0x80 <= regionEnd; at += 256u) {
+                        const auto* bytes = reinterpret_cast<const char*>(static_cast<std::uintptr_t>(at));
+                        if (std::memcmp(bytes, "PSR_BVHL", 8) != 0) continue;
+                        std::uint64_t size = 0;
+                        std::memcpy(&size, bytes + 0x10, sizeof(size));
+                        if (size < 0x80 || size > (1ull << 30u) || at + size > end || !committedReadable(at, size)) continue;
+                        AgcDriver::GuestMemory::FlushGpuWrites(at, static_cast<std::size_t>(size));
+                        char name[96];
+                        std::snprintf(name, sizeof(name), "bvh_%llx_%llx.bin", static_cast<unsigned long long>(at), static_cast<unsigned long long>(size));
+                        std::ofstream(*options.dumpBvh / name, std::ios::binary).write(bytes, static_cast<std::streamsize>(size));
+                        index << std::hex << "0x" << at << " 0x" << size;
+                        for (std::uint32_t word = 0; word < 0x80; word += 8) {
+                            std::uint64_t value = 0;
+                            std::memcpy(&value, bytes + word, sizeof(value));
+                            index << " " << value;
+                        }
+                        index << "\n";
+                        ++count;
+                        total += size;
+                        at += (size - 1u) & ~std::uint64_t{255u};
+                    }
+                }
+                cursor = regionEnd;
+            }
+        }
+        std::fprintf(stderr, "[replay] --dump-bvh: %zu blobs (%.1f MiB) into %s\n", count, total / 1048576.0, options.dumpBvh->string().c_str());
+    }
+
+    bool drain() {
+        std::optional<Clock::time_point> stalledAt;
+        for (;;) {
+            if (ReplayDrain(std::chrono::milliseconds(100))) return true;
+            rethrowFailure();
+            if (!ReplayStalled()) {
+                stalledAt.reset();
+                continue;
+            }
+            if (!stalledAt) stalledAt = Clock::now();
+            else if (Clock::now() - *stalledAt > std::chrono::seconds(3)) return false;
+        }
+    }
+
+    // --free-run: the pages the game's CPU wrote during the capture (every delta page: command buffers,
+    // constants, labels) return to their base contents, so each loop runs the captured commands over the
+    // captured CPU data; everything else, the GPU-written surfaces and the driver's images, carries over from
+    // the previous loop, so temporal effects accumulate as in the game. Queue and driver state are restored.
+    void freeRunRestore() {
+        ReplaySettle();
+        if (!freeRunPagesBuilt) {
+            freeRunPagesBuilt = true;
+            std::unordered_set<std::uint64_t> deltaPages;
+            for (std::size_t i = prologueEnd; i < capture.events.size(); ++i) {
+                const auto& event = capture.events[i];
+                if (event.type != EventType::Memory) continue;
+                Reader reader(event.payload);
+                if (reader.Get<MemoryKind>() != MemoryKind::Delta) continue;
+                for (const auto& run : reader.GetSpan<MemoryRun>()) {
+                    for (std::uint32_t page = 0; page < run.pages; ++page) deltaPages.insert(run.address + static_cast<std::uint64_t>(page) * PageBytes);
+                }
+            }
+            for (std::size_t i = 0; i < prologueEnd; ++i) {
+                const auto& event = capture.events[i];
+                if (event.type != EventType::Memory) continue;
+                Reader reader(event.payload);
+                static_cast<void>(reader.Get<MemoryKind>());
+                const auto runs = reader.GetSpan<MemoryRun>();
+                const auto indices = reader.GetSpan<std::uint32_t>();
+                std::size_t next = 0;
+                for (const auto& run : runs) {
+                    for (std::uint32_t page = 0; page < run.pages; ++page, ++next) {
+                        const auto address = run.address + static_cast<std::uint64_t>(page) * PageBytes;
+                        if (next < indices.size() && deltaPages.count(address) != 0) freeRunPages.emplace_back(address, indices[next]);
+                    }
+                }
+            }
+            std::sort(freeRunPages.begin(), freeRunPages.end());
+            std::fprintf(stderr, "[replay] --free-run: %zu CPU-written pages return to their base contents each loop (%zu delta pages)\n", freeRunPages.size(), deltaPages.size());
+        }
+        space.restoredPages = 0;
+        space.restoredRanges.clear();
+        for (const auto& [address, index] : freeRunPages) {
+            AgcDriver::GuestMemory::FlushGpuWrites(address, PageBytes);
+            space.Write(address, capture.Page(index), PageBytes, true);
+        }
+        for (std::size_t i = 0; i < prologueEnd; ++i) {
+            const auto& event = capture.events[i];
+            if (event.type == EventType::QueueState || event.type == EventType::DriverState) apply(event);
+        }
+        for (auto it = lastPageUndo.rbegin(); it != lastPageUndo.rend(); ++it) {
+            if (it->second == 0) lastPage.erase(it->first);
+            else lastPage[it->first] = it->second;
+        }
+        lastPageUndo.clear();
+        space.ApplyProtections();
+        if (!space.restoredRanges.empty()) {
+            auto& ranges = space.restoredRanges;
+            std::sort(ranges.begin(), ranges.end());
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+            for (const auto& range : ranges) {
+                if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+                else merged.push_back(range);
+            }
+            ReplayCollectWrites(merged);
+        }
+        std::fprintf(stderr, "[replay] loop %u: free run, %llu CPU-written pages restored\n", loop, static_cast<unsigned long long>(space.restoredPages));
+    }
+
+    void restore() {
+        ReplaySettle();
+        if (options.cold != 0) {
+            const auto started = Clock::now();
+            ReplayClearCaches(options.cold);
+            std::fprintf(stderr, "[replay] loop %u: driver caches cleared (classes 0x%x) in %.1f ms\n", loop, options.cold, std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+        }
+        std::vector<Piece> removed;
+        std::vector<Piece> added;
+        std::set_difference(space.Pieces().begin(), space.Pieces().end(), initialPieces.begin(), initialPieces.end(), std::back_inserter(removed), PieceLess);
+        std::set_difference(initialPieces.begin(), initialPieces.end(), space.Pieces().begin(), space.Pieces().end(), std::back_inserter(added), PieceLess);
+        std::vector<RegistryRange> registryRemoved;
+        std::vector<RegistryRange> registryAdded;
+        std::set_difference(space.Registry().begin(), space.Registry().end(), initialRegistry.begin(), initialRegistry.end(), std::back_inserter(registryRemoved), RegistryLess);
+        std::set_difference(initialRegistry.begin(), initialRegistry.end(), space.Registry().begin(), space.Registry().end(), std::back_inserter(registryAdded), RegistryLess);
+        if (!removed.empty() || !added.empty() || !registryRemoved.empty() || !registryAdded.empty()) space.Apply({}, removed, added, registryRemoved, registryAdded);
+        space.restoredPages = 0;
+        space.restoredRanges.clear();
+        for (std::size_t i = 0; i < prologueEnd; ++i) {
+            const auto& event = capture.events[i];
+            Reader reader(event.payload);
+            if (event.type == EventType::Memory) {
+                static_cast<void>(reader.Get<MemoryKind>());
+                const auto runs = reader.GetSpan<MemoryRun>();
+                writeRuns(runs, reader.GetSpan<std::uint32_t>(), true, false, false);
+            } else if (event.type == EventType::QueueState || event.type == EventType::DriverState) {
+                apply(event);
+            }
+        }
+        for (auto it = lastPageUndo.rbegin(); it != lastPageUndo.rend(); ++it) {
+            if (it->second == 0) lastPage.erase(it->first);
+            else lastPage[it->first] = it->second;
+        }
+        lastPageUndo.clear();
+        space.ApplyProtections();
+        // The restore rewrites every page the loop changed, several times what the game writes
+        // between two frames: collected here, the write-watch walk and reset of those pages land in
+        // the setup instead of the first frame's lookups. They are stamped as written as before.
+        // --no-restore-collect leaves them to the frame.
+        if (options.restoreCollect && !space.restoredRanges.empty()) {
+            auto& ranges = space.restoredRanges;
+            std::sort(ranges.begin(), ranges.end());
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+            for (const auto& range : ranges) {
+                if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+                else merged.push_back(range);
+            }
+            ReplayCollectWrites(merged);
+        }
+        std::fprintf(stderr, "[replay] loop %u: restored %llu pages to the capture's start state\n", loop, static_cast<unsigned long long>(space.restoredPages));
+    }
+
+    const Options& options;
+    const CaptureFile& capture;
+    GuestSpace space;
+    std::vector<Piece> initialPieces;
+    std::vector<RegistryRange> initialRegistry;
+    std::vector<std::optional<PresentEvent>> presents;
+    std::size_t prologueEnd = 0;
+    std::unique_ptr<Presenter> presenter;
+    std::map<std::uint32_t, std::shared_ptr<ReplayOutput>> outputs;
+    std::array<std::uint64_t, QueueCount> base{};
+    std::atomic<std::uint64_t> nextFlip{0};
+    std::vector<std::uint64_t> loopFlips;
+    std::mutex flipTimesMutex;
+    std::vector<Clock::time_point> flipTimes;
+    // Per flip, and at the loop's start: the CPU ns of queue 0's worker and of the committer (-1: unknown).
+    std::vector<std::array<std::int64_t, 2>> flipCpu;
+    std::array<std::int64_t, 2> cpuAtStart{-1, -1};
+    std::uint64_t drawPacketsAtStart = 0;
+    std::uint64_t drawsCommittedAtStart = 0;
+    std::uint64_t batchesAtStart = 0;
+    std::array<std::array<std::uint64_t, 2>, 2> allocsAtStart{};
+
+    static std::array<std::int64_t, 2> DriverCpu() {
+        return {AgcDriver::DriverThreadCpuNs(AgcDriver::DriverThread::Queue0Worker), AgcDriver::DriverThreadCpuNs(AgcDriver::DriverThread::Committer)};
+    }
+    std::uint32_t loop = 0;
+    // --free-run: the delta pages with their base page index, built at the first free-run restore.
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> freeRunPages;
+    bool freeRunPagesBuilt = false;
+    // --hash-check: loop 0's block hashes per point, the point counter of the running loop, and how many points differed.
+    std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> hashReference;
+    std::size_t hashPoints = 0;
+    std::size_t hashDifferingPoints = 0;
+    double pacingMs = 0;
+    static constexpr std::size_t ParallelWritePages = 256;
+    static constexpr std::size_t WriteChunkPages = 64;
+    WritePool writers{3};
+    // The capture's memory deltas written during the loop (the game's CPU stores between submissions).
+    double memoryMs = 0;
+    std::uint64_t memoryBytes = 0;
+    std::uint64_t stallReleases = 0;
+    // Each written page's last captured version (page index + 1), at the loop's start and now.
+    // The changes to lastPage since the prologue, oldest first (address, value before; 0: none), rewound by restore().
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> lastPageUndo;
+    bool lastPageLogged = false;
+    // writeRuns' per-event buffers, kept for their capacity.
+    std::vector<std::uint64_t> writeAddresses;
+    std::vector<std::uint64_t> writePrevious;
+    std::unordered_map<std::uint64_t, std::uint64_t> lastPage;
+    std::uint64_t submits = 0;
+    std::uint64_t mappingChanges = 0;
+    std::uint64_t piecesMapped = 0;
+    std::uint64_t piecesUnmapped = 0;
+    bool stuck = false;
+    std::mutex failureMutex;
+    std::exception_ptr failure;
+};
+
+void ReplayFlip::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& timing) {
+    owner.FlipReady(flip, timing);
+}
+
+void ReplayFlip::Fail(std::exception_ptr error) noexcept {
+    owner.NoteFailure(error);
+}
+
+std::shared_ptr<AgcDriver::IFlipRequest> ReplayOutput::Reserve(const AgcDriver::FlipInfo&) {
+    return owner.ReserveFlip();
+}
+
+void ReplayOutput::Fail(std::exception_ptr error) noexcept {
+    owner.NoteFailure(error);
+}
+
+// Loop 0's frames decide the result; with --png-all-loops the later loops' frames are compared with the same
+// reference too ("loop N frame M"), for runs whose loops should repeat the capture.
+int Compare(const std::filesystem::path& replayed, const std::filesystem::path& reference, const std::vector<std::optional<PresentEvent>>& presents, std::uint32_t loops) {
+    std::fprintf(stderr, "[compare] %s against %s\n", replayed.string().c_str(), reference.string().c_str());
+    double worst = std::numeric_limits<double>::infinity();
+    std::size_t compared = 0;
+    std::size_t missing = 0;
+    for (std::uint32_t loop = 0; loop < loops; ++loop) {
+    char label[32];
+    if (loop == 0) label[0] = '\0';
+    else std::snprintf(label, sizeof(label), "loop %u ", loop);
+    for (std::size_t flip = 0; flip < presents.size(); ++flip) {
+        if (!presents[flip] || !presents[flip]->hasBuffer) continue;
+        if (loop != 0 && !std::filesystem::exists(FramePath(replayed, loop, flip))) continue;
+        const auto ours = LoadPng(FramePath(replayed, loop, flip), std::chrono::seconds(2));
+        const auto theirs = LoadPng(FramePath(reference, 0, flip), std::chrono::seconds(0));
+        if (!ours || !theirs) {
+            std::fprintf(stderr, "[compare] %sframe %zu: %s missing\n", label, flip, !ours ? "replayed frame" : "reference frame");
+            if (loop == 0) ++missing;
+            continue;
+        }
+        if (ours->width != theirs->width || ours->height != theirs->height) {
+            std::fprintf(stderr, "[compare] %sframe %zu: size %dx%d differs from the reference %dx%d\n", label, flip, ours->width, ours->height, theirs->width, theirs->height);
+            if (loop == 0) ++missing;
+            continue;
+        }
+        std::uint32_t maximum = 0;
+        double squared = 0;
+        double absolute = 0;
+        std::size_t differing = 0;
+        for (std::size_t pixel = 0; pixel < ours->pixels.size() / 4; ++pixel) {
+            std::uint32_t pixelMax = 0;
+            for (std::size_t channel = 0; channel < 3; ++channel) {
+                const auto difference = static_cast<std::uint32_t>(std::abs(static_cast<int>(ours->pixels[pixel * 4 + channel]) - static_cast<int>(theirs->pixels[pixel * 4 + channel])));
+                pixelMax = std::max(pixelMax, difference);
+                squared += static_cast<double>(difference) * difference;
+                absolute += difference;
+            }
+            maximum = std::max(maximum, pixelMax);
+            if (pixelMax > 8) ++differing;
+        }
+        // APS5_REPLAY_COMPARE_CURVE=1: the mean replayed channel value per 16-value band of the reference's, which
+        // tells a tone or transfer-function difference (a smooth curve) from content differences (noise).
+        static const bool curve = std::getenv("APS5_REPLAY_COMPARE_CURVE") != nullptr;
+        if (curve) {
+            std::array<double, 16> sums{};
+            std::array<std::uint64_t, 16> counts{};
+            for (std::size_t sample = 0; sample < ours->pixels.size(); ++sample) {
+                if (sample % 4 == 3) continue;
+                const auto band = theirs->pixels[sample] / 16u;
+                sums[band] += ours->pixels[sample];
+                ++counts[band];
+            }
+            std::string text;
+            for (std::size_t band = 0; band < 16; ++band) {
+                char item[32];
+                std::snprintf(item, sizeof(item), " %zu:%.0f", band * 16 + 8, counts[band] != 0 ? sums[band] / static_cast<double>(counts[band]) : -1.0);
+                text += item;
+            }
+            std::fprintf(stderr, "[compare] %sframe %zu curve (reference band centre: mean replayed):%s\n", label, flip, text.c_str());
+        }
+        const auto samples = static_cast<double>(ours->pixels.size() / 4 * 3);
+        const auto mse = squared / samples;
+        const auto psnr = mse == 0 ? std::numeric_limits<double>::infinity() : 10.0 * std::log10(255.0 * 255.0 / mse);
+        std::fprintf(stderr, "[compare] %sframe %zu: PSNR %.1f dB, mean |diff| %.2f, max %u, %.2f%% of pixels differ by more than 8\n", label, flip, psnr, absolute / samples, maximum, 100.0 * static_cast<double>(differing) / static_cast<double>(ours->pixels.size() / 4));
+        if (loop != 0) continue;
+        worst = std::min(worst, psnr);
+        ++compared;
+    }
+    }
+    std::fprintf(stderr, "[compare] %zu frames compared, %zu missing; worst PSNR %.1f dB\n", compared, missing, worst);
+    return missing == 0 ? 0 : 1;
+}
+
+std::uint32_t ParseCacheClasses(const std::string& list) {
+    static const std::map<std::string, std::uint32_t> names{{"dispatch", CacheDispatch}, {"draw", CacheDraw}, {"resources", CacheResources}, {"textures", CacheTextures}, {"tables", CacheTables}, {"space", CacheSpace}, {"all", CacheAll}, {"live", CacheLive}};
+    std::uint32_t classes = 0;
+    std::size_t start = 0;
+    while (start <= list.size()) {
+        const auto end = std::min(list.find(',', start), list.size());
+        const auto found = names.find(list.substr(start, end - start));
+        if (found == names.end()) Fail("unknown cache class '" + list.substr(start, end - start) + "' (live, all, dispatch, draw, resources, textures, tables, space)");
+        classes |= found->second;
+        start = end + 1;
+    }
+    return classes;
+}
+
+Options ParseOptions(int argc, char** argv) {
+    Options options;
+    const auto usage = [] {
+        Fail("usage: agc_frame_replay <capture dir> [--loop N] [--png DIR] [--png-scale N] [--png-all-loops] [--compare DIR] [--no-pacing] [--loop-skips FILE] [--settle] [--hash-check[=N]] [--flush-check] [--free-run] [--hidden] [--summary] [--shader-cache DIR] [--cold[=live|all|dispatch,draw,resources,textures,tables,space]]");
+    };
+    if (argc < 2) usage();
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument = argv[i];
+        const auto value = [&]() -> std::string {
+            if (i + 1 >= argc) usage();
+            return argv[++i];
+        };
+        if (argument == "--loop") options.loops = static_cast<std::uint32_t>(std::stoul(value()));
+        else if (argument == "--for-seconds") options.forSeconds = std::stod(value());
+        else if (argument == "--png") options.png = value();
+        else if (argument == "--png-scale") options.pngScale = static_cast<std::uint32_t>(std::stoul(value()));
+        else if (argument == "--png-all-loops") options.pngAllLoops = true;
+        else if (argument == "--compare") options.compare = value();
+        else if (argument == "--no-pacing") options.pacing = false;
+        else if (argument == "--no-restore-collect") options.restoreCollect = false;
+        else if (argument == "--no-delta-merge") options.deltaMerge = false;
+        else if (argument == "--dump-range") {
+            const auto text = value();
+            const auto colon = text.find(':');
+            if (colon == std::string::npos) Fail("--dump-range takes <hex address>:<hex bytes>");
+            options.dumpRanges.emplace_back(std::stoull(text.substr(0, colon), nullptr, 16), std::stoull(text.substr(colon + 1), nullptr, 16));
+        }
+        else if (argument == "--loop-skips") {
+            std::ifstream file(value());
+            if (!file) Fail("--loop-skips: cannot read the file");
+            for (std::string line; std::getline(file, line);) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+                options.loopSkips.push_back(line);
+            }
+            if (options.loopSkips.empty()) Fail("--loop-skips: the file has no lines");
+        }
+        else if (argument == "--dump-bvh") options.dumpBvh = std::filesystem::path(value());
+        else if (argument == "--settle") options.settle = true;
+        else if (argument == "--hash-check") options.hashCheck = true;
+        else if (argument == "--flush-check") options.flushCheck = true;
+        else if (argument == "--free-run") options.freeRun = true;
+        else if (argument.rfind("--hash-check=", 0) == 0) {
+            options.hashCheck = true;
+            options.hashPointLimit = std::stoull(argument.substr(13));
+        }
+        else if (argument == "--hidden") options.hidden = true;
+        else if (argument == "--summary") options.summary = true;
+        else if (argument == "--shader-cache") options.shaderCache = value();
+        else if (argument == "--cold") options.cold = CacheLive;
+        else if (argument.starts_with("--cold=")) options.cold = ParseCacheClasses(argument.substr(7));
+        else if (!argument.starts_with("--") && options.capture.empty()) options.capture = argument;
+        else usage();
+    }
+    if (options.capture.empty() || options.loops == 0 || options.pngScale == 0) usage();
+    if (options.png && !options.compare && std::filesystem::exists(options.capture / "live")) options.compare = options.capture / "live";
+    return options;
+}
+
+}
+
+int Summarize(const CaptureFile& capture) {
+    static constexpr std::array<const char*, 14> Names{"?", "Begin", "AddressSpace", "Memory", "Progress", "Submit", "Suspend", "Shader", "QueueState", "DriverState", "VideoOutput", "Present", "End", "RewindTail"};
+    std::map<std::uint32_t, std::pair<std::size_t, std::uint64_t>> counts;
+    for (const auto& event : capture.events) {
+        auto& [count, bytes] = counts[static_cast<std::uint32_t>(event.type)];
+        ++count;
+        bytes += event.payload.size();
+    }
+    std::printf("%zu events, %llu pages in pages.bin\n", capture.events.size(), static_cast<unsigned long long>(capture.PageCount()));
+    for (const auto& [type, entry] : counts) std::printf("  %-12s %8zu events %12llu bytes\n", type < Names.size() ? Names[type] : "unknown", entry.first, static_cast<unsigned long long>(entry.second));
+    // Each present's place among the Present calls (`flip`) beside the flip its serial names (the replay's flip index
+    // under APS5_REPLAY_FLIP_SERIALS): a difference is the numbering skew of B8c.
+    std::uint64_t flipsBefore = 0;
+    for (const auto& event : capture.events) {
+        if (event.type == EventType::Begin) {
+            Reader reader(event.payload);
+            flipsBefore = reader.Get<BeginEvent>().flipsBefore;
+            std::printf("begin: capture starts after flip %llu\n", static_cast<unsigned long long>(flipsBefore));
+        }
+        if (event.type != EventType::Present) continue;
+        Reader reader(event.payload);
+        const auto present = reader.Get<PresentEvent>();
+        std::uint64_t serial = 0;
+        for (std::size_t k = 0; k < sizeof(present.flipSerial); ++k) serial |= static_cast<std::uint64_t>(present.flipSerial[k]) << (8u * k);
+        if (serial == 0) std::printf("  present %llu: no flip serial%s\n", static_cast<unsigned long long>(present.flip), present.hasBuffer ? "" : ", no buffer");
+        else std::printf("  present %llu: flip serial %llu (replay flip %lld)%s\n", static_cast<unsigned long long>(present.flip), static_cast<unsigned long long>(serial), static_cast<long long>(serial) - 1 - static_cast<long long>(flipsBefore), present.hasBuffer ? "" : ", no buffer");
+    }
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    try {
+        ReplayPlatform::DisablePowerThrottling();
+        const auto options = ParseOptions(argc, argv);
+        if (options.shaderCache && !ReplayPlatform::SetEnvironment("ANYPS5_SHADER_CACHE_DIR", *options.shaderCache)) Fail("cannot set ANYPS5_SHADER_CACHE_DIR");
+        CaptureFile capture(options.capture);
+        if (options.summary) return Summarize(capture);
+        Replayer replayer(options, capture);
+        replayer.Run();
+        int status = replayer.Stuck() || ReplayCommandMismatches() != 0 ? 2 : 0;
+        if (options.png && options.compare) status = std::max(status, Compare(*options.png, *options.compare, replayer.Presents(), options.pngAllLoops ? options.loops : 1));
+        std::fflush(stdout);
+        std::fflush(stderr);
+        ReplayPlatform::Exit(status);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
+        return 1;
+    }
+}

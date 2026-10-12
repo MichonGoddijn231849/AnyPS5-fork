@@ -35,16 +35,21 @@ struct Counts {
     std::size_t calls = 0;
     std::size_t functions = 0;
     std::size_t notInlined = 0;
+    std::size_t sharedWords = 0;
 };
 
 Counts Count(std::span<const std::uint32_t> words) {
     Check(words.size() >= 5 && words[0] == spv::MagicNumber, "formatted buffer once: missing SPIR-V module");
     Counts counts{words.size()};
+    bool shared = false;
     for (std::size_t offset = 5; offset < words.size();) {
         const auto count = words[offset] >> spv::WordCountShift;
         Check(count != 0 && count <= words.size() - offset, "formatted buffer once: malformed SPIR-V instruction");
         const auto opcode = words[offset] & spv::OpCodeMask;
-        if (opcode == spv::OpSwitch) ++counts.switches;
+        if (opcode == spv::OpFunction) shared = count > 3 && (words[offset + 3] & spv::FunctionControlDontInlineMask) != 0;
+        if (shared) counts.sharedWords += count;
+        if (opcode == spv::OpFunctionEnd) shared = false;
+        if (opcode == spv::OpSwitch && count > 3) ++counts.switches;
         if (opcode == spv::OpFunctionCall) ++counts.calls;
         if (opcode == spv::OpFunction) {
             ++counts.functions;
@@ -93,12 +98,12 @@ int main() {
         const auto storeThree = Compile(3, true);
         Check(storeOne.functions == none.functions + 2 && storeOne.calls == none.calls + 2, "formatted buffer once: a formatted load and a formatted store to another resource emitted " + std::to_string(storeOne.functions - none.functions) + " functions and " + std::to_string(storeOne.calls - none.calls) + " calls more than none, expected one function and one call each");
         Check(storeThree.functions == storeOne.functions && storeThree.calls == storeOne.calls + 4 && storeThree.switches == storeOne.switches, "formatted buffer once: two more formatted loads and stores emitted " + std::to_string(storeThree.functions - storeOne.functions) + " functions, " + std::to_string(storeThree.calls - storeOne.calls) + " calls and " + std::to_string(storeThree.switches - storeOne.switches) + " switches more, expected four calls only");
-        Check(three.words - one.words < one.words / 10u, "formatted buffer once: 2 more formatted loads added " + std::to_string(three.words - one.words) + " SPIR-V words to a " + std::to_string(one.words) + "-word module");
+        Check(three.words - one.words < one.sharedWords, "formatted buffer once: 2 more formatted loads added " + std::to_string(three.words - one.words) + " SPIR-V words, more than the " + std::to_string(one.sharedWords) + "-word shared access they call");
         const auto gpuOne = Compile(1, false, true);
         const auto gpuThree = Compile(3, false, true);
         Check(gpuThree.functions == gpuOne.functions && gpuThree.calls > gpuOne.calls, "formatted buffer once: two more formatted loads from a GPU-selected descriptor emitted " + std::to_string(gpuThree.functions - gpuOne.functions) + " more functions, expected calls to the shared one");
         Check(gpuThree.switches == gpuOne.switches, "formatted buffer once: two more formatted loads from a GPU-selected descriptor emitted " + std::to_string(gpuThree.switches - gpuOne.switches) + " more format switches");
-        Check(gpuThree.words - gpuOne.words < gpuOne.words / 10u, "formatted buffer once: 2 more formatted loads from a GPU-selected descriptor added " + std::to_string(gpuThree.words - gpuOne.words) + " SPIR-V words to a " + std::to_string(gpuOne.words) + "-word module");
+        Check(gpuThree.words - gpuOne.words < gpuOne.sharedWords, "formatted buffer once: 2 more formatted loads from a GPU-selected descriptor added " + std::to_string(gpuThree.words - gpuOne.words) + " SPIR-V words, more than the " + std::to_string(gpuOne.sharedWords) + "-word shared access they call");
         std::printf("formatted buffer once tests passed (%zu words for 1 load, %zu for 3; GPU-selected %zu and %zu)\n", one.words, three.words, gpuOne.words, gpuThree.words);
         return 0;
     } catch (const std::exception& error) {

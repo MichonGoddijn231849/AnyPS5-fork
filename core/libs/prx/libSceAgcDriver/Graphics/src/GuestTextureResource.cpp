@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -47,6 +48,24 @@ TextureDimension resolveDimension(std::uint32_t raw) {
     }
 }
 
+}
+
+bool IsNullTextureDescriptor(std::span<const std::uint32_t> words, bool baseZeroIsNull) {
+    if (words.size() != 8) return false;
+    if (baseZeroIsNull && words[0] == 0u && (words[1] & 0xffu) == 0u) return true;
+    return std::all_of(words.begin(), words.end(), [](std::uint32_t word) { return word == 0; });
+}
+
+bool IsNullTextureDescriptor(std::span<const std::uint32_t> words) {
+    // APS5_NULL_UNRESOLVED_IMAGES=1 (Wolverine bring-up): a T# with no base address (Wolverine's meshlet draws into the
+    // scene color bind some) is the null descriptor too, so the draw runs and reads zeros, as reads of the unmapped
+    // page at address 0 return without page faults; otherwise the draw is refused.
+    // TODO(debt): the zero reads are an assumption about the PS5's fault setting, not a measured result.
+    static const bool baseZeroIsNull = [] {
+        const char* text = std::getenv("APS5_NULL_UNRESOLVED_IMAGES");
+        return text != nullptr && text[0] != '\0' && text[0] != '0';
+    }();
+    return IsNullTextureDescriptor(words, baseZeroIsNull);
 }
 
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words) {

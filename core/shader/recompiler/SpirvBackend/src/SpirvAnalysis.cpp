@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvAnalysis.hpp"
+#include "RdnaDecoder/RdnaInstruction.hpp"
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
@@ -8,6 +9,26 @@
 namespace ShaderRecompiler {
 
 namespace {
+
+bool ReadsNeighbourLanes(const IrProgram& program, const IrValue& inst) {
+    switch (inst.Opcode()) {
+    case IrOpcode::ImageQueryLod:
+    case IrOpcode::DppMoveU32:
+    case IrOpcode::DppUpdateU32:
+    case IrOpcode::SwizzleU32:
+    case IrOpcode::BpermuteU32:
+    case IrOpcode::Permlane16U32:
+    case IrOpcode::ReadLane:
+        return true;
+    case IrOpcode::ImageSampleImplicitLod:
+    case IrOpcode::ImageSampleRaw: {
+        const auto flags = program.Resources().memoryInfo.at(inst.Flags<MemoryFlags>().index).imageSampleFlags;
+        return (flags & (RdnaImageSampleFlagDerivative | RdnaImageSampleFlagLod | RdnaImageSampleFlagLevelZero)) == 0u;
+    }
+    default:
+        return false;
+    }
+}
 
 bool UniformSource(const IrValue& value) {
     switch (value.Opcode()) {
@@ -325,6 +346,10 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                     }
                     requirements.functionScratch = true;
                 }
+                // A compute FLAT access may reach the private aperture (see RoutesApertures).
+                if (program.Resources().memoryInfo.at(memoryIndex).kind == ResourceKind::Flat && program.Resources().stage == IrShaderStage::Compute && program.Info().scratchDwords != 0u) {
+                    requirements.functionScratch = true;
+                }
             }
             if (BufferAccessOf(inst->Opcode()) != BufferAccess::None) {
                 const auto memoryIndex = inst->Flags<MemoryFlags>().index;
@@ -362,6 +387,7 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                     requirements.subgroupLocalInvocationId = true;
                 }
             }
+            requirements.neighbourLaneReads = requirements.neighbourLaneReads || ReadsNeighbourLanes(program, *inst);
             switch (inst->Opcode()) {
             case IrOpcode::Ballot:
                 requirements.subgroupBallot = true;

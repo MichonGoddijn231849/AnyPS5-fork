@@ -62,7 +62,6 @@ void DefineBdaFaultFunction(SpirvEmitterState& state) {
         store(4, bytes);
         store(5, ConstantU32(state, static_cast<std::uint32_t>(state.program.Resources().stage)));
         store(6, instruction);
-        store(7, ConstantU32(state, 0u));
         const auto release = ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask);
         state.module.AddFunction(spv::OpAtomicStore, pointer, scope, release, ConstantU32(state, static_cast<std::uint32_t>(BdaAbi::FaultState::Ready)));
     });

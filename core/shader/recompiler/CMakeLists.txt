@@ -34,6 +34,8 @@ function(add_shader_recompiler target runtimeTarget)
 
     add_library(${target} STATIC EXCLUDE_FROM_ALL
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Recompiler.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/DeepStack.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/WideFeedback.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderDiskCache.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/RectListShaders.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/BarycentricGeometryShader.cpp
@@ -48,6 +50,7 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/RdnaDecoder/src/RdnaDescriptorFormat.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ControlFlow/src/ControlFlowGraph.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ControlFlow/src/GraphBuilder.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ControlFlow/src/SubroutineCalls.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ControlFlow/src/Structurizer.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ControlFlow/src/RequestSerializer.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/IntermediateRepresentation/src/IrType.cpp
@@ -212,10 +215,12 @@ function(add_shader_recompiler target runtimeTarget)
             BuildBarycentricGeometryShader
             BuildPreparedShaderKey
             BuildRectListShaders
+            CallUserData
             CaptureResources
             DebugProbeActive
             DepthBitsTextureWidth
             HashBytes
+            RecompileCacheKey::HashCode
             PixelInput
             PixelInputBit
             RayTracingStrict
@@ -231,11 +236,18 @@ function(add_shader_recompiler target runtimeTarget)
             GetPreparedArtifact
             MaterializeShader
             ResolveSource
+            ResourceMaterializer::EvaluateNanoseconds
+            ResourceMaterializer::MaterializeNanoseconds
+            ResourceMaterializer::SetBindlessTableLimit
             ResourceMaterializer::SpecializationNanoseconds
+            ResourceMaterializer::WideBindless
+            WideFeedback::SetMemory
             RuntimeAbi::RequireVersion
             RuntimeAbi::HeapCapacity
+            RuntimeAbi::IsWideImages
             SetDebugProbeActive
             ShaderCacheDirectory
+            SubroutineCallsEnabled
             SrgbDecodeBit
             SrgbUnormFormat
             ThreadOwned

@@ -5,6 +5,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -29,7 +30,24 @@ inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
 }
 
+// Debug aid: APS5_GPU_CHECKPOINTS=1 records a VK_NV_device_diagnostic_checkpoints marker (the
+// program address) before each guest dispatch; a device loss reports the last ones the GPU reached.
+inline PFN_vkCmdSetCheckpointNV& CheckpointMarker() {
+    static PFN_vkCmdSetCheckpointNV marker = nullptr;
+    return marker;
+}
+
+// Reports why the device was lost (VK_EXT_device_fault), set once the device supports it.
+inline void (*&DeviceLostHook())() {
+    static void (*hook)() = nullptr;
+    return hook;
+}
+
 inline void Check(VkResult result, const char* operation) {
+    if (result == VK_ERROR_DEVICE_LOST && DeviceLostHook() != nullptr) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) DeviceLostHook()();
+    }
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
 
@@ -143,6 +161,8 @@ struct Context {
     bool nonSeamlessCubeMap = false;
     bool conservativeRasterization = false;
     VkBuffer emptyBuffer = VK_NULL_HANDLE;
+    // The wide bindless feedback buffer (ShaderRecompiler::WideFeedback), host-visible.
+    VkBuffer wideFeedback = VK_NULL_HANDLE;
     // The device's list of recorded dispatches whose copied written buffers await a CPU write-back
     // (VulkanDevice's State::copiedWriters; the draw counterpart is DrawCopiedWriters): an indirect
     // draw whose records one of them produces reads them on the CPU. Null in tests.
@@ -157,6 +177,7 @@ struct Context {
     bool geometryShader = false;
     bool sampleRateShading = false;
     bool nullDescriptors = false;
+    bool demoteToHelperInvocation = false;
     bool bufferInt64Atomics = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;

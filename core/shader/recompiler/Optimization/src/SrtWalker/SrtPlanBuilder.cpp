@@ -43,29 +43,54 @@ void PlanBuilder::Run() {
     PatchReads();
 }
 
+// Depth first over the arguments, each value finished after its arguments (the order the recursive form had), with an
+// explicit stack: inlined subroutine calls (a function table's eleven callees in Wolverine's 0x11d049aa00) make argument
+// chains thousands deep, past a thread's stack.
 void PlanBuilder::Collect(IrValue* raw, std::uint32_t usePc) {
-    IrValue* value = raw->Resolve();
-    if (value->Opcode() == IrOpcode::Void) {
-        return;
-    }
-    IrValue* inst = value;
-    const auto cycle = std::find(_visiting.begin(), _visiting.end(), inst);
-    if (cycle != _visiting.end()) {
-        const auto containsPhi = std::any_of(cycle, _visiting.end(), [](IrValue* candidate) { return candidate->Opcode() == IrOpcode::Phi; });
-        if (containsPhi) {
+    struct Frame {
+        IrValue* inst;
+        std::size_t next;
+    };
+    std::vector<Frame> stack;
+    const auto enter = [&](IrValue* argument) {
+        IrValue* inst = argument->Resolve();
+        if (inst->Opcode() == IrOpcode::Void) {
             return;
         }
-        Fail(_program.Resources(), usePc, "cyclic typed planning value " + std::string(IrOpcodeName(inst->Opcode())) + " without a phi");
+        if (_visitingSet.contains(inst)) {
+            const auto cycle = std::find(_visiting.begin(), _visiting.end(), inst);
+            const auto containsPhi = std::any_of(cycle, _visiting.end(), [](IrValue* candidate) { return candidate->Opcode() == IrOpcode::Phi; });
+            if (containsPhi) {
+                return;
+            }
+            Fail(_program.Resources(), usePc, "cyclic typed planning value " + std::string(IrOpcodeName(inst->Opcode())) + " without a phi");
+        }
+        if (_visited.contains(inst)) {
+            return;
+        }
+        _visiting.push_back(inst);
+        _visitingSet.insert(inst);
+        stack.push_back({inst, 0});
+    };
+    enter(raw);
+    while (!stack.empty()) {
+        auto& frame = stack.back();
+        if (frame.next < frame.inst->ArgumentCount()) {
+            IrValue* argument = frame.inst->Argument(frame.next++);
+            enter(argument);
+            continue;
+        }
+        IrValue* inst = frame.inst;
+        stack.pop_back();
+        _visiting.pop_back();
+        _visitingSet.erase(inst);
+        _visited.insert(inst);
+        Finish(inst, usePc);
     }
-    if (std::find(_visited.begin(), _visited.end(), inst) != _visited.end()) {
-        return;
-    }
-    _visiting.push_back(inst);
-    for (std::size_t index = 0; index < inst->ArgumentCount(); index++) {
-        Collect(inst->Argument(index), usePc);
-    }
-    _visiting.pop_back();
-    _visited.push_back(inst);
+}
+
+void PlanBuilder::Finish(IrValue* inst, [[maybe_unused]] std::uint32_t usePc) {
+    IrValue* value = inst;
     if (!IsRawRead(_program.Resources(), *inst)) {
         return;
     }

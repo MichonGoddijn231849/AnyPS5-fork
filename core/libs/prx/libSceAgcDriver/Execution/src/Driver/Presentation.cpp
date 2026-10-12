@@ -14,6 +14,7 @@ void Driver::RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVi
     rethrowFailure();
     checkStopping();
     require(outputs.emplace(handle, output).second, "video output already registered");
+    recordVideoOutput(handle, true);
 }
 
 void Driver::UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
@@ -21,6 +22,19 @@ void Driver::UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<I
     const auto it = outputs.find(handle);
     require(it != outputs.end() && it->second == output, "video output registration mismatch");
     outputs.erase(it);
+    recordVideoOutput(handle, false);
+}
+
+void Driver::recordVideoOutput(std::uint32_t handle, bool registered) {
+    auto& capture = Capture::FrameCapture::Get();
+    if (!capture.Recording()) return;
+    try {
+        Capture::Writer writer;
+        writer.Put(Capture::VideoOutputEvent{handle, registered ? 1u : 0u});
+        capture.RecordEvent(Capture::EventType::VideoOutput, writer.data);
+    } catch (const std::exception& error) {
+        captureFailed(error);
+    }
 }
 
 void Driver::AttachWindow(const PresentationWindow& window) {
@@ -54,6 +68,12 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     static const std::size_t inFlight = VulkanDevice::FlipInFlight();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::shared_ptr<VulkanDevice> presenting;
+    std::string dumpPath;
+    try {
+        Capture::FrameCapture::Get().NotePresent(buffer, opaque, dumpPath, window.timing != nullptr ? window.timing->Id() : 0);
+    } catch (const std::exception& error) {
+        captureFailed(error);
+    }
     timing.Mark("validate");
     try {
         bool submitted = false;
@@ -94,6 +114,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                     presenting->WaitIdle();
                     timing.Mark("device_idle_wait");
                 }
+                if (!dumpPath.empty()) VulkanDevice::DumpNextPresent(dumpPath, 1);
                 submitted = presenting->PresentDisplayBuffer(*buffer);
                 timing.Mark("present_display_buffer");
             } else {

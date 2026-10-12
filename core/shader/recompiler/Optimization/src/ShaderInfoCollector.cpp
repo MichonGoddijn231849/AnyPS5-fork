@@ -102,7 +102,7 @@ void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inpu
                         return Fail("interpolation parameter reference is invalid");
                     }
                     if (input->ImmediateU32() >= inputInfo.pixel->inputNum || component->ImmediateU32() >= 4u || mode->ImmediateU32() >= 3u) {
-                        return Fail("interpolation parameter reference is out of range");
+                        return Fail("interpolation parameter reference is out of range (attribute " + std::to_string(input->ImmediateU32()) + " component " + std::to_string(component->ImmediateU32()) + " mode " + std::to_string(mode->ImmediateU32()) + ", " + std::to_string(inputInfo.pixel->inputNum) + " inputs)");
                     }
                     break;
                 }
@@ -234,7 +234,7 @@ bool IsPixelParameterFlat(const ShaderPixelInputInfo& pixel, std::uint32_t input
 }
 
 void CollectPixelInputs(const IrProgram& program, const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
-    if (pixel->HasPositionInput()) {
+    if (pixel->HasPositionInput() || pixel->quadPixelMask != 0xf) {
         AddInput(info, StageInputKind::FragCoord, 0, 4, "gl_FragCoord");
     }
     if (pixel->psFrontFace) {
@@ -404,6 +404,9 @@ void CollectOutputs(const IrProgram& program, ShaderStageInputInfo inputInfo, Sh
             if (exportInfo.kind == ExportTargetKind::MrtZ) {
                 if (program.Resources().stage == IrShaderStage::Pixel && (exportInfo.en & 0x1u) != 0u && inputInfo.pixel->psDepthExportEnable) {
                     AddOutput(info, StageOutputKind::Depth, 0, 0, "gl_FragDepth");
+                }
+                if (program.Resources().stage == IrShaderStage::Pixel && (exportInfo.en & 0x2u) != 0u && inputInfo.pixel->psStencilExportEnable) {
+                    AddOutput(info, StageOutputKind::StencilRef, 0, 0, "gl_FragStencilRefARB");
                 }
                 if (program.Resources().stage == IrShaderStage::Pixel && (exportInfo.en & 0x4u) != 0u && inputInfo.pixel->psSampleMaskExportEnable) {
                     AddOutput(info, StageOutputKind::SampleMask, 0, 0, "gl_SampleMask");

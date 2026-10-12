@@ -19,6 +19,16 @@ std::array<IrU32, 2> TranslationContext::readU32Pair(const RdnaOperand& operand)
             const auto bits = std::bit_cast<std::uint64_t>(static_cast<double>(std::bit_cast<float>(operand.value)));
             return {IrU32(ir.Constant(static_cast<std::uint32_t>(bits))), IrU32(ir.Constant(static_cast<std::uint32_t>(bits >> 32u)))};
         }
+        case RdnaOperandKind::ApertureRegister: {
+            // The apertures the FLAT routing uses (SpirvMemoryInstructions.cpp): 4 GB windows whose high dwords are
+            // 0x80000000 (shared, LDS) and 0x70000000 (private, scratch), so a base is the high dword over a zero
+            // low dword and a limit the same high dword over 0xffffffff, as gfx9+ hardware reports them
+            // (src_shared_limit = src_shared_base | 0xffffffff, kfd_flat_memory.c).
+            // TODO(debt): the console's aperture high dwords are inferred from GTA V's traversal addresses.
+            const bool shared = operand.reg == 235u || operand.reg == 236u;
+            const bool limit = operand.reg == 236u || operand.reg == 238u;
+            return {IrU32(ir.Constant(limit ? 0xffffffffu : 0u)), IrU32(ir.Constant(shared ? 0x80000000u : 0x70000000u))};
+        }
         default: return {readU32(operand), readU32(offsetOperand(operand, 1u))};
     }
 }

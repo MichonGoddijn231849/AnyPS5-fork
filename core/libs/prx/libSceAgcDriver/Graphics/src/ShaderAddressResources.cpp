@@ -38,6 +38,10 @@ VkDescriptorBufferInfo ShaderResources::descriptor(Allocation& allocation) {
         Require(context.emptyBuffer != VK_NULL_HANDLE, "no placeholder buffer for a null V#");
         return {context.emptyBuffer, 0, allocation.size};
     }
+    if (allocation.role == ShaderRecompiler::DescriptorRole::WideFeedback) {
+        Require(context.wideFeedback != VK_NULL_HANDLE, "no wide bindless feedback buffer");
+        return {context.wideFeedback, 0, VK_WHOLE_SIZE};
+    }
     if (allocation.role == ShaderRecompiler::DescriptorRole::BdaPagetable || allocation.role == ShaderRecompiler::DescriptorRole::FaultBuffer) {
         Require(bda != nullptr, "BDA descriptors have no memory owner");
         return allocation.role == ShaderRecompiler::DescriptorRole::BdaPagetable ? bda->Table() : bda->Fault();

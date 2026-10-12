@@ -31,7 +31,11 @@ struct HostImport {
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
     bool unwatched = false;
+    mutable std::uint64_t lastUse = 0;
     bool dmaBuf = false;
+    // A whole-range import for a descriptor that binds the range (see UploadFinish): least-recently-used eviction
+    // passes it by, since its cells could not be merged back while recorded work holds them.
+    mutable bool pinned = false;
     std::shared_ptr<void> chunk;
 };
 
@@ -50,6 +54,15 @@ ImportProbe ProbeImportWriteProtection(const Context& context);
 ImportProbe ProbeDmaBufImportWriteProtection(const Context& context);
 ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);
+
+std::uint64_t RelieveGpuMemory(const Context& context);
+// Debug aid (APS5_CHECK_BVH): ranges whose GPU copy-backs and copy-outs are logged ([bvh-copy]).
+void DebugWatchRange(std::uint64_t begin, std::uint64_t end);
+void DropAddressSpaceCache();
+// Drops the image mirrors made on `device` (VulkanDevice teardown): their buffers must go back to
+// the device's pool while the device lives, not at static destruction.
+void ClearImageMirrors(VkDevice device);
+std::uint64_t HostImportLimit();
 
 // The host import of the registered allocation containing [address, address + bytes), made on demand
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
@@ -252,6 +265,10 @@ public:
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    // The same ranges into `into` (cleared first), so a per-draw caller reuses its storage; and whether one overlaps
+    // [address, address + bytes) without building them.
+    void InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& into) const;
+    bool InPlaceReadOverlaps(std::uint64_t address, std::size_t bytes) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
 
 private:
@@ -359,6 +376,7 @@ private:
     // Import registry epoch when `direct` pointers were taken at acquire time; they are reused while
     // no import was destroyed since.
     std::uint64_t importsEpoch = 0;
+    std::uint64_t importFloor = 0;
     std::vector<Region> regions;
     // Whether `regions` is in ascending address order (true right after AcquireRegistered, whose
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.

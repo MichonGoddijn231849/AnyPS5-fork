@@ -1,0 +1,2 @@
+testdata/gta-perf-3/*.xz filter=lfs diff=lfs merge=lfs -text
+testdata/gta-perf-3/live/*.png filter=lfs diff=lfs merge=lfs -text

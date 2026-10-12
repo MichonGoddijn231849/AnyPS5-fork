@@ -107,7 +107,11 @@ struct SidebandResampleInfo {
 };
 
 struct Resampler {
+    // Input frames consumed per output frame; sceAjmBatchJobSetResampleParametersEx moves it by `change` after every
+    // output frame, never below MinRatio.
+    static constexpr float MinRatio = 1.0f / 64.0f;
     float ratio = 1.0f;
+    float change = 0.0f;
     std::vector<double> frames;
     double position = 1.0;
 };
@@ -134,6 +138,7 @@ struct Instance {
     AVCodecContext* opus = nullptr;
     std::uint32_t opusChannels = 0;
     std::uint32_t opusSampleRate = 0;
+    std::uint32_t opusMappingFamily = 0;
     std::vector<std::uint8_t> opusPending;
     Resampler resampler;
 
@@ -370,7 +375,14 @@ std::int32_t InitializeInstance(Instance& instance, const std::uint8_t* paramete
         if (channels == 0 || channels > 8 || sampleRate == 0) return AJM_RESULT_INVALID_PARAMETER;
         std::uint32_t third = 0;
         if (size >= 12) std::memcpy(&third, parameters + 8, sizeof(third));
-        if (sampleRate != 48000 || third != 0) NotImplemented_nid_no_patch("sceAjmBatchJobInitialize (Opus sample rate other than 48000 or nonzero third parameter word)");
+        // The third word is taken as the Opus channel mapping family: 0 (mono or stereo) or 1 (Vorbis channel order,
+        // multistream; Wolverine's 4-channel streams). TODO(debt): the word's meaning is inferred from Wolverine's
+        // 4-channel streams, which cannot be family 0.
+        if (sampleRate != 48000 || third > 1u || (third == 0u && channels > 2u)) {
+            const auto what = "sceAjmBatchJobInitialize (Opus " + std::to_string(channels) + " channels at " + std::to_string(sampleRate) + " Hz, third parameter word " + std::to_string(third) + ", " + std::to_string(size) + " parameter bytes: only 48000 Hz, mapping family 0 for up to 2 channels or 1)";
+            NotImplemented_nid_no_patch(what.c_str());
+        }
+        instance.opusMappingFamily = third;
         instance.opusChannels = channels;
         instance.opusSampleRate = sampleRate;
         OpenOpus(instance);
@@ -531,6 +543,7 @@ void ResamplerProduce(Instance& instance, PcmOutputs& outputs, std::size_t chann
         }
         outputs.Emit(frame.data(), frameBytes);
         resampler.position += resampler.ratio;
+        if (resampler.change != 0.0f) resampler.ratio = std::max(Resampler::MinRatio, resampler.ratio + resampler.change);
     }
     const auto index = std::min(static_cast<std::size_t>(resampler.position), available);
     if (index > 1) {
@@ -931,6 +944,34 @@ void OpenOpus(Instance& instance) {
     if (!instance.opus) throw std::runtime_error("AJM: cannot allocate the FFmpeg Opus decoder");
     av_channel_layout_default(&instance.opus->ch_layout, static_cast<int>(instance.opusChannels));
     instance.opus->sample_rate = 48000;
+    if (instance.opusMappingFamily == 1u) {
+        // Mapping family 1 has no header in the packets; FFmpeg takes the stream layout from an OpusHead: the
+        // stream and coupled counts and the Vorbis-order mapping of RFC 7845 section 5.1.1.2.
+        struct SurroundLayout {
+            std::uint8_t streams;
+            std::uint8_t coupled;
+            std::uint8_t mapping[8];
+        };
+        static constexpr SurroundLayout layouts[8] = {
+            {1, 0, {0}}, {1, 1, {0, 1}}, {2, 1, {0, 2, 1}}, {2, 2, {0, 1, 2, 3}},
+            {3, 2, {0, 4, 1, 2, 3}}, {4, 2, {0, 4, 1, 2, 3, 5}}, {4, 3, {0, 4, 1, 2, 3, 5, 6}}, {5, 3, {0, 6, 1, 2, 3, 4, 5, 7}},
+        };
+        const auto& layout = layouts[instance.opusChannels - 1];
+        const std::size_t headBytes = 21 + instance.opusChannels;
+        auto* head = static_cast<std::uint8_t*>(av_mallocz(headBytes + AV_INPUT_BUFFER_PADDING_SIZE));
+        if (!head) throw std::bad_alloc();
+        std::memcpy(head, "OpusHead", 8);
+        head[8] = 1;
+        head[9] = static_cast<std::uint8_t>(instance.opusChannels);
+        head[12] = 0x80;
+        head[13] = 0xbb;
+        head[18] = 1;
+        head[19] = layout.streams;
+        head[20] = layout.coupled;
+        std::memcpy(head + 21, layout.mapping, instance.opusChannels);
+        instance.opus->extradata = head;
+        instance.opus->extradata_size = static_cast<int>(headBytes);
+    }
     if (avcodec_open2(instance.opus, codec, nullptr) < 0) throw std::runtime_error("AJM: cannot open the FFmpeg Opus decoder");
 }
 
@@ -1153,7 +1194,8 @@ void Execute(const JobHeader& job, const AjmBuffer* inputs, const AjmBuffer* out
         break;
     case JobKind::SetResampleParameters:
         std::memcpy(&instance->resampler.ratio, job.parameters, sizeof(instance->resampler.ratio));
-        AJM_TRACE("[ajm] instance %u set resample ratio %f\n", job.instance, static_cast<double>(instance->resampler.ratio));
+        std::memcpy(&instance->resampler.change, job.parameters + sizeof(float), sizeof(instance->resampler.change));
+        AJM_TRACE("[ajm] instance %u set resample ratio %f change %f\n", job.instance, static_cast<double>(instance->resampler.ratio), static_cast<double>(instance->resampler.change));
         WriteResult(job.sideband, job.sidebandSize, 0);
         break;
     case JobKind::GetResampleInfo: {
@@ -1331,13 +1373,18 @@ int APS5_VABI sceAjmBatchJobRun(AjmBatchInfo* info, uint32_t instance, uint64_t 
     return sceAjmBatchJobRunSplit(info, instance, flags, &input, 1, &output, 1, sideband_output, sideband_output_size);
 }
 
-int APS5_VABI sceAjmBatchJobSetResampleParameters(AjmBatchInfo* info, uint32_t instance, float ratio, uint32_t flags, void* result) {
+int APS5_VABI sceAjmBatchJobSetResampleParametersEx(AjmBatchInfo* info, uint32_t instance, float ratio_start, float ratio_change_per_sample, uint32_t flags, void* result) {
     (void)flags;
-    if (!std::isfinite(ratio) || ratio <= 0.0f) return SCE_AJM_ERROR_INVALID_PARAMETER;
+    if (!std::isfinite(ratio_start) || ratio_start <= 0.0f || !std::isfinite(ratio_change_per_sample)) return SCE_AJM_ERROR_INVALID_PARAMETER;
     auto header = MakeHeader(JobKind::SetResampleParameters, instance, result, sizeof(SidebandResult));
-    std::memcpy(header.parameters, &ratio, sizeof(ratio));
-    header.parameterSize = sizeof(ratio);
+    std::memcpy(header.parameters, &ratio_start, sizeof(float));
+    std::memcpy(header.parameters + sizeof(float), &ratio_change_per_sample, sizeof(float));
+    header.parameterSize = 2 * sizeof(float);
     return Append(info, header, nullptr, nullptr);
+}
+
+int APS5_VABI sceAjmBatchJobSetResampleParameters(AjmBatchInfo* info, uint32_t instance, float ratio, uint32_t flags, void* result) {
+    return sceAjmBatchJobSetResampleParametersEx(info, instance, ratio, 0.0f, flags, result);
 }
 
 int APS5_VABI sceAjmBatchJobGetResampleInfo(AjmBatchInfo* info, uint32_t instance, void* result) {
@@ -1346,6 +1393,10 @@ int APS5_VABI sceAjmBatchJobGetResampleInfo(AjmBatchInfo* info, uint32_t instanc
 
 int APS5_VABI sceAjmBatchJobDecode(AjmBatchInfo* info, uint32_t instance, const void* bitstream_input, size_t bitstream_input_size, void* pcm_output, size_t pcm_output_size, void* result) {
     return sceAjmBatchJobRun(info, instance, SIDEBAND_STREAM, bitstream_input, bitstream_input_size, pcm_output, pcm_output_size, result, sizeof(SidebandResult) + sizeof(SidebandStream));
+}
+
+int APS5_VABI sceAjmBatchJobDecodeSplit(AjmBatchInfo* info, uint32_t instance, const AjmBuffer* input_buffers, size_t input_buffers_num, const AjmBuffer* output_buffers, size_t output_buffers_num, void* result) {
+    return sceAjmBatchJobRunSplit(info, instance, SIDEBAND_STREAM, input_buffers, input_buffers_num, output_buffers, output_buffers_num, result, sizeof(SidebandResult) + sizeof(SidebandStream));
 }
 
 int APS5_VABI sceAjmBatchJobDecodeSingle(AjmBatchInfo* info, uint32_t instance, const void* bitstream_input, size_t bitstream_input_size, void* pcm_output, size_t pcm_output_size, void* result) {

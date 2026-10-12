@@ -10,6 +10,8 @@ namespace ShaderRecompiler {
 
 struct RdnaProgram {
     std::span<const std::uint32_t> code;
+    // The caller's code followed by its inlined callees' copies, when InlineSubroutineCalls added any (`code` views it).
+    std::vector<std::uint32_t> ownedCode;
     std::vector<RdnaInstruction> instructions;
 };
 

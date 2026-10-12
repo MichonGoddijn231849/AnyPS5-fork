@@ -13,6 +13,14 @@
 namespace AgcDriver::GuestMemory {
 
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);
+// APS5_CAPTURE_PASSES: while a thread points this at a list, CheckRange appends every range it accepts there (address,
+// bytes, writable): the guest memory the driver reads or writes for a captured pass.
+struct CheckedRange {
+    std::uint64_t address;
+    std::uint64_t bytes;
+    bool writable;
+};
+std::vector<CheckedRange>*& RecordedRanges();
 // CheckRange without throwing: whether the whole range is mapped with the requested access.
 bool Accessible(const void* pointer, std::size_t bytes, bool writable = false);
 // The accessible parts [begin, end) of a range, in address order. GPU heaps are often bound whole while
@@ -95,6 +103,12 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 void BumpCollectEpoch();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
+// The calling thread's collect epoch while its collects are memoized within it (it bumped at an
+// ordering point and APS5_NO_COLLECT_MEMO is off), else 0; and the unwatch serial the collect memo's
+// entries are also keyed by. A result that holds for a range within one (epoch, serial) holds for
+// every later collect of that range in it, short of a stamp (see APS5_TARGET_PROOF_MEMO).
+std::uint64_t ThreadCollectEpoch();
+std::uint64_t UnwatchSerial();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the
@@ -116,6 +130,14 @@ constexpr std::uint8_t BlockUnchanged = 0;
 constexpr std::uint8_t BlockWritten = 1;
 constexpr std::uint8_t BlockMaybeWritten = 2;
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu = {});
+void SetImageRange(std::uintptr_t base, std::size_t bytes);
+// Where no guest arena exists (Linux), the range whose page states Accessible/CheckRange cache, as they cache the
+// arena's (set before guest memory is first checked; the frame replay names its captured address space). A host that
+// changes protections in it without the guest allocation registry calls ForgetPageStates after each change.
+void SetGuestPagesRange(std::uintptr_t base, std::size_t bytes);
+void ForgetPageStates(std::uintptr_t address, std::size_t bytes);
+void SetCaptureDirtyPages(bool enabled);
+std::vector<std::uint64_t> TakeCaptureDirtyPages();
 
 // Serializes device work: draws, dispatches, presentation and the deferred write-backs below. The
 // mutex is recursive; it is wrapped so every acquisition (std::lock_guard at any site) measures how

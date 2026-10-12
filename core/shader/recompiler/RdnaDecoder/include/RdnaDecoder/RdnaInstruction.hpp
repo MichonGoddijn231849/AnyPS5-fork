@@ -53,7 +53,10 @@ enum class RdnaOperandKind {
     VccZ,
     ExecZ,
     M0,
-    PopsExitingWaveId
+    PopsExitingWaveId,
+    // src_shared_base, src_shared_limit, src_private_base, src_private_limit (scalar source codes 235 to 238, the
+    // code in `reg`): 64-bit flat aperture bounds.
+    ApertureRegister
 };
 
 enum class RdnaImageDimension : std::uint32_t {
@@ -164,6 +167,15 @@ struct RdnaInstruction {
     bool idxen = false;
     bool offen = false;
     std::uint32_t branchTarget = 0;
+    // Subroutine calls (InlineSubroutineCalls): an s_swappc_b64 whose callee was inlined, or the callee's
+    // s_setpc_b64 return, branches to branchTarget like s_branch.
+    bool resolvedJump = false;
+    // A function table call (InlineSubroutineCalls): the dispatcher it jumps to compares its target registers and writes
+    // the return address itself, so the call does not (its return pair may be its target pair).
+    bool linkInDispatcher = false;
+    // The instruction's guest address minus (shader base + programCounter): non-zero in an inlined callee's copy,
+    // whose program counters follow the caller's code. s_getpc_b64 and s_swappc_b64 add it.
+    std::uint64_t guestPcDelta = 0;
     bool exportValidMask = false;
     std::string_view unsupportedReason{};
 };

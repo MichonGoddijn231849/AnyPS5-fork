@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <array>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -46,7 +47,18 @@ public:
     // resize, device replacement, CPU fill fallback and APS5_DRAIN_ALL; the packet-loop drains use the
     // three-step form below so the GPU wait happens without the mutex.
     void WaitIdle();
+    // Creates (and destroys) `shader`'s compute pipeline without the pipeline cache and without resources: its set
+    // layouts come from the module's own bindings. The seconds vkCreateComputePipelines took (agc_dispatch_run
+    // --compile-only measures the host driver's compile of a large program this way).
+    double CompileComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool optimize);
+    // Creates the pipeline APS5_DUMP_PIPELINE_DIR wrote at `path` (its SPIR-V, set layout, specialization and flags,
+    // as the dispatch would) through the device's pipeline cache, which the teardown saves; the seconds it took.
+    double CompileDumpedPipeline(const std::string& path);
+    std::uint64_t RelieveMemory();
     void PrepareForReplacement();
+    void DropCaches(bool resources, bool textures, bool tables, bool space);
+    // Writes every cached storage image's pending results back (debug resync, APS5_DEBUG_RESYNC).
+    void FlushTextures();
     // Sends recorded work to the GPU without waiting for it. With `reapFirst` it first retires batches
     // that already finished, so the in-flight list stays short (APS5_NO_OPPORTUNISTIC_REAP=1 skips
     // that). A reap runs completion actions, and a write-back can wait for a later batch under the
@@ -187,6 +199,7 @@ public:
     // submitted (0: today's render fence wait before the flip completes, 1 default, 2; larger
     // values are refused; 0 when APS5_SYNC_FLIP is set).
     static std::size_t FlipInFlight();
+    static void DumpNextPresent(std::string path, std::uint32_t scale);
     double RetirePresents(std::size_t keepInFlight);
     // Whether presenting `buffer` will use the single scaler source, staging or upload objects (a
     // GPU frame dump, the guest-memory path, a source-size change) while an in-flight blit still
@@ -232,7 +245,7 @@ public:
         int cpuReason;
         double argumentReadMs;
     };
-    IndirectOutcome DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::uint64_t programAddress = 0, std::shared_ptr<PreparedDispatch> prepared = nullptr, std::shared_ptr<const Recipe>* recipe = nullptr);
+    IndirectOutcome DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::uint64_t programAddress = 0, std::shared_ptr<PreparedDispatch> prepared = nullptr, std::shared_ptr<const Recipe>* recipe = nullptr, std::array<std::uint32_t, 3> threadGroup = {});
     // A value-equal dispatch-cache hit with a recipe (design_cpu_final M4), in two steps.
     // PrepareRecipe, WITHOUT GuestMemory::GpuMutex: the pre-checks (recipes on, the recipe's
     // device is this one, its template and pipeline objects still alive), the template's
@@ -274,6 +287,7 @@ public:
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+    bool PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, Graphics::DrawPreparation& prepared) const;
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
@@ -297,7 +311,7 @@ private:
     ShaderRecompiler::SpirvTarget buildTarget() const;
     Graphics::Context buildContext() const;
     // Body of Dispatch and DispatchIndirect: `arguments` 0 dispatches x, y, z groups.
-    IndirectOutcome dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe);
+    IndirectOutcome dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe, std::array<std::uint32_t, 3> threadGroup = {});
     // The stage-A pre-sync over `surfaces` (see PrepareDispatch): the serial waited for, 0 none.
     std::uint64_t presync(std::span<const std::pair<std::uint64_t, std::uint64_t>> surfaces);
     // A DISPATCH_INDIRECT's argument path (see DispatchIndirect): GPU-side from the host import, or

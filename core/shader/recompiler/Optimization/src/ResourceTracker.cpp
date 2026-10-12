@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,7 +48,7 @@ std::string formatHex32(std::uint32_t value) {
 std::string describeValueChain(const IrValue* value, std::uint32_t depth) {
     value = value->Resolve();
     if (value->HasImmediate()) {
-        return "Immediate";
+        return value->Type() == IrType::U32 ? "Immediate 0x" + formatHex32(value->ImmediateU32()) : "Immediate";
     }
     std::string text = std::string(IrOpcodeName(value->Opcode()));
     if (value->Opcode() == IrOpcode::LoadAddressU32 || value->Opcode() == IrOpcode::ReadConstBuffer) {
@@ -332,8 +333,23 @@ private:
     }
 
     // The table entry offset `key * 32` (a shift or a multiply), optionally plus an immediate.
-    static bool MatchTableOffset(IrValue* value, IrValue*& key, std::uint32_t& entryOffset) {
+    // `(key * 32) & mask` with a contiguous mask from bit 5 keeping at least 16 key bits: the mask
+    // only wraps keys past 65536 entries, which no bound table reaches (they read the pad either way).
+    static IrValue* StripKeyMask(IrValue* value) {
         value = value->Resolve();
+        if (value->Opcode() != IrOpcode::BitwiseAnd32 || value->ArgumentCount() != 2u) return value;
+        std::uint32_t mask = 0;
+        IrValue* masked = nullptr;
+        if (immediateU32(value->Argument(1), mask)) masked = value->Argument(0);
+        else if (immediateU32(value->Argument(0), mask)) masked = value->Argument(1);
+        if (masked == nullptr) return value;
+        const std::uint64_t span = (static_cast<std::uint64_t>(mask) | 31u) + 1u;
+        if ((span & (span - 1u)) != 0u || (mask >> 5u) < 0xffffu || (mask & 0xffffffe0u) != ((span - 1u) & 0xffffffe0u)) return value;
+        return masked->Resolve();
+    }
+
+    static bool MatchTableOffset(IrValue* value, IrValue*& key, std::uint32_t& entryOffset) {
+        value = StripKeyMask(value);
         entryOffset = 0;
         if (value->Opcode() == IrOpcode::IAdd32 && value->ArgumentCount() == 2u) {
             std::uint32_t immediate = 0;
@@ -345,6 +361,7 @@ private:
                 return false;
             }
             entryOffset = immediate;
+            value = StripKeyMask(value);
         }
         if (value->ArgumentCount() != 2u) {
             return false;
@@ -410,14 +427,35 @@ private:
 
         IrValue* key = nullptr;
         std::uint32_t entryOffset = 0;
+        static const bool traceMatch = std::getenv("APS5_TRACE_TABLE_MATCH") != nullptr;
         if (!MatchTableOffset(heapOffset, key, entryOffset) || key->Type() != IrType::U32) {
+            if (traceMatch) {
+                std::uint32_t mask = 0;
+                const IrValue* resolved = heapOffset->Resolve();
+                if (resolved->Opcode() == IrOpcode::BitwiseAnd32) immediateU32(resolved->Argument(1), mask);
+                std::fprintf(stderr, "[table-match] heap offset is not key * 32 (+ immediate), mask 0x%x: %s\n", mask, describeValueChain(heapOffset, 4u).c_str());
+            }
             return false;
         }
+        if (traceMatch) std::fprintf(stderr, "[table-match] matched heap offset %s, entry offset 0x%x\n", describeValueChain(heapOffset, 6u).c_str(), entryOffset + immediateOffset);
         entryOffset += immediateOffset;
 
-        const std::array<const IrValue*, 1> imageUsers {&handle};
+        // The reads may feed several image handles (one table entry sampled more than once), as long as
+        // every user is a T# built from exactly these eight reads; each handle gets the same plan.
+        std::vector<const IrValue*> imageUsers {&handle};
+        for (const IrValue* user : heapReads[0]->Uses()) {
+            if (user == &handle || user->Opcode() != IrOpcode::GetImageResource || user->ArgumentCount() != 8u) continue;
+            bool same = true;
+            for (std::uint32_t dword = 0; dword < 8u && same; dword++) same = user->Argument(dword)->Resolve() == heapReads[dword];
+            if (same) imageUsers.push_back(user);
+        }
         for (const auto* read : heapReads) {
-            if (!usesOnly(*read, imageUsers)) {
+            if (!usesOnly(*read, std::span<const IrValue* const>(imageUsers))) {
+                if (traceMatch) {
+                    std::string users;
+                    for (const IrValue* user : read->Uses()) users += std::string(" ") + std::string(IrOpcodeName(user->Opcode())) + (user == &handle ? "(this)" : "");
+                    std::fprintf(stderr, "[table-match] a T# dword has users besides its image handle:%s\n", users.c_str());
+                }
                 return false;
             }
         }
@@ -425,6 +463,7 @@ private:
         DescriptorSource heapSource;
         std::uint32_t heapSourceIndex = 0;
         if (!MakeRuntimeBufferSource(*heapHandle, heapSourceIndex, heapSource)) {
+            if (traceMatch) std::fprintf(stderr, "[table-match] the heap V# is no runtime buffer source\n");
             return false;
         }
 
@@ -447,6 +486,16 @@ private:
                 table.selectorStride = selectorStride;
                 table.selectorOffset = selectorOffset + materialMemory->offset;
                 materialSource = candidateSource;
+            }
+        }
+        // A key the SRT walk resolved to a word of the flattened SRT (read at a constant address): the same key for
+        // every lane of the dispatch. Stride 0 marks it; the materializer takes the key from that word.
+        if (const IrValue* uniform = key->Resolve(); !table.hasMaterial && uniform->Opcode() == IrOpcode::ReadConst && uniform->ArgumentCount() == 2u && uniform->Argument(0)->Resolve()->Opcode() == IrOpcode::GetSrtResource) {
+            std::uint32_t slot = 0;
+            if (immediateU32(uniform->Argument(1), slot)) {
+                table.hasMaterial = true;
+                table.selectorStride = 0u;
+                table.selectorOffset = slot;
             }
         }
 
@@ -911,7 +960,7 @@ private:
                     continue;
                 }
                 // A store through a table would mark every bound slot pending write-back.
-                if (imageInfo.resourceClass == ImageResourceClass::Storage) {
+                if (imageInfo.resourceClass == ImageResourceClass::Storage && !ResourceMaterializer::BindlessStorageTables()) {
                     ResourceMaterializer::CountBindlessRejection(BindlessRejection::Storage);
                     fail("bindless storage image tables are unsupported");
                 }
@@ -930,16 +979,36 @@ private:
         DescriptorSource descriptor;
         MakeSource(*handle, width, sampler, sampleAdjust, descriptor);
         std::uint32_t badDword = 0;
+        // APS5_NULL_UNRESOLVED_IMAGES=1 (Wolverine bring-up, ported from wolverine-capture): an image or sampler
+        // descriptor the walk cannot derive (selected on the GPU, as through a per-wave material record) is bound as
+        // all zeros (a null image of the instruction's dimension, the default sampler) instead of refusing the
+        // program, so the draw or dispatch still runs and reads zeros. Logged for the first 16.
+        // TODO(debt): an approximation until images and samplers can be selected on the GPU.
+        const auto nullDescriptor = [&](std::uint32_t dword) {
+            static const bool enabled = [] {
+                const char* text = std::getenv("APS5_NULL_UNRESOLVED_IMAGES");
+                return text != nullptr && text[0] != '\0' && text[0] != '0';
+            }();
+            if (!enabled || (expected != IrOpcode::GetImageResource && expected != IrOpcode::GetSamplerResource)) return false;
+            static std::atomic<std::uint32_t> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[recompiler] %s dword %u is not a runtime value: bound as all zeros; chain: %s\n", std::string(IrOpcodeName(expected)).c_str(), dword, describeValueChain(descriptor.dwords[dword], 8u).c_str());
+            for (std::uint32_t i = 0; i < descriptor.dwordCount; ++i) descriptor.dwords[i] = &m_builder.Constant(0u);
+            if (expected == IrOpcode::GetImageResource && descriptor.dwordCount > 3u) descriptor.dwords[3] = &m_builder.Constant(m_nullImageType << 28u);
+            source = InternSource(descriptor);
+            return true;
+        };
         if (expected == IrOpcode::GetImageResource) {
             for (; badDword < descriptor.dwordCount; badDword++) {
                 const IrValue* value2 = descriptor.dwords[badDword]->Resolve();
                 if (value2->Opcode() == IrOpcode::ReadConstBuffer) {
+                    if (nullDescriptor(badDword)) return;
                     fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
                 }
             }
             badDword = 0;
         }
         if (!ValidateSource(descriptor, badDword)) {
+            if (nullDescriptor(badDword)) return;
             fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
         }
         source = InternSource(descriptor);
@@ -1201,6 +1270,16 @@ private:
         if (indirect != nullptr) {
             source = indirect->source;
         } else {
+            // T# word 3 type of the null image a descriptor the walk cannot derive is bound as.
+            switch (memory.imageDimension) {
+                case RdnaImageDimension::Dim1D: m_nullImageType = 8u; break;
+                case RdnaImageDimension::Dim3D: m_nullImageType = 10u; break;
+                case RdnaImageDimension::Dim1DArray: m_nullImageType = 12u; break;
+                case RdnaImageDimension::Dim2DArray: m_nullImageType = 13u; break;
+                case RdnaImageDimension::Dim2DMsaa: m_nullImageType = 14u; break;
+                case RdnaImageDimension::Dim2DMsaaArray: m_nullImageType = 15u; break;
+                default: m_nullImageType = 9u; break;
+            }
             GetHandle(inst.Argument(0), IrOpcode::GetImageResource, 8, handle, source);
         }
         resource = AddImage(source, memory, op, flags.pc);
@@ -1269,6 +1348,7 @@ private:
         IrValue* value = nullptr;
     };
     std::vector<EdgeSelectorEntry> m_edgeSelectors;
+    std::uint32_t m_nullImageType = 9u;
 };
 
 }

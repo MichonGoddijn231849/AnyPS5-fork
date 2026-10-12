@@ -29,6 +29,8 @@ public:
     };
 
     explicit FrameTiming(std::uint64_t id, bool localMetrics = false) : localMetrics(localMetrics), id(id), workerStart(Clock::now()) {}
+    // The flip's serial: the driver numbers frames from 1 as their FLIP packets execute (with flipsCounted).
+    std::uint64_t Id() const { return id; }
 
     static FrameTiming* Preparation() {
         if (!APS5_ENABLE_TIMING_LOG) return nullptr;

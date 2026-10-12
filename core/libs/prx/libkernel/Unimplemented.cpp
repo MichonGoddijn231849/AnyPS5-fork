@@ -116,4 +116,5 @@ int APS5_VABI sceKernelUnknown19(void) {
     NotImplemented_nid_no_patch("uDGXwUKqi8s");
     return 0;
 }
+
 }

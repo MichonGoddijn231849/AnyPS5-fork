@@ -84,7 +84,17 @@ public:
     bool Idle() const { return open == nullptr && inFlight.empty(); }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
+    // The object lives at least until the batch open now completed; it is then destroyed AFTER the
+    // finishing thread released GuestMemory::GpuMutex, on a release thread of its own (never under
+    // a hold, see Recorder.cpp ReleaseDeferredKeeps; the finishing thread destroys it itself when
+    // the thread's queue is full, APS5_RELEASE_QUEUE_MAX batches, or with APS5_RELEASE_ON_UNLOCK=1;
+    // APS5_RELEASE_UNDER_LOCK=1 destroys it in the reap as before), so its destructor must need
+    // neither the mutex nor the recorder nor a particular thread. ~Recorder joins the release
+    // thread and waits for every release in progress before the device goes.
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
+    void KeepTransient(std::shared_ptr<void> object, std::size_t bytes);
+    static bool TransientUploadsOverBudget();
+    void SettleTransientUploads();
     static constexpr std::size_t KeptBytesBudget = std::size_t{512} << 20u;
     void BoundKeptBytes();
     std::size_t InFlightKeptBytes() const { return inFlightKeptBytes; }
@@ -93,8 +103,22 @@ public:
     static constexpr std::size_t DrawSnapshotEntries = 1024;
     static constexpr std::size_t DrawInputBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawInputEntries = 16384;
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
-    void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    // `offset`: where the snapshot starts in `buffer` (a slice of a snapshot arena, see AllocateDrawSnapshot). A
+    // caller without `offset` is served only snapshots at offset 0.
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, VkDeviceSize* offset = nullptr, std::uint64_t generation = 0);
+    void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0, VkDeviceSize offset = 0);
+    // APS5_SNAPSHOT_RING=1: a draw's new storage snapshot is a slice of a host-visible arena instead of a Buffer of
+    // its own. The arena is a pooled Buffer the slices share: every batch that bound a slice keeps it (through the
+    // draw's bindings) and so does every reuse entry naming one, and it goes back to the BufferPool when the last
+    // of them is gone. Slices are written once, when allocated, and never again, so recycling needs no fence of its
+    // own. A request larger than a quarter arena, or one made while the arenas still held reach their cap, gets
+    // nothing (the caller makes a Buffer as before).
+    struct SnapshotSlice {
+        std::shared_ptr<Buffer> buffer;
+        VkDeviceSize offset = 0;
+    };
+    static bool SnapshotRingEnabled();
+    SnapshotSlice AllocateDrawSnapshot(std::size_t bytes);
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
@@ -218,6 +242,7 @@ public:
     std::size_t InFlightBatches() const { return inFlight.size(); }
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
     static std::uint64_t ReapsWithWork();
+    static bool WaitForReleases(std::chrono::milliseconds timeout);
 
     // A store of `bytes` into a host import (a label, or a COPY_DATA/DMA_DATA/DUMP_CONST_RAM store
     // of up to 64 KiB; `address` is its guest address) recorded into the open batch: ordered
@@ -326,6 +351,9 @@ public:
     // Whether the lock-free pending-write snapshot (open, in-flight and finishing batches) overlaps
     // the range: false means no recorded work writes it, so a wait on it has nothing to submit.
     static bool SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes);
+    // Whether a label the calling thread queued but has not recorded writes the range (what the flush
+    // hook records first, see FlushForAccess).
+    static bool QueuedLabelsOverlap(std::uint64_t address, std::size_t bytes);
     // The snapshot itself (the sorted, merged union of the pending ranges; null when none), for a
     // reader that tests many ranges against one loaded snapshot: one atomic shared_ptr load per
     // validation instead of one per run, and every test sees the same snapshot (design13 R1's p0).
@@ -794,6 +822,7 @@ private:
         std::list<DrawSnapshotKey>::iterator recent;
         std::shared_ptr<Buffer> buffer;
         std::uint32_t derived;
+        VkDeviceSize offset;
     };
     struct DrawSnapshotPool {
         std::list<DrawSnapshotKey> recency;
@@ -801,6 +830,9 @@ private:
     };
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
+    // APS5_SNAPSHOT_RING: the arena slices are cut from, and the next free byte in it.
+    std::shared_ptr<Buffer> snapshotArena;
+    std::size_t snapshotArenaCursor = 0;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
 };

@@ -17,6 +17,9 @@ public:
     PreparedShaderState& Edit(const ShaderSnapshot& snapshot);
     const PreparedShaderState& Read(const ShaderSnapshot& snapshot) const;
     void Commit();
+    // Clears the failure an inner transaction left on this thread's open transaction (a dropped ABI hint), so the
+    // caller's commit still applies the rest. No effect without an open transaction.
+    static void ForgiveFailure();
 
 private:
     struct State;

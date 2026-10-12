@@ -7,6 +7,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <mutex>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <atomic>
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -26,10 +28,16 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#ifndef PSAPI_VERSION
+#define PSAPI_VERSION 2
+#endif
+#include <psapi.h>
 #else
 #include <cerrno>
 #include <cstdint>
 #include <fcntl.h>
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <fstream>
 #include <pthread.h>
 #include <sstream>
@@ -64,6 +72,153 @@ enum : std::uint64_t {
 };
 #define PROCMAP_QUERY _IOWR('f', 17, struct procmap_query)
 #endif
+#endif
+
+namespace AgcDriver::DriverDetail {
+// Set by CpuReadTrace.cpp once the CPU read trace is installed: the protection of a page it armed (false when it
+// is not armed). A hook rather than a call, so targets without the trace link GuestMemory.cpp alone.
+bool (*CpuReadTraceProtectionHook)(std::uintptr_t address, unsigned long* protection) = nullptr;
+}
+
+#ifdef _WIN32
+namespace {
+
+// APS5_HEAP_TRAP_SIZE=<bytes> (with APS5_HEAP_REPORT): the call stacks of heap allocations of exactly that size, by
+// patching every loaded module's HeapAlloc and RtlAllocateHeap imports at the first heap report.
+namespace HeapTrap {
+using Allocate = LPVOID(WINAPI*)(HANDLE, DWORD, SIZE_T);
+SIZE_T trapBytes = 0;
+Allocate heapAlloc = nullptr;
+Allocate rtlAllocateHeap = nullptr;
+std::mutex stacksMutex;
+std::map<std::array<void*, 10>, std::uint64_t>& Stacks() {
+    static std::map<std::array<void*, 10>, std::uint64_t> stacks;
+    return stacks;
+}
+
+// The return addresses on the stack, found by scanning it: unwinding stops on a guest thread. Each value inside a
+// loaded module is counted once per allocation, so the trapped allocations' call chain has the highest counts.
+struct ModuleRange {
+    std::uintptr_t begin;
+    std::uintptr_t end;
+};
+std::vector<ModuleRange>& Modules() {
+    static std::vector<ModuleRange> modules;
+    return modules;
+}
+std::map<std::uintptr_t, std::uint64_t>& Addresses() {
+    static std::map<std::uintptr_t, std::uint64_t> addresses;
+    return addresses;
+}
+std::uint64_t trapped = 0;
+
+void record() {
+    volatile std::uintptr_t marker = 0;
+    const auto top = reinterpret_cast<std::uintptr_t>(&marker);
+    MEMORY_BASIC_INFORMATION stack{};
+    if (VirtualQuery(reinterpret_cast<const void*>(top), &stack, sizeof(stack)) == 0) return;
+    const auto end = std::min<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(stack.BaseAddress) + stack.RegionSize, top + 32768u);
+    std::array<std::uintptr_t, 256> found{};
+    std::size_t count = 0;
+    for (auto cursor = (top + 7u) & ~std::uintptr_t{7}; cursor + 8u <= end && count < found.size(); cursor += 8u) {
+        const auto value = *reinterpret_cast<const std::uintptr_t*>(cursor);
+        const bool code = std::any_of(Modules().begin(), Modules().end(), [&](const ModuleRange& range) { return value >= range.begin && value < range.end; });
+        if (code && std::find(found.begin(), found.begin() + count, value) == found.begin() + count) found[count++] = value;
+    }
+    std::lock_guard lock(stacksMutex);
+    ++trapped;
+    for (std::size_t index = 0; index < count; ++index) ++Addresses()[found[index]];
+}
+
+LPVOID WINAPI heapAllocHook(HANDLE heap, DWORD flags, SIZE_T bytes) {
+    if (bytes == trapBytes) record();
+    return heapAlloc(heap, flags, bytes);
+}
+
+LPVOID WINAPI rtlAllocateHeapHook(HANDLE heap, DWORD flags, SIZE_T bytes) {
+    if (bytes == trapBytes) record();
+    return rtlAllocateHeap(heap, flags, bytes);
+}
+
+std::size_t patchModule(HMODULE module) {
+    auto* base = reinterpret_cast<std::uint8_t*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    const auto& directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (directory.VirtualAddress == 0) return 0;
+    std::size_t patched = 0;
+    for (auto* import = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + directory.VirtualAddress); import->Name != 0; ++import) {
+        if (import->OriginalFirstThunk == 0) continue;
+        auto* names = reinterpret_cast<IMAGE_THUNK_DATA*>(base + import->OriginalFirstThunk);
+        auto* functions = reinterpret_cast<IMAGE_THUNK_DATA*>(base + import->FirstThunk);
+        for (; names->u1.AddressOfData != 0; ++names, ++functions) {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+            const auto* name = reinterpret_cast<const char*>(reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData)->Name);
+            void* replacement = std::strcmp(name, "HeapAlloc") == 0 ? reinterpret_cast<void*>(&heapAllocHook) : std::strcmp(name, "RtlAllocateHeap") == 0 ? reinterpret_cast<void*>(&rtlAllocateHeapHook) : nullptr;
+            if (replacement == nullptr) continue;
+            DWORD protection = 0;
+            if (!VirtualProtect(&functions->u1.Function, sizeof(functions->u1.Function), PAGE_READWRITE, &protection)) continue;
+            functions->u1.Function = reinterpret_cast<ULONG_PTR>(replacement);
+            VirtualProtect(&functions->u1.Function, sizeof(functions->u1.Function), protection, &protection);
+            ++patched;
+        }
+    }
+    return patched;
+}
+
+void install() {
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+    const char* text = std::getenv("APS5_HEAP_TRAP_SIZE");
+    if (text == nullptr) return;
+    trapBytes = static_cast<SIZE_T>(std::strtoull(text, nullptr, 10));
+    heapAlloc = reinterpret_cast<Allocate>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "HeapAlloc"));
+    rtlAllocateHeap = reinterpret_cast<Allocate>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlAllocateHeap"));
+    if (heapAlloc == nullptr || rtlAllocateHeap == nullptr) return;
+    std::vector<HMODULE> modules(1024);
+    DWORD needed = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &needed)) return;
+    modules.resize(std::min<std::size_t>(modules.size(), needed / sizeof(HMODULE)));
+    std::size_t patched = 0;
+    for (const auto module : modules) {
+        patched += patchModule(module);
+        MODULEINFO info{};
+        if (K32GetModuleInformation(GetCurrentProcess(), module, &info, sizeof(info))) Modules().push_back({reinterpret_cast<std::uintptr_t>(info.lpBaseOfDll), reinterpret_cast<std::uintptr_t>(info.lpBaseOfDll) + info.SizeOfImage});
+    }
+    std::fprintf(stderr, "[heap] trapping allocations of %llu bytes: %zu imports patched in %zu modules\n", static_cast<unsigned long long>(trapBytes), patched, modules.size());
+}
+
+std::string describeFrame(void* frame) {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(frame), &module)) return "?";
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(module, path, MAX_PATH);
+    const char* name = std::strrchr(path, '\\');
+    char text[MAX_PATH + 32];
+    std::snprintf(text, sizeof(text), "%s+0x%llx", name != nullptr ? name + 1 : path, static_cast<unsigned long long>(static_cast<std::uint8_t*>(frame) - reinterpret_cast<std::uint8_t*>(module)));
+    return text;
+}
+
+void report() {
+    if (trapBytes == 0) return;
+    std::vector<std::pair<std::uintptr_t, std::uint64_t>> sorted;
+    std::uint64_t total = 0;
+    {
+        std::lock_guard lock(stacksMutex);
+        sorted.assign(Addresses().begin(), Addresses().end());
+        total = trapped;
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) { return left.second > right.second; });
+    std::string frames;
+    for (std::size_t index = 0; index < std::min<std::size_t>(sorted.size(), 24u); ++index) frames += " " + describeFrame(reinterpret_cast<void*>(sorted[index].first)) + "x" + std::to_string(sorted[index].second);
+    std::fprintf(stderr, "[heap] %llu allocations of %llu bytes; code addresses on their stacks:%s\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(trapBytes), frames.c_str());
+
+}
+}
+
+}
 #endif
 
 namespace AgcDriver::GuestMemory {
@@ -293,9 +448,19 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
     }
     return captured;
 #else
-    static_cast<void>(skip);
-    frames[0] = ModuleOffset(__builtin_return_address(0));
-    return 1;
+    // glibc's backtrace walks the unwind tables as RtlCaptureStackBackTrace does; frame 0 of its
+    // capture is this function, so the caller is 1. Each frame is an offset into the object that
+    // holds it (dladdr), symbolized with addr2line against that object.
+    void* raw[24];
+    const auto wanted = static_cast<int>(std::min<std::size_t>(frames.size() + 1 + skip, std::size(raw)));
+    const int captured = backtrace(raw, wanted);
+    std::size_t written = 0;
+    for (int i = 1 + static_cast<int>(skip); i < captured && written < frames.size(); ++i) {
+        Dl_info info{};
+        const auto address = reinterpret_cast<std::uintptr_t>(raw[i]);
+        frames[written++] = dladdr(raw[i], &info) != 0 && info.dli_fbase != nullptr ? address - reinterpret_cast<std::uintptr_t>(info.dli_fbase) : 0;
+    }
+    return written;
 #endif
 }
 
@@ -328,6 +493,101 @@ public:
         auto last = state.lastReport.load();
         if (nowMs - last < 10000 || !state.lastReport.compare_exchange_strong(last, nowMs)) return;
         const auto totals = FoldMemoryCounters();
+#ifdef _WIN32
+        {
+            // Where the process memory is: the guest's committed arena (the game's own memory) against the
+            // process's private commit, the rest being the host's (driver copies, Vulkan host memory, ...).
+            PROCESS_MEMORY_COUNTERS_EX counters{};
+            counters.cb = sizeof(counters);
+            K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters));
+            std::uint64_t guestPrivate = 0;
+            std::uint64_t guestMapped = 0;
+            for (auto cursor = static_cast<std::uintptr_t>(PagesBase()); cursor < PagesBase() + PagesSize();) {
+                MEMORY_BASIC_INFORMATION info{};
+                if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.RegionSize == 0) break;
+                if (info.State == MEM_COMMIT) (info.Type == MEM_PRIVATE ? guestPrivate : guestMapped) += info.RegionSize;
+                cursor = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[memory] process private %.0f MiB, working set %.0f MiB; guest arena committed %.0f MiB private + %.0f MiB mapped\n", counters.PrivateUsage / 1048576.0, counters.WorkingSetSize / 1048576.0, guestPrivate / 1048576.0, guestMapped / 1048576.0);
+            // APS5_HEAP_REPORT=1 (every 60 s, slow: it walks every heap under its lock): the busy heap bytes by
+            // allocation size, and the committed private regions outside the heaps by region size.
+            static const bool heapReport = std::getenv("APS5_HEAP_REPORT") != nullptr;
+            static std::int64_t lastHeapReport = 0;
+            if (heapReport && nowMs - lastHeapReport >= 60000) {
+                lastHeapReport = nowMs;
+                HeapTrap::install();
+                HeapTrap::report();
+                std::array<std::uint64_t, 40> heapBytes{};
+                std::array<std::uint64_t, 40> heapCounts{};
+                std::vector<std::pair<std::uintptr_t, std::uintptr_t>> heapRegions;
+                // The blocks of 512 KiB to 2 MiB, by exact size and by their first two dwords, to tell what they are.
+                std::unordered_map<std::uint64_t, std::uint64_t> blockSizes;
+                std::unordered_map<std::uint64_t, std::uint64_t> blockHeads;
+                std::vector<HANDLE> heaps(GetProcessHeaps(0, nullptr) + 16u);
+                heaps.resize(GetProcessHeaps(static_cast<DWORD>(heaps.size()), heaps.data()));
+                for (const auto heap : heaps) {
+                    if (!HeapLock(heap)) continue;
+                    PROCESS_HEAP_ENTRY entry{};
+                    while (HeapWalk(heap, &entry)) {
+                        if ((entry.wFlags & PROCESS_HEAP_REGION) != 0) {
+                            heapRegions.emplace_back(reinterpret_cast<std::uintptr_t>(entry.lpData), reinterpret_cast<std::uintptr_t>(entry.Region.lpLastBlock));
+                        } else if ((entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) != 0) {
+                            const auto bucket = std::min<std::size_t>(std::bit_width(static_cast<std::uint64_t>(entry.cbData)), heapBytes.size() - 1u);
+                            heapBytes[bucket] += entry.cbData;
+                            ++heapCounts[bucket];
+                            if (entry.cbData > (512u << 10u) && entry.cbData <= (2u << 20u)) {
+                                ++blockSizes[entry.cbData];
+                                std::uint64_t head = 0;
+                                std::memcpy(&head, entry.lpData, sizeof(head));
+                                ++blockHeads[head];
+                            }
+                        }
+                    }
+                    HeapUnlock(heap);
+                }
+                std::array<std::uint64_t, 48> regionBytes{};
+                std::array<std::uint64_t, 48> regionCounts{};
+                for (std::uintptr_t cursor = 0x10000;;) {
+                    MEMORY_BASIC_INFORMATION info{};
+                    if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.RegionSize == 0) break;
+                    const auto base = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+                    const bool inHeap = std::any_of(heapRegions.begin(), heapRegions.end(), [&](const auto& region) { return base >= region.first && base < region.second; });
+                    const bool inArena = base >= PagesBase() && base < PagesBase() + PagesSize();
+                    if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE && !inHeap && !inArena) {
+                        const auto bucket = std::min<std::size_t>(std::bit_width(static_cast<std::uint64_t>(info.RegionSize)), regionBytes.size() - 1u);
+                        regionBytes[bucket] += info.RegionSize;
+                        ++regionCounts[bucket];
+                    }
+                    if (base + info.RegionSize <= cursor) break;
+                    cursor = base + info.RegionSize;
+                }
+                std::uint64_t heapTotal = 0;
+                for (const auto bytes : heapBytes) heapTotal += bytes;
+                std::uint64_t regionTotal = 0;
+                for (const auto bytes : regionBytes) regionTotal += bytes;
+                AgcDriver::ProfilePrint_nid_no_patch("[heap] %zu heaps, %.0f MiB busy by allocation size (<= bytes: MiB/count):", heaps.size(), heapTotal / 1048576.0);
+                for (std::size_t bucket = 0; bucket < heapBytes.size(); ++bucket) {
+                    if (heapBytes[bucket] >= (16u << 20u)) AgcDriver::ProfilePrint_nid_no_patch(" %llu:%.0f/%llu", 1ull << bucket, heapBytes[bucket] / 1048576.0, static_cast<unsigned long long>(heapCounts[bucket]));
+                }
+                AgcDriver::ProfilePrint_nid_no_patch("; private regions outside heaps and the arena %.0f MiB (<= bytes: MiB/count):", regionTotal / 1048576.0);
+                for (std::size_t bucket = 0; bucket < regionBytes.size(); ++bucket) {
+                    if (regionBytes[bucket] >= (16u << 20u)) AgcDriver::ProfilePrint_nid_no_patch(" %llu:%.0f/%llu", 1ull << bucket, regionBytes[bucket] / 1048576.0, static_cast<unsigned long long>(regionCounts[bucket]));
+                }
+                AgcDriver::ProfilePrint_nid_no_patch("\n");
+                const auto top = [](const std::unordered_map<std::uint64_t, std::uint64_t>& counts) {
+                    std::vector<std::pair<std::uint64_t, std::uint64_t>> sorted(counts.begin(), counts.end());
+                    std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) { return left.second > right.second; });
+                    if (sorted.size() > 6u) sorted.resize(6u);
+                    return sorted;
+                };
+                AgcDriver::ProfilePrint_nid_no_patch("[heap] blocks of 512 KiB to 2 MiB by size:");
+                for (const auto& [size, count] : top(blockSizes)) AgcDriver::ProfilePrint_nid_no_patch(" %llu x%llu", static_cast<unsigned long long>(size), static_cast<unsigned long long>(count));
+                AgcDriver::ProfilePrint_nid_no_patch("; by first 8 bytes:");
+                for (const auto& [head, count] : top(blockHeads)) AgcDriver::ProfilePrint_nid_no_patch(" %016llx x%llu", static_cast<unsigned long long>(head), static_cast<unsigned long long>(count));
+                AgcDriver::ProfilePrint_nid_no_patch("\n");
+            }
+        }
+#endif
         AgcDriver::ProfilePrint_nid_no_patch("[guestmem]");
         for (std::size_t i = 0; i < MemoryCounterCount; ++i) {
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
@@ -451,6 +711,9 @@ struct PageStates {
     }
 };
 
+std::pair<std::uintptr_t, std::size_t> imageOverride{0, 0};
+std::pair<std::uintptr_t, std::size_t> guestPagesOverride{0, 0};
+
 PageStates& Pages() {
     static PageStates pages;
     return pages;
@@ -480,16 +743,31 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     forgetSerial.fetch_add(1, std::memory_order_release);
 }
 
+// APS5_NO_LINUX_PAGE_CACHE=1: every Linux check reads /proc/self/maps again, as before the page cache served them
+// (SetGuestPagesRange and the image range are ignored).
+bool PagesQueriedEachTime() {
+    static const bool each = std::getenv("APS5_NO_LINUX_PAGE_CACHE") != nullptr;
+    return each;
+}
+
 void PageStates::initialize() {
     std::call_once(once, [&] {
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
+        if (arena.size == 0 && guestPagesOverride.second != 0 && !PagesQueriedEachTime()) {
+            arena.base = guestPagesOverride.first;
+            arena.size = guestPagesOverride.second;
+        }
         const bool arenaCached = arena.allocate();
         bool imageCached = false;
 #ifdef _WIN32
         // The image extent is the run of regions sharing the module's allocation base, as the registry
         // walks it when it registers the main image.
         static const bool noImageCache = std::getenv("APS5_NO_IMAGE_PAGE_CACHE") != nullptr;
-        if (const auto module = noImageCache ? nullptr : GetModuleHandleW(nullptr)) {
+        if (imageOverride.second != 0) {
+            image.base = imageOverride.first;
+            image.size = imageOverride.second;
+            imageCached = !noImageCache && image.allocate();
+        } else if (const auto module = noImageCache ? nullptr : GetModuleHandleW(nullptr)) {
             const auto start = reinterpret_cast<std::uintptr_t>(module);
             auto cursor = start;
             for (;;) {
@@ -499,6 +777,15 @@ void PageStates::initialize() {
             }
             image.base = start;
             image.size = cursor - start;
+            imageCached = image.allocate();
+        }
+#else
+        // The image range a host named (the frame replay names the capture's largest external run); the Linux checks
+        // cache their answers there as VirtualQuery's are.
+        static const bool noImageCache = std::getenv("APS5_NO_IMAGE_PAGE_CACHE") != nullptr;
+        if (imageOverride.second != 0 && !noImageCache && !PagesQueriedEachTime()) {
+            image.base = imageOverride.first;
+            image.size = imageOverride.second;
             imageCached = image.allocate();
         }
 #endif
@@ -566,6 +853,11 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 std::fprintf(stderr, "[query] 0x%llx range 0x%zx: base 0x%llx size 0x%llx state 0x%lx protect 0x%lx type 0x%lx %.0f us gen %llu from +0x%llx\n", static_cast<unsigned long long>(cursor), bytes, reinterpret_cast<unsigned long long>(memory.BaseAddress), static_cast<unsigned long long>(memory.RegionSize), memory.State, memory.Protect, memory.Type, us, static_cast<unsigned long long>(GuestAllocations::GuestAllocationsGeneration_nid_postfix()), ModuleOffset(__builtin_return_address(0)));
             }
         }
+        // Pages the CPU read trace (APS5_TRACE_CPU_READS) made inaccessible keep their real protection here.
+        if (memory.Protect == PAGE_NOACCESS) {
+            unsigned long armed = 0;
+            if (DriverDetail::CpuReadTraceProtectionHook != nullptr && DriverDetail::CpuReadTraceProtectionHook(cursor, &armed)) memory.Protect = armed;
+        }
         const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
         if (memory.RegionSize > std::numeric_limits<std::uintptr_t>::max() - base || base + memory.RegionSize <= cursor) return false;
         const auto regionEnd = base + memory.RegionSize;
@@ -592,6 +884,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             query.size = sizeof(query);
             query.query_flags = PROCMAP_QUERY_COVERING_OR_NEXT_VMA;
             query.query_addr = cursor;
+            const auto queryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
             if (ioctl(fd, PROCMAP_QUERY, &query) == 0) {
                 if (query.vma_end <= cursor || query.vma_start >= query.vma_end) return false;
                 if (query.vma_start > cursor) {
@@ -601,8 +894,21 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                     continue;
                 }
                 const bool readable = (query.vma_flags & PROCMAP_QUERY_VMA_READABLE) != 0;
+                const bool writable = readable && (query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) != 0;
+                if (readable && !PagesQueriedEachTime()) {
+                    const auto first = static_cast<std::uintptr_t>(query.vma_start);
+                    const auto last = static_cast<std::uintptr_t>(query.vma_end);
+                    for (PageSpan* span : {&pages.arena, &pages.image}) {
+                        if (span->size == 0 || last <= span->base || first >= span->base + span->size) continue;
+                        const std::uint8_t value = PageReadable | (writable ? PageWritable : 0u);
+                        const auto from = std::max(first, span->base);
+                        const auto to = std::min(last, span->base + span->size);
+                        for (auto at = from; at < to; at += PageBytes) span->store(at, value);
+                        if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != queryGeneration) span->forget(from, static_cast<std::size_t>(to - from));
+                    }
+                }
                 const auto next = std::min<std::uintptr_t>(end, query.vma_end);
-                if (!emit(PageRun{cursor, next, readable, readable && (query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) != 0})) return true;
+                if (!emit(PageRun{cursor, next, readable, writable})) return true;
                 cursor = next;
                 continue;
             }
@@ -612,6 +918,11 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             }
             return false;
         }
+        // As VirtualQuery's answers above, the mapping's run is stored in the page cache (the guest's own protection
+        // changes go through the registry and forget it; the write watch is userfaultfd's and leaves the mapping's
+        // permissions alone). Without it every check reread the whole maps file: with the GTA replay's ~5000
+        // mappings that was most of the committer's time.
+        const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         std::ifstream maps("/proc/self/maps");
         if (!maps.is_open()) return false;
         std::string line;
@@ -631,8 +942,20 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 found = true;
                 break;
             }
+            const bool readable = permissions[0] == 'r';
+            const bool writable = readable && permissions[1] == 'w';
+            if (readable && !PagesQueriedEachTime()) {
+                for (PageSpan* span : {&pages.arena, &pages.image}) {
+                    if (span->size == 0 || last <= span->base || first >= span->base + span->size) continue;
+                    const std::uint8_t value = PageReadable | (writable ? PageWritable : 0u);
+                    const auto from = std::max(first, span->base);
+                    const auto to = std::min(last, span->base + span->size);
+                    for (auto at = from; at < to; at += PageBytes) span->store(at, value);
+                    if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) span->forget(from, static_cast<std::size_t>(to - from));
+                }
+            }
             const auto next = std::min(end, last);
-            if (!emit(PageRun{cursor, next, permissions[0] == 'r', permissions[0] == 'r' && permissions[1] == 'w'})) return true;
+            if (!emit(PageRun{cursor, next, readable, writable})) return true;
             cursor = next;
             found = true;
             break;
@@ -701,7 +1024,11 @@ std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable) {
     require(alignment != 0, "zero guest memory alignment");
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
-    require(address != 0 && address % alignment == 0, "null or misaligned address");
+    if (address == 0 || address % alignment != 0) {
+        char message[96];
+        std::snprintf(message, sizeof(message), "null or misaligned address 0x%llx (alignment %zu, %zu bytes)", static_cast<unsigned long long>(address), alignment, bytes);
+        require(false, message);
+    }
     require(bytes <= std::numeric_limits<std::uintptr_t>::max() - address, "address range overflow");
     const auto reason = verify(address, bytes, writable);
     if (!reason.empty()) {
@@ -710,6 +1037,12 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
         if (trace) std::fprintf(stderr, "[unreadable] %s from +0x%llx\n", reason.c_str(), ModuleOffset(__builtin_return_address(0)));
         require(false, reason.c_str());
     }
+    if (auto* recorded = RecordedRanges()) recorded->push_back({address, bytes, writable});
+}
+
+std::vector<CheckedRange>*& RecordedRanges() {
+    thread_local std::vector<CheckedRange>* recorded = nullptr;
+    return recorded;
 }
 
 bool Accessible(const void* pointer, std::size_t bytes, bool writable) {
@@ -1018,6 +1351,30 @@ struct ThreadCollectMemo {
 };
 thread_local ThreadCollectMemo threadCollectMemo;
 
+// The ranges the calling thread walked during its current epoch, by first page: the ring above
+// holds a few draws' worth, while a recorded draw collects some 25 ranges (targets, every texture a
+// cached set revalidates, storage images, snapshots), so the ring alone walked a surface again every
+// few draws of an epoch. Cleared when the epoch moves on. APS5_NO_EPOCH_COLLECT_MAP=1 uses the ring alone.
+struct EpochCollectMap {
+    std::uint64_t epoch = 0;
+    std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
+};
+
+EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
+    thread_local EpochCollectMap* slot = nullptr;
+    auto& map = ShaderRecompiler::ThreadOwned(slot);
+    if (map.epoch != epoch) {
+        map.ranges.clear();
+        map.epoch = epoch;
+    }
+    return map;
+}
+
+bool epochCollectMapEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_EPOCH_COLLECT_MAP") == nullptr;
+    return enabled;
+}
+
 bool sharedCollectMemo() {
     static const bool shared = std::getenv("APS5_SHARED_COLLECT_MEMO") != nullptr;
     return shared;
@@ -1043,8 +1400,12 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
 }
 #endif
 
+std::atomic<bool> captureDirtyEnabled{false};
+std::vector<std::uint64_t> captureDirtyPages;
+
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false) {
     ++tracker.generation;
+    const bool captureDirty = kind != StampKind::Driver && captureDirtyEnabled.load(std::memory_order_relaxed);
 #ifdef _WIN32
     static_cast<void>(armedOnly);
     constexpr std::uint64_t page = 4096;
@@ -1068,6 +1429,9 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
             tracker.stamp(tracker.blockOf(page), tracker.generation, kind);
             if (kind != StampKind::Driver) tracker.noteCpuStore(page, page + WritePageBytes, tracker.generation);
         }
+        if (captureDirty) {
+            for (ULONG_PTR i = 0; i < count; ++i) captureDirtyPages.push_back(reinterpret_cast<std::uintptr_t>(tracker.pages[i]));
+        }
         if (count < tracker.pages.size()) break;
         cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + (granularity != 0 ? granularity : page);
     }
@@ -1084,12 +1448,16 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
                 tracker.stamp(tracker.blockOf(page), tracker.generation, kind);
                 if (kind != StampKind::Driver) tracker.noteCpuStore(page, page + WritePageBytes, tracker.generation);
             }
+            if (captureDirty) {
+                for (ULONG_PTR i = 0; i < count; ++i) captureDirtyPages.push_back(reinterpret_cast<std::uintptr_t>(tracker.pages[i]));
+            }
             if (count < tracker.pages.size()) break;
             cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + (granularity != 0 ? granularity : page);
         }
     }
     return true;
 #else
+    if (captureDirty) throw std::runtime_error("frame capture requires the Windows write tracker");
     const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
     StampRuns runs{tracker, kind};
     const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
@@ -1097,6 +1465,21 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
     return complete;
 #endif
+}
+
+// APS5_COLLECT_GRANULE_KIB=<n> (a power of two, at least 4): a memoized collect walks the whole aligned n KiB granule
+// around its range when the tracker covers it and the walk completes, and memoizes that, so the next ranges inside the
+// granule in the same epoch (a ring of per-draw constants, neighbouring buffers) are memo hits instead of walks of
+// their own (one GetWriteWatch / write-watch ioctl each). Walking more pages only stamps writes there earlier.
+std::uint64_t collectGranule() {
+    static const std::uint64_t granule = [] {
+        const char* text = std::getenv("APS5_COLLECT_GRANULE_KIB");
+        if (text == nullptr) return std::uint64_t{64} * 1024u;
+        const auto kib = std::strtoull(text, nullptr, 10);
+        if (kib < 4 || (kib & (kib - 1)) != 0 || kib > (1u << 20u)) return std::uint64_t{0};
+        return static_cast<std::uint64_t>(kib) * 1024u;
+    }();
+    return granule;
 }
 
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
@@ -1113,6 +1496,20 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
+        if (epochCollectMapEnabled()) {
+            const auto& map = epochCollectMap(epoch);
+            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
+                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                return tracker.generation.load(std::memory_order_relaxed);
+            }
+            // A granule walked around another range (APS5_COLLECT_GRANULE_KIB) is keyed by the granule's start.
+            if (const auto granule = collectGranule(); granule != 0) {
+                if (const auto found = map.ranges.find(first & ~(granule - 1)); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.begin <= first && stop <= found->second.end) {
+                    collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                    return tracker.generation.load(std::memory_order_relaxed);
+                }
+            }
+        }
         for (const auto& entry : threadCollectMemo.entries) {
             if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
@@ -1146,12 +1543,30 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
 #endif
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+    auto walkFirst = first;
+    auto walkStop = stop;
+    bool walked = false;
+    if (const auto granule = collectGranule(); granule != 0 && useMemo) {
+        const auto wideFirst = first & ~(granule - 1);
+        const auto wideStop = stop > std::numeric_limits<std::uint64_t>::max() - granule ? stop : (stop + granule - 1) & ~(granule - 1);
+        if ((wideFirst != first || wideStop != stop) && tracker.covers(wideFirst, static_cast<std::size_t>(wideStop - wideFirst)) && walkWrites(tracker, wideFirst, wideStop, StampKind::Cpu)) {
+            walkFirst = wideFirst;
+            walkStop = wideStop;
+            walked = true;
+        }
+    }
+    if (!walked && !walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
-        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
-        else threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
+        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {walkFirst, walkStop, epoch, serial};
+        else {
+            threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {walkFirst, walkStop, epoch, serial};
+            if (epochCollectMapEnabled()) {
+                auto& entry = epochCollectMap(epoch).ranges[walkFirst];
+                if (entry.unwatched != serial || entry.end < walkStop) entry = {walkFirst, walkStop, epoch, serial};
+            }
+        }
     }
     return tracker.generation;
 }
@@ -1169,6 +1584,14 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
 void BumpCollectEpoch() {
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t ThreadCollectEpoch() {
+    return collectMemoEnabled() ? threadCollectEpoch : 0;
+}
+
+std::uint64_t UnwatchSerial() {
+    return unwatchSerial.load(std::memory_order_acquire);
 }
 
 std::uint64_t CollectEpochBumps() {
@@ -1424,6 +1847,37 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
         if (k < cpu.size()) cpu[k] = generation == 0 || tracker.cpuStampOf(block) > generation ? 1 : 0;
     }
     return true;
+}
+
+void SetImageRange(std::uintptr_t base, std::size_t bytes) {
+    require(Pages().arena.pages == nullptr && Pages().image.pages == nullptr, "the image range must be set before guest memory is first checked");
+    imageOverride = {base, bytes};
+}
+
+void SetGuestPagesRange(std::uintptr_t base, std::size_t bytes) {
+    require(Pages().arena.pages == nullptr && Pages().image.pages == nullptr, "the guest pages range must be set before guest memory is first checked");
+    guestPagesOverride = {base, bytes};
+}
+
+void ForgetPageStates(std::uintptr_t address, std::size_t bytes) {
+    ForgetPages(address, bytes);
+}
+
+void SetCaptureDirtyPages(bool enabled) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    require(!enabled || tracker.watched, "frame capture requires write-watched guest memory");
+    captureDirtyEnabled.store(enabled, std::memory_order_relaxed);
+    captureDirtyPages.clear();
+}
+
+std::vector<std::uint64_t> TakeCaptureDirtyPages() {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    std::vector<std::uint64_t> pages;
+    pages.swap(captureDirtyPages);
+    return pages;
 }
 
 namespace {

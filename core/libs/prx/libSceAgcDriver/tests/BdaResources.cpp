@@ -688,7 +688,10 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         GuestBufferMemory tail(aligned);
         tail.AddWritable(address, 62);
         tail.Upload(true);
-        reject([&] { tail.Descriptor(address + 58, 4, adjustment); }, "exceeds its GPU owner");
+        // A view whose DWORD rounding runs past its owner is bound up to the owner's end, never past it.
+        const auto clamped = tail.Descriptor(address + 58, 4, adjustment);
+        Require(clamped.range != 0 && address + 58 - adjustment + clamped.range <= address + 62, "a view at its owner's end binds past the owner");
+        reject([&] { tail.Descriptor(address + 62, 4, adjustment); }, "exceeds its GPU owner");
     }
     {
         // The cached address space: a second build in an unchanged registry takes the first one's

@@ -66,7 +66,12 @@ void Driver::validate(const Submission& submission, const std::uint32_t* guest) 
             throw std::runtime_error(std::string("AGC driver: ") + what);
         }
         const auto count = Pm4::PacketWords(header);
-        require(count <= commands.size() - cursor, "truncated PM4 packet");
+        if (count > commands.size() - cursor) {
+            dumpPackets(commands, guest);
+            char what[160];
+            std::snprintf(what, sizeof(what), "AGC driver: truncated PM4 packet: %s header 0x%08x of %zu words at DWORD %zu of %zu (queue 0x%x)", Pm4::Name(header).c_str(), header, count, cursor, commands.size(), queue);
+            throw std::runtime_error(what);
+        }
         try {
             Pm4::Validate(commands.subspan(cursor, count), queue);
             if (header == FlipPacketHeader && !guarded.empty()) throw std::runtime_error("a flip inside a conditional execution range (conditional flip reservation) is not implemented");

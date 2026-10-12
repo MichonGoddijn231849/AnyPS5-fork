@@ -4,10 +4,13 @@
 #include "SpirvBackend/SpirvSpecialization.hpp"
 #include <algorithm>
 #include <initializer_list>
+#include <array>
 #include <map>
+#include <tuple>
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace ShaderRecompiler {
@@ -31,6 +34,23 @@ Instruction Make(spv::Op op, std::initializer_list<std::uint32_t> operands) {
     Instruction result{(static_cast<std::uint32_t>(operands.size() + 1u) << 16u) | op};
     result.insert(result.end(), operands);
     return result;
+}
+
+bool DerivativeInstruction(std::uint32_t op) {
+    switch (op) {
+    case spv::OpDPdx:
+    case spv::OpDPdy:
+    case spv::OpFwidth:
+    case spv::OpDPdxFine:
+    case spv::OpDPdyFine:
+    case spv::OpFwidthFine:
+    case spv::OpDPdxCoarse:
+    case spv::OpDPdyCoarse:
+    case spv::OpFwidthCoarse:
+        return true;
+    default:
+        return false;
+    }
 }
 
 bool PureInstruction(const Instruction& instruction) {
@@ -242,6 +262,7 @@ public:
             if (hasResult && hasType) resultTypes.emplace(instruction.at(2), instruction.at(1));
             if (op == spv::OpTypeBool) types.emplace(instruction.at(1), ScalarType{1u, true});
             if (op == spv::OpTypeInt) types.emplace(instruction.at(1), ScalarType{instruction.at(2), false});
+            if (op == spv::OpTypeVector) vectorTypes.insert(instruction.at(1));
             if (op == spv::OpConstant && types.contains(instruction.at(1)) && types.at(instruction[1]).width <= 32u) values.emplace(instruction.at(2), instruction.at(3));
             if (op == spv::OpConstantTrue || op == spv::OpConstantFalse) values.emplace(instruction.at(2), op == spv::OpConstantTrue ? 1u : 0u);
             cursor += count;
@@ -253,9 +274,12 @@ public:
         while (changed) {
             changed = fold();
             changed |= prune();
+            changed |= shareValues();
             changed |= propagateCopies();
         }
         removeDeadComputations();
+        removeUnreferencedBlocks();
+        shareConstants();
         orderPhis();
         std::vector<std::uint32_t> words = header;
         bool inserted = false;
@@ -323,10 +347,22 @@ private:
         }
     }
 
+    std::uint32_t integerConstant() const {
+        for (const auto& [id, value] : values) {
+            const auto type = resultTypes.find(id);
+            if (type == resultTypes.end()) continue;
+            const auto scalar = types.find(type->second);
+            if (scalar != types.end() && !scalar->second.boolean && scalar->second.width == 32u) return id;
+        }
+        return 0u;
+    }
+
     bool fold() {
         bool changed = false;
         bool function = false;
         std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> extracts;
+        std::map<std::uint32_t, std::array<std::uint32_t, 3>> selects;
+        std::map<std::uint32_t, std::uint32_t> bitcasts;
         for (auto& instruction : instructions) {
             if (instruction.empty()) continue;
             auto op = Opcode(instruction);
@@ -339,6 +375,25 @@ private:
                     changed = true;
                 }
             }
+            if (op == spv::OpSelect && instruction.size() == 6u) {
+                for (const std::size_t arm : {4u, 5u}) {
+                    const auto inner = selects.find(instruction[arm]);
+                    if (inner != selects.end() && inner->second[0] == instruction[3]) {
+                        instruction[arm] = inner->second[arm == 4u ? 1u : 2u];
+                        changed = true;
+                    }
+                }
+                selects[instruction[2]] = {instruction[3], instruction[4], instruction[5]};
+            }
+            if (op == spv::OpBitcast && instruction.size() == 4u) {
+                const auto inner = bitcasts.find(instruction[3]);
+                if (inner != bitcasts.end() && resultTypes.contains(inner->second) && resultTypes.at(inner->second) == instruction[1]) {
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], inner->second});
+                    changed = true;
+                } else {
+                    bitcasts[instruction[2]] = instruction[3];
+                }
+            }
             if (op == spv::OpVectorExtractDynamic && instruction.size() == 5u) {
                 if (const auto index = value(instruction[4])) {
                     instruction = Make(spv::OpCompositeExtract, {instruction[1], instruction[2], instruction[3], *index});
@@ -349,7 +404,7 @@ private:
             if (op == spv::OpCompositeExtract && instruction.size() == 5u) extracts.emplace(instruction[2], std::pair{instruction[3], instruction[4]});
             if (op == spv::OpCompositeConstruct && instruction.size() == 7u) {
                 const auto first = extracts.find(instruction[3]);
-                bool shuffle = first != extracts.end();
+                bool shuffle = first != extracts.end() && resultTypes.contains(first->second.first) && vectorTypes.contains(resultTypes.at(first->second.first));
                 for (std::size_t index = 4; shuffle && index < instruction.size(); ++index) {
                     const auto found = extracts.find(instruction[index]);
                     shuffle = found != extracts.end() && found->second.first == first->second.first;
@@ -440,8 +495,9 @@ private:
                     retainMerge = !linearSelection(target, instruction.at(1));
                     if (!retainMerge) instruction.clear();
                 }
-                const auto replacement = !retainMerge ? Make(spv::OpBranch, {target}) : op == spv::OpSwitch ?
-                    Make(spv::OpSwitch, {terminal.at(1), target}) : Make(spv::OpBranchConditional, {terminal.at(1), target, target});
+                const auto selector = op == spv::OpSwitch ? terminal.at(1) : integerConstant();
+                const auto replacement = !retainMerge ? Make(spv::OpBranch, {target}) : selector != 0u ?
+                    Make(spv::OpSwitch, {selector, target}) : Make(spv::OpBranchConditional, {terminal.at(1), target, target});
                 if (terminal != replacement) {
                     terminal = replacement;
                     changed = true;
@@ -496,6 +552,280 @@ private:
             }
         }
         return changed;
+    }
+
+    bool shareValues() {
+        std::set<std::uint32_t> decorated;
+        for (const auto& instruction : instructions) {
+            if (instruction.empty()) continue;
+            const auto op = Opcode(instruction);
+            if (op == spv::OpFunction) break;
+            if ((op == spv::OpDecorate || op == spv::OpDecorateId) && instruction.size() > 1u) decorated.insert(instruction[1]);
+        }
+        std::uint32_t faultFunction = 0;
+        for (const auto& instruction : instructions) {
+            if (instruction.size() < 3u || Opcode(instruction) != spv::OpName) continue;
+            std::string name;
+            for (std::size_t index = 2; index < instruction.size(); ++index) {
+                for (std::uint32_t shift = 0; shift < 32u; shift += 8u) {
+                    const auto character = static_cast<char>((instruction[index] >> shift) & 0xffu);
+                    if (character != '\0') name.push_back(character);
+                }
+            }
+            if (name == "record_bda_fault") faultFunction = instruction[1];
+        }
+        std::set<std::uint32_t> constantPointers;
+        for (const auto& instruction : instructions) {
+            if (instruction.empty()) continue;
+            const auto op = Opcode(instruction);
+            if (op == spv::OpVariable && instruction.size() > 3u) {
+                const auto storage = instruction[3];
+                if (storage == spv::StorageClassUniformConstant || storage == spv::StorageClassInput || storage == spv::StorageClassUniform || storage == spv::StorageClassPushConstant) constantPointers.insert(instruction[2]);
+            } else if ((op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain || op == spv::OpCopyObject) && instruction.size() > 3u && constantPointers.contains(instruction[3])) {
+                constantPointers.insert(instruction[2]);
+            }
+        }
+        bool changed = false;
+        std::size_t index = 0;
+        while (index < instructions.size()) {
+            while (index < instructions.size() && (instructions[index].empty() || Opcode(instructions[index]) != spv::OpFunction)) ++index;
+            if (index >= instructions.size()) break;
+            std::vector<std::uint32_t> order;
+            std::map<std::uint32_t, std::vector<std::size_t>> body;
+            std::map<std::uint32_t, std::vector<std::uint32_t>> successors;
+            std::uint32_t block = 0;
+            for (; index < instructions.size(); ++index) {
+                const auto& instruction = instructions[index];
+                if (instruction.empty()) continue;
+                const auto op = Opcode(instruction);
+                if (op == spv::OpFunctionEnd) break;
+                if (op == spv::OpLabel) {
+                    block = instruction.at(1);
+                    order.push_back(block);
+                    continue;
+                }
+                if (block == 0u) continue;
+                body[block].push_back(index);
+                if (op == spv::OpBranch) successors[block].push_back(instruction.at(1));
+                else if (op == spv::OpBranchConditional) successors[block] = {instruction.at(2), instruction.at(3)};
+                else if (op == spv::OpSwitch) {
+                    const auto selectorType = resultTypes.find(instruction.at(1));
+                    const auto stride = selectorType != resultTypes.end() && types.contains(selectorType->second) && types.at(selectorType->second).width == 64u ? 3u : 2u;
+                    successors[block].push_back(instruction.at(2));
+                    for (std::size_t operand = 3; operand + stride <= instruction.size(); operand += stride) successors[block].push_back(instruction[operand + stride - 1u]);
+                }
+            }
+            if (order.empty()) continue;
+            std::vector<std::uint32_t> postorder;
+            std::set<std::uint32_t> visited;
+            std::vector<std::pair<std::uint32_t, std::size_t>> stack{{order.front(), 0u}};
+            visited.insert(order.front());
+            while (!stack.empty()) {
+                auto& [current, next] = stack.back();
+                const auto& outgoing = successors[current];
+                if (next < outgoing.size()) {
+                    const auto target = outgoing[next++];
+                    if (visited.insert(target).second) stack.push_back({target, 0u});
+                    continue;
+                }
+                postorder.push_back(current);
+                stack.pop_back();
+            }
+            std::map<std::uint32_t, std::size_t> rank;
+            for (std::size_t position = 0; position < postorder.size(); ++position) rank[postorder[position]] = position;
+            std::map<std::uint32_t, std::vector<std::uint32_t>> predecessors;
+            for (const auto label : postorder) {
+                for (const auto target : successors[label]) {
+                    if (rank.contains(target)) predecessors[target].push_back(label);
+                }
+            }
+            std::map<std::uint32_t, std::uint32_t> idom;
+            idom[order.front()] = order.front();
+            bool moved = true;
+            while (moved) {
+                moved = false;
+                for (auto position = postorder.rbegin(); position != postorder.rend(); ++position) {
+                    const auto label = *position;
+                    if (label == order.front()) continue;
+                    std::uint32_t candidate = 0;
+                    for (const auto predecessor : predecessors[label]) {
+                        if (!idom.contains(predecessor)) continue;
+                        if (candidate == 0u) {
+                            candidate = predecessor;
+                            continue;
+                        }
+                        auto left = candidate;
+                        auto right = predecessor;
+                        while (left != right) {
+                            while (rank.at(left) < rank.at(right)) left = idom.at(left);
+                            while (rank.at(right) < rank.at(left)) right = idom.at(right);
+                        }
+                        candidate = left;
+                    }
+                    if (candidate != 0u && (!idom.contains(label) || idom.at(label) != candidate)) {
+                        idom[label] = candidate;
+                        moved = true;
+                    }
+                }
+            }
+            std::map<std::uint32_t, std::vector<std::uint32_t>> children;
+            for (const auto& [label, parent] : idom) {
+                if (label != parent) children[parent].push_back(label);
+            }
+            std::map<std::uint32_t, std::uint32_t> faultGuards;
+            for (const auto label : postorder) {
+                const auto& positions = body[label];
+                if (faultFunction == 0u || positions.size() != 2u || predecessors[label].size() != 1u) continue;
+                const auto& call = instructions[positions[0]];
+                if (call.size() < 4u || Opcode(call) != spv::OpFunctionCall || call[3] != faultFunction || Opcode(instructions[positions[1]]) != spv::OpBranch) continue;
+                const auto guard = predecessors[label].front();
+                const auto& terminal = instructions[body[guard].back()];
+                if (Opcode(terminal) == spv::OpBranchConditional && terminal.size() >= 4u && terminal[2] == label && terminal[3] != label) faultGuards[label] = terminal[1];
+            }
+            std::map<std::uint32_t, std::uint32_t> faulted;
+            std::vector<std::vector<std::uint32_t>> faultScopes;
+            std::map<Instruction, std::uint32_t> table;
+            std::vector<std::vector<Instruction>> scopes;
+            std::vector<std::pair<std::uint32_t, bool>> walk{{order.front(), false}};
+            while (!walk.empty()) {
+                const auto [label, leaving] = walk.back();
+                walk.pop_back();
+                if (leaving) {
+                    for (const auto& key : scopes.back()) table.erase(key);
+                    scopes.pop_back();
+                    for (const auto condition : faultScopes.back()) faulted.erase(condition);
+                    faultScopes.pop_back();
+                    continue;
+                }
+                scopes.emplace_back();
+                faultScopes.emplace_back();
+                walk.push_back({label, true});
+                if (const auto guarded = faultGuards.find(label); guarded != faultGuards.end()) {
+                    const auto earlier = faulted.find(guarded->second);
+                    if (earlier != faulted.end() && earlier->second != predecessors[label].front()) {
+                        instructions[body[label].front()].clear();
+                        body[label].erase(body[label].begin());
+                        faultGuards.erase(guarded);
+                        changed = true;
+                    }
+                }
+                if (!body[label].empty()) {
+                    const auto& terminal = instructions[body[label].back()];
+                    if (Opcode(terminal) == spv::OpBranchConditional && terminal.size() >= 4u && faultGuards.contains(terminal[2]) && faultGuards.at(terminal[2]) == terminal[1] && faulted.emplace(terminal[1], label).second) faultScopes.back().push_back(terminal[1]);
+                }
+                for (const auto position : body[label]) {
+                    auto& instruction = instructions[position];
+                    if (instruction.empty()) continue;
+                    const auto op = Opcode(instruction);
+                    if (op == spv::OpCopyObject || (op == spv::OpLoad && (instruction.size() < 4u || !constantPointers.contains(instruction[3]))) || op == spv::OpPhi || DerivativeInstruction(op) || instruction.size() < 3u || !PureInstruction(instruction) || decorated.contains(instruction[2])) continue;
+                    Instruction key(instruction);
+                    key[2] = 0u;
+                    const auto found = table.find(key);
+                    if (found == table.end()) {
+                        table.emplace(key, instruction[2]);
+                        scopes.back().push_back(std::move(key));
+                        continue;
+                    }
+                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], found->second});
+                    changed = true;
+                }
+                for (const auto child : children[label]) walk.push_back({child, false});
+            }
+        }
+        return changed;
+    }
+
+    void shareConstants() {
+        using Key = std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>;
+        const auto keyOf = [](const Instruction& constant) {
+            const auto op = Opcode(constant);
+            return Key{op, constant.at(1), op == spv::OpConstant ? constant.at(3) : 0u};
+        };
+        const auto shareable = [](const Instruction& constant) {
+            const auto op = Opcode(constant);
+            return (op == spv::OpConstant && constant.size() == 4u) || op == spv::OpConstantTrue || op == spv::OpConstantFalse;
+        };
+        std::map<Key, std::uint32_t> canonical;
+        bool function = false;
+        for (const auto& instruction : instructions) {
+            if (instruction.empty()) continue;
+            const auto op = Opcode(instruction);
+            if (op == spv::OpFunction) break;
+            if (shareable(instruction)) canonical.emplace(keyOf(instruction), instruction.at(2));
+        }
+        std::map<std::uint32_t, std::uint32_t> duplicates;
+        for (const auto& constant : constants) {
+            if (!shareable(constant)) continue;
+            const auto [found, inserted] = canonical.emplace(keyOf(constant), constant.at(2));
+            if (!inserted) duplicates.emplace(constant.at(2), found->second);
+        }
+        if (duplicates.empty()) return;
+        const auto pin = [&](const Instruction& instruction, std::size_t from) {
+            for (std::size_t index = from; index < instruction.size(); ++index) duplicates.erase(instruction[index]);
+        };
+        for (const auto& instruction : instructions) {
+            if (instruction.empty()) continue;
+            const auto op = Opcode(instruction);
+            if (op == spv::OpFunction) function = true;
+            if (op == spv::OpFunctionEnd) function = false;
+            if (!function) {
+                if (op != spv::OpName) pin(instruction, 1u);
+                continue;
+            }
+            if (!VisitInputs(instruction, [](std::size_t) {})) pin(instruction, 1u);
+        }
+        for (const auto& constant : constants) {
+            if (Opcode(constant) == spv::OpConstantComposite) pin(constant, 3u);
+        }
+        if (duplicates.empty()) return;
+        function = false;
+        for (auto& instruction : instructions) {
+            if (instruction.empty()) continue;
+            const auto op = Opcode(instruction);
+            if (op == spv::OpFunction) function = true;
+            if (op == spv::OpFunctionEnd) function = false;
+            if (!function) continue;
+            VisitInputs(instruction, [&](std::size_t index) {
+                if (const auto found = duplicates.find(instruction[index]); found != duplicates.end()) instruction[index] = found->second;
+            });
+        }
+        for (auto& constant : constants) {
+            if (shareable(constant) && duplicates.contains(constant.at(2))) {
+                removed.insert(constant.at(2));
+                constant.clear();
+            }
+        }
+    }
+
+    void removeUnreferencedBlocks() {
+        std::set<std::uint32_t> referenced;
+        for (const auto& instruction : instructions) {
+            if (instruction.empty()) continue;
+            const auto op = Opcode(instruction);
+            if (op == spv::OpBranch || op == spv::OpSelectionMerge) referenced.insert(instruction.at(1));
+            else if (op == spv::OpLoopMerge) referenced.insert({instruction.at(1), instruction.at(2)});
+            else if (op == spv::OpBranchConditional) referenced.insert({instruction.at(2), instruction.at(3)});
+            else if (op == spv::OpSwitch) referenced.insert(instruction.begin() + 2, instruction.end());
+            else if (op == spv::OpPhi) {
+                for (std::size_t operand = 4; operand < instruction.size(); operand += 2u) referenced.insert(instruction[operand]);
+            }
+        }
+        bool entry = false;
+        for (std::size_t index = 0; index < instructions.size(); ++index) {
+            auto& instruction = instructions[index];
+            if (instruction.empty()) continue;
+            const auto op = Opcode(instruction);
+            if (op == spv::OpFunction) entry = true;
+            if (op != spv::OpLabel) continue;
+            const bool first = entry;
+            entry = false;
+            std::size_t next = index + 1u;
+            while (next < instructions.size() && instructions[next].empty()) ++next;
+            if (first || next >= instructions.size() || Opcode(instructions[next]) != spv::OpUnreachable || referenced.contains(instruction.at(1))) continue;
+            removed.insert(instruction.at(1));
+            instruction.clear();
+            instructions[next].clear();
+        }
     }
 
     void orderPhis() {
@@ -614,6 +944,7 @@ private:
     std::map<std::uint32_t, ScalarType> types;
     std::map<std::uint32_t, std::uint32_t> values;
     std::map<std::uint32_t, std::uint32_t> resultTypes;
+    std::set<std::uint32_t> vectorTypes;
     std::set<std::uint32_t> removed;
 };
 

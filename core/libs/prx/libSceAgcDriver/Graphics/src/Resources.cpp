@@ -3,9 +3,386 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NullSubmit.hpp"
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <exception>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
+
+bool NullSubmit() {
+    static const bool null = std::getenv("APS5_NULL_SUBMIT") != nullptr;
+    return null;
+}
+
+namespace {
+
+// The stub pipeline: `void main() {}` for GLCompute, local size 1.
+constexpr std::array<std::uint32_t, 35> NullPipelineCode{
+    0x07230203u, 0x00010300u, 0x00070000u, 0x00000005u, 0x00000000u, 0x00020011u, 0x00000001u, 0x0003000eu, 0x00000000u,
+    0x00000001u, 0x0005000fu, 0x00000005u, 0x00000001u, 0x6e69616du, 0x00000000u, 0x00060010u, 0x00000001u, 0x00000011u,
+    0x00000001u, 0x00000001u, 0x00000001u, 0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00050036u,
+    0x00000002u, 0x00000001u, 0x00000000u, 0x00000003u, 0x000200f8u, 0x00000004u, 0x000100fdu, 0x00010038u,
+};
+
+struct NullPipelineObjects {
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+std::mutex& nullPipelineMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::unordered_map<VkDevice, NullPipelineObjects>& nullPipelines() {
+    static std::unordered_map<VkDevice, NullPipelineObjects> pipelines;
+    return pipelines;
+}
+
+}
+
+VkPipeline NullPipeline(const Context& context) {
+    std::lock_guard lock(nullPipelineMutex());
+    auto& objects = nullPipelines()[context.device];
+    if (objects.pipeline != VK_NULL_HANDLE) return objects.pipeline;
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = NullPipelineCode.size() * sizeof(std::uint32_t);
+    moduleInfo.pCode = NullPipelineCode.data();
+    VkShaderModule module = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule null pipeline");
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &objects.layout), "vkCreatePipelineLayout null pipeline");
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineInfo.stage.module = module;
+    pipelineInfo.stage.pName = "main";
+    pipelineInfo.layout = objects.layout;
+    const auto result = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &objects.pipeline);
+    context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+    Check(result, "vkCreateComputePipelines null pipeline");
+    return objects.pipeline;
+}
+
+void ReleaseNullPipeline(const Context& context) {
+    std::lock_guard lock(nullPipelineMutex());
+    const auto found = nullPipelines().find(context.device);
+    if (found == nullPipelines().end()) return;
+    if (found->second.pipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, found->second.pipeline, nullptr);
+    if (found->second.layout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, found->second.layout, nullptr);
+    nullPipelines().erase(found);
+}
+
+namespace {
+
+std::atomic<PFN_vkGetDeviceProcAddr> realDeviceProc{nullptr};
+std::atomic<PFN_vkCreateImage> realCreateImage{nullptr};
+std::atomic<PFN_vkQueueSubmit> realQueueSubmit{nullptr};
+
+VKAPI_ATTR VkResult VKAPI_CALL nullCreateImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* allocator, VkImage* image) {
+    auto patched = *info;
+    if (patched.samples == VK_SAMPLE_COUNT_2_BIT || patched.samples == VK_SAMPLE_COUNT_8_BIT || patched.samples == VK_SAMPLE_COUNT_16_BIT) patched.samples = VK_SAMPLE_COUNT_4_BIT;
+    return realCreateImage.load(std::memory_order_relaxed)(device, &patched, allocator, image);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL nullQueueSubmit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    std::vector<VkSubmitInfo> empty(submits, submits + count);
+    for (auto& info : empty) {
+        info.commandBufferCount = 0;
+        info.pCommandBuffers = nullptr;
+    }
+    return realQueueSubmit.load(std::memory_order_relaxed)(queue, count, empty.data(), fence);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL nullDeviceProc(VkDevice device, const char* name) {
+    const auto real = realDeviceProc.load(std::memory_order_relaxed);
+    const auto function = real(device, name);
+    if (function == nullptr) return function;
+    if (std::strcmp(name, "vkCreateImage") == 0) {
+        realCreateImage.store(reinterpret_cast<PFN_vkCreateImage>(function), std::memory_order_relaxed);
+        return reinterpret_cast<PFN_vkVoidFunction>(&nullCreateImage);
+    }
+    if (std::strcmp(name, "vkQueueSubmit") == 0) {
+        realQueueSubmit.store(reinterpret_cast<PFN_vkQueueSubmit>(function), std::memory_order_relaxed);
+        return reinterpret_cast<PFN_vkVoidFunction>(&nullQueueSubmit);
+    }
+    return function;
+}
+
+}
+
+PFN_vkGetDeviceProcAddr NullDeviceProc(PFN_vkGetDeviceProcAddr real) {
+    PFN_vkGetDeviceProcAddr expected = nullptr;
+    realDeviceProc.compare_exchange_strong(expected, real, std::memory_order_relaxed);
+    return &nullDeviceProc;
+}
+
+bool BatchSubmits() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_BATCH_SUBMITS");
+        return value == nullptr || (value[0] != '\0' && value[0] != '0');
+    }();
+    return enabled;
+}
+
+namespace {
+
+VkResult SubmitToQueue(VkQueue queue, PFN_vkQueueSubmit submit, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    if (!NullSubmit()) return submit(queue, count, submits, fence);
+    // The same submissions with their waits and signals, without the command buffers.
+    std::vector<VkSubmitInfo> empty(submits, submits + count);
+    for (auto& info : empty) {
+        info.commandBufferCount = 0;
+        info.pCommandBuffers = nullptr;
+    }
+    return submit(queue, count, empty.data(), fence);
+}
+
+// The submit thread (BatchSubmits): a FIFO of recorded batches, submitted in order. `queueMutex` is held for each
+// vkQueueSubmit the thread makes and by AcquireQueue's callers; `mutex` guards the FIFO and the counts.
+class SubmitThread {
+public:
+    // Never destroyed: a static's destructor would join the worker during DLL detach at process exit, after Windows
+    // ended the thread, and the winpthreads join then waits forever (every test exited only after a ctest timeout).
+    static SubmitThread& Get() {
+        static auto* thread = new SubmitThread();
+        return *thread;
+    }
+
+    void Enqueue(const Context& context, PFN_vkQueueSubmit submit, const QueuedSubmit& work) {
+        {
+            std::lock_guard lock(mutex);
+            rethrowFailure();
+            if (!worker.joinable()) worker = std::thread([this] { run(); });
+            fifo.push_back(Item{context.queue, submit, work});
+            ++enqueued;
+        }
+        wake.notify_one();
+    }
+
+    std::unique_lock<std::mutex> Acquire() {
+        {
+            std::unique_lock lock(mutex);
+            const auto target = enqueued;
+            drained.wait(lock, [&] { return submitted >= target; });
+            rethrowFailure();
+        }
+        return std::unique_lock(queueMutex);
+    }
+
+    SubmitThreadCounts TakeCounts() {
+        std::lock_guard lock(mutex);
+        return std::exchange(counts, SubmitThreadCounts{});
+    }
+
+private:
+    struct Item {
+        VkQueue queue;
+        PFN_vkQueueSubmit submit;
+        QueuedSubmit work;
+    };
+
+    ~SubmitThread() {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        wake.notify_one();
+        if (worker.joinable()) worker.join();
+    }
+
+    void rethrowFailure() {
+        if (failure == VK_SUCCESS) return;
+        Check(std::exchange(failure, VK_SUCCESS), "vkQueueSubmit recorder (submit thread)");
+    }
+
+    void run() {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            wake.wait(lock, [&] { return stopping || !fifo.empty(); });
+            if (fifo.empty()) return;
+            const auto item = fifo.front();
+            fifo.pop_front();
+            lock.unlock();
+            VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submission.commandBufferCount = 1;
+            submission.pCommandBuffers = &item.work.commands;
+            VkTimelineSemaphoreSubmitInfoKHR timelineInfo{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+            timelineInfo.signalSemaphoreValueCount = 1;
+            timelineInfo.pSignalSemaphoreValues = &item.work.value;
+            if (item.work.timeline != VK_NULL_HANDLE) {
+                submission.pNext = &timelineInfo;
+                submission.signalSemaphoreCount = 1;
+                submission.pSignalSemaphores = &item.work.timeline;
+            }
+            const auto start = std::chrono::steady_clock::now();
+            VkResult result;
+            {
+                std::lock_guard queueLock(queueMutex);
+                result = SubmitToQueue(item.queue, item.submit, 1, &submission, item.work.fence);
+            }
+            const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+            lock.lock();
+            if (result != VK_SUCCESS && failure == VK_SUCCESS) failure = result;
+            ++submitted;
+            ++counts.submits;
+            counts.submitUs += us;
+            drained.notify_all();
+        }
+    }
+
+    std::mutex mutex;
+    std::mutex queueMutex;
+    std::condition_variable wake;
+    std::condition_variable drained;
+    std::deque<Item> fifo;
+    std::uint64_t enqueued = 0;
+    std::uint64_t submitted = 0;
+    VkResult failure = VK_SUCCESS;
+    SubmitThreadCounts counts;
+    bool stopping = false;
+    std::thread worker;
+};
+
+}
+
+void EnqueueSubmit(const Context& context, PFN_vkQueueSubmit submit, const QueuedSubmit& work) {
+    SubmitThread::Get().Enqueue(context, submit, work);
+}
+
+std::unique_lock<std::mutex> AcquireQueue() {
+    if (!BatchSubmits()) return {};
+    return SubmitThread::Get().Acquire();
+}
+
+SubmitThreadCounts TakeSubmitThreadCounts() {
+    if (!BatchSubmits()) return {};
+    return SubmitThread::Get().TakeCounts();
+}
+
+VkResult QueueSubmit(const Context&, VkQueue queue, PFN_vkQueueSubmit submit, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    const auto queueLock = AcquireQueue();
+    return SubmitToQueue(queue, submit, count, submits, fence);
+}
+
+namespace {
+
+struct GpuMemoryCounts {
+    std::array<std::atomic<std::int64_t>, static_cast<std::size_t>(GpuMemoryKind::Count)> bytes{};
+    std::array<std::atomic<std::int64_t>, static_cast<std::size_t>(GpuMemoryKind::Count)> objects{};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+GpuMemoryCounts& MemoryCounts() {
+    static GpuMemoryCounts counts;
+    return counts;
+}
+
+thread_local std::uint64_t outOfMemoryFailures = 0;
+
+std::string describeGpuMemory() {
+    static constexpr std::array<const char*, static_cast<std::size_t>(GpuMemoryKind::Count)> names{"host buffers", "device buffers", "host imports", "textures", "storage images", "depth surfaces", "render targets", "shadow slabs"};
+    auto& counts = MemoryCounts();
+    std::string text;
+    std::int64_t objects = 0;
+    for (std::size_t kind = 0; kind < names.size(); ++kind) {
+        char item[96];
+        const auto count = counts.objects[kind].load(std::memory_order_relaxed);
+        objects += count;
+        std::snprintf(item, sizeof(item), "%s%s %.0f MiB (%lld)", kind == 0 ? "" : ", ", names[kind], counts.bytes[kind].load(std::memory_order_relaxed) / 1048576.0, static_cast<long long>(count));
+        text += item;
+    }
+    char tail[96];
+    std::snprintf(tail, sizeof(tail), "; %lld allocations", static_cast<long long>(objects));
+    return text + tail;
+}
+
+bool outOfMemory(VkResult result) {
+    return result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+
+}
+
+void CountGpuMemory(GpuMemoryKind kind, std::int64_t bytes) {
+    auto& counts = MemoryCounts();
+    const auto index = static_cast<std::size_t>(kind);
+    counts.bytes[index].fetch_add(bytes, std::memory_order_relaxed);
+    counts.objects[index].fetch_add(bytes < 0 ? -1 : 1, std::memory_order_relaxed);
+    static const bool trace = std::getenv("APS5_TRACE_GPU_MEMORY") != nullptr;
+    if (!trace) return;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counts.lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10 || !counts.lastReport.compare_exchange_strong(last, now)) return;
+    std::fprintf(stderr, "[gpumem] live: %s\n", describeGpuMemory().c_str());
+}
+
+std::uint64_t LiveGpuMemory() {
+    std::int64_t total = 0;
+    for (const auto& bytes : MemoryCounts().bytes) total += bytes.load(std::memory_order_relaxed);
+    return total > 0 ? static_cast<std::uint64_t>(total) : 0;
+}
+
+std::uint64_t OutOfMemoryFailures() {
+    return outOfMemoryFailures;
+}
+
+VkResult AllocateGpuMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory& memory, GpuMemoryKind kind, const char* what, std::uint32_t fallbackTypes) {
+    const auto allocate = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
+    auto result = allocate(context.device, &allocation, nullptr, &memory);
+    VkDeviceSize trimmed = 0;
+    if (outOfMemory(result) && context.bufferPool != nullptr && (trimmed = context.bufferPool->Trim()) != 0) result = allocate(context.device, &allocation, nullptr, &memory);
+    // A device-local allocation whose heap ran out goes to another heap its resource allows (device-local first,
+    // then host-visible): slower memory instead of a failed draw or dispatch. Ported from wolverine-capture 20c34aa1d.
+    if (outOfMemory(result) && fallbackTypes != 0) {
+        const auto failedHeap = context.memory.memoryTypes[allocation.memoryTypeIndex].heapIndex;
+        for (const bool visible : {false, true}) {
+            for (std::uint32_t index = 0; index < context.memory.memoryTypeCount && outOfMemory(result); ++index) {
+                const auto& type = context.memory.memoryTypes[index];
+                if ((fallbackTypes & (1u << index)) == 0 || type.heapIndex == failedHeap || (type.propertyFlags & (VK_MEMORY_PROPERTY_PROTECTED_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT)) != 0 || ((type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) != visible) continue;
+                auto moved = allocation;
+                moved.memoryTypeIndex = index;
+                result = allocate(context.device, &moved, nullptr, &memory);
+                if (result != VK_SUCCESS) continue;
+                static std::atomic<std::uint64_t> placed{0};
+                const auto count = placed.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (count <= 4 || count % 1000 == 0) std::fprintf(stderr, "[gpumem] %s of %.1f MiB placed in memory type %u (heap %u) after heap %u ran out (%llu so far)\n", what, allocation.allocationSize / 1048576.0, index, type.heapIndex, failedHeap, static_cast<unsigned long long>(count));
+            }
+            if (!outOfMemory(result)) break;
+        }
+    }
+    if (result == VK_SUCCESS) {
+        CountGpuMemory(kind, static_cast<std::int64_t>(allocation.allocationSize));
+        return result;
+    }
+    memory = VK_NULL_HANDLE;
+    if (!outOfMemory(result)) return result;
+    ++outOfMemoryFailures;
+    const auto& type = context.memory.memoryTypes[allocation.memoryTypeIndex];
+    const auto& heap = context.memory.memoryHeaps[type.heapIndex];
+    static std::atomic<std::uint64_t> failures{0};
+    const auto failure = failures.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (failure > 4 && failure % 100 != 0) return result;
+    const auto pool = context.bufferPool != nullptr ? context.bufferPool->RetainedBytes() : std::pair<VkDeviceSize, VkDeviceSize>{0, 0};
+    const auto* recorder = GuestMemory::GpuMutex().HeldByThisThread() ? Recorder::Active() : nullptr;
+    char batches[48] = "";
+    if (recorder != nullptr) std::snprintf(batches, sizeof(batches), ", %zu batches in flight", recorder->InFlightBatches());
+    std::fprintf(stderr, "[gpumem] vkAllocateMemory %s of %.1f MiB failed (%d, failure %llu): memory type %u (flags 0x%x) in heap %u (%.0f MiB, flags 0x%x); pool emptied %.0f MiB first; live: %s of %u allowed; pool retains %.0f MiB host, %.0f MiB device; host import limit %.0f MiB%s\n", what, allocation.allocationSize / 1048576.0, static_cast<int>(result), static_cast<unsigned long long>(failure), allocation.memoryTypeIndex, type.propertyFlags, type.heapIndex, heap.size / 1048576.0, heap.flags, trimmed / 1048576.0, describeGpuMemory().c_str(), context.limits.maxMemoryAllocationCount, pool.first / 1048576.0, pool.second / 1048576.0, HostImportLimit() / 1048576.0, batches);
+    return result;
+}
 
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
     Require(size != 0, "zero-sized GPU buffer");
@@ -61,7 +438,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             ready = true;
             return;
         }
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory buffer");
+        Check(AllocateGpuMemory(context, allocation, memory, (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 ? GpuMemoryKind::HostBuffer : GpuMemoryKind::DeviceBuffer, "buffer", (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 ? 0u : requirements.memoryTypeBits), "vkAllocateMemory buffer");
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
         if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
@@ -88,7 +465,10 @@ void Buffer::release() noexcept {
     }
     if (mapping) context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, memory);
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) {
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        CountGpuMemory((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 ? GpuMemoryKind::HostBuffer : GpuMemoryKind::DeviceBuffer, -static_cast<std::int64_t>(allocationBytes));
+    }
 }
 
 VkBuffer Buffer::Handle() const {
@@ -131,7 +511,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory device buffer");
+        Check(AllocateGpuMemory(context, allocation, memory, GpuMemoryKind::DeviceBuffer, "device buffer", requirements.memoryTypeBits), "vkAllocateMemory device buffer");
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
     } catch (...) {
         release();
@@ -149,7 +529,10 @@ void DeviceBuffer::release() noexcept {
         return;
     }
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) {
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        CountGpuMemory(GpuMemoryKind::DeviceBuffer, -static_cast<std::int64_t>(allocationBytes));
+    }
 }
 
 VkBuffer DeviceBuffer::Handle() const {
@@ -243,7 +626,8 @@ RenderTarget::RenderTarget(const Context& context, const ColorTarget& target, bo
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory render target");
+        Check(AllocateGpuMemory(context, allocation, memory, GpuMemoryKind::RenderTarget, "render target", requirements.memoryTypeBits), "vkAllocateMemory render target");
+        allocationBytes = allocation.allocationSize;
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory");
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = image;
@@ -264,7 +648,10 @@ RenderTarget::~RenderTarget() {
 void RenderTarget::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) {
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        CountGpuMemory(GpuMemoryKind::RenderTarget, -static_cast<std::int64_t>(allocationBytes));
+    }
 }
 
 VkImage RenderTarget::Image() const {
@@ -304,7 +691,10 @@ CommandBatch::~CommandBatch() {
 void CommandBatch::release() noexcept {
     if (pending) {
         auto result = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, fence);
-        if (result == VK_NOT_READY) result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+        if (result == VK_NOT_READY) {
+            const auto queueLock = AcquireQueue();
+            result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+        }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) std::terminate();
     }
     if (commands) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
@@ -328,10 +718,17 @@ void CommandBatch::Submit() {
     submission.commandBufferCount = 1;
     submission.pCommandBuffers = &commands;
     timing.Mark("command_end");
-    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    Check(QueueSubmit(context, context.queue, context.Function<PFN_vkQueueSubmit>("vkQueueSubmit"), 1, &submission, fence), "vkQueueSubmit graphics");
     timing.Mark("queue_submit");
     pending = true;
     submitted = true;
+}
+
+bool CommandBatch::Finished() {
+    if (!pending) return true;
+    if (context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, fence) != VK_SUCCESS) return false;
+    pending = false;
+    return true;
 }
 
 void CommandBatch::Wait() {

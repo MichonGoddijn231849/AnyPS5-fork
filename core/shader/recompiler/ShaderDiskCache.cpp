@@ -493,6 +493,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(image.indirectRoot);
         out.Value(image.indirectMappingOffset);
         out.Value(image.indirectSearchIterations);
+        out.Value(image.wideTable);
         out.Values(std::span<const std::uint32_t>(image.indirectResources));
     });
     writer.Value(!info.runtimeImageModes.empty());
@@ -598,6 +599,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.indirectRoot);
         in.Value(image.indirectMappingOffset);
         in.Value(image.indirectSearchIterations);
+        in.Value(image.wideTable);
         in.Values(image.indirectResources);
     });
     bool preparedImageModes = false;
@@ -658,11 +660,14 @@ void decodeAllocation(Reader& reader, CompiledBindingLayout& allocation) {
 
 constexpr std::string_view NeutralSwitches[] = {
     "APS5_PROFILE_DRAW",
+    "APS5_FAST_STRUCTURIZER",
     "APS5_DUMP_IR",
     "APS5_NO_CODE_HASH_KEY",
     "APS5_NO_FAILURE_MEMO",
     "APS5_NO_PERF_FRONTEND_PAIR",
     "APS5_NO_RESULT_MEMO",
+    "APS5_VERIFY_SRT_COMPACT",
+    "APS5_TRACE_TABLE_MATCH",
 };
 
 const std::vector<std::byte>& switchKey() {

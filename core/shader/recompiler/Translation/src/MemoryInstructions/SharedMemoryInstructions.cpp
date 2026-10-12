@@ -30,10 +30,18 @@ MemoryInfo sharedMemoryInfoFromInstruction(const RdnaInstruction& inst) {
 
 }
 
+// A DS address: on GDS, plus the wave's GDS base (M0 bits 16-31, the size in bits 0-15).
+IrU32 TranslationContext::sharedAddress(const RdnaInstruction& inst) {
+    const IrU32 address = readU32(inst.source0);
+    if (!inst.gds) return address;
+    IrValue& base = ir.ShiftRightLogical(readU32(makeM0Operand()).Value(), ir.Constant(16u));
+    return IrU32(ir.IAdd(address.Value(), base));
+}
+
 bool TranslationContext::dsAtomic(const RdnaInstruction& inst, IrOpcode opcode, bool returnsValue) {
     MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
     memory.flushDenormals = sharedFloatFlush(opcode);
-    const IrU32 address = readU32(inst.source0);
+    const IrU32 address = sharedAddress(inst);
     const IrU32 value = readU32(inst.source1);
     IrValue& active = ir.GetExec();
     IrValue& result = ir.Emit(opcode, IrOpcodeType(opcode), {&address.Value(), &value.Value(), &active}, addMemoryInfo(memory, inst.programCounter));
@@ -53,7 +61,7 @@ bool TranslationContext::dsWrxchg2(const RdnaInstruction& inst) {
     first.componentCount = width;
     MemoryInfo second = first;
     second.offset = first.secondaryOffset;
-    const IrU32 address = readU32(inst.source0);
+    const IrU32 address = sharedAddress(inst);
     const auto data = [&](const RdnaOperand& operand) { return width == 2u ? &readU64(operand).Value() : &readU32(operand).Value(); };
     IrValue* firstValue = data(inst.source1);
     IrValue* secondValue = data(inst.source2);
@@ -117,7 +125,7 @@ void TranslationContext::writeSharedU32(std::uint32_t width, IrU32 address, cons
 
 bool TranslationContext::dsRead(const RdnaInstruction& inst) {
     const MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
-    const IrU32 address = readU32(inst.source0);
+    const IrU32 address = sharedAddress(inst);
     if (memory.dataBits == 32u) {
         const std::uint32_t width = memory.dataDwords;
         IrValue* loaded = loadSharedU32(width, address, memory, inst.programCounter);
@@ -136,7 +144,7 @@ bool TranslationContext::dsRead(const RdnaInstruction& inst) {
 bool TranslationContext::dsRead2(const RdnaInstruction& inst) {
     const MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
     const std::uint32_t width = memory.dataDwords / 2u;
-    const IrU32 address = readU32(inst.source0);
+    const IrU32 address = sharedAddress(inst);
     MemoryInfo first = memory;
     first.dataDwords = width;
     first.componentCount = width;
@@ -161,7 +169,7 @@ bool TranslationContext::dsWrite(const RdnaInstruction& inst) {
     for (std::uint32_t index = 0u; index < width; ++index) {
         values[index] = &readU32(offsetOperand(inst.source1, index)).Value();
     }
-    const IrU32 address = readU32(inst.source0);
+    const IrU32 address = sharedAddress(inst);
     if (memory.dataBits == 32u) {
         writeSharedU32(width, address, values, memory, inst.programCounter);
         return true;
@@ -176,7 +184,7 @@ bool TranslationContext::dsWrite(const RdnaInstruction& inst) {
 bool TranslationContext::dsWrite2(const RdnaInstruction& inst) {
     const MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
     const std::uint32_t width = memory.dataDwords / 2u;
-    const IrU32 address = readU32(inst.source0);
+    const IrU32 address = sharedAddress(inst);
     std::array<IrValue*, 4> firstValues{};
     std::array<IrValue*, 4> secondValues{};
     for (std::uint32_t index = 0u; index < width; ++index) {
@@ -200,7 +208,7 @@ bool TranslationContext::dsSrc2(const RdnaInstruction& inst, IrOpcode opcode) {
         throw std::runtime_error("GDS src2 operations are not supported");
     }
     const MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
-    const IrU32 address = readU32(inst.source0);
+    const IrU32 address = sharedAddress(inst);
     MemoryInfo source = memory;
     source.offset = memory.secondaryOffset;
     source.secondaryOffset = 0u;
@@ -230,7 +238,7 @@ bool TranslationContext::sharedFloatFlush(IrOpcode opcode) const {
 bool TranslationContext::dsAtomic2(const RdnaInstruction& inst, IrOpcode opcode, bool returnsValue) {
     MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
     memory.flushDenormals = sharedFloatFlush(opcode);
-    const IrU32 address = readU32(inst.source0);
+    const IrU32 address = sharedAddress(inst);
     const IrU32 data0 = readU32(inst.source1);
     const IrU32 data1 = readU32(inst.source2);
     IrValue& active = ir.GetExec();
@@ -245,7 +253,7 @@ bool TranslationContext::dsAtomic64(const RdnaInstruction& inst, IrOpcode opcode
     }
     MemoryInfo memory = sharedMemoryInfoFromInstruction(inst);
     memory.flushDenormals = sharedFloatFlush(opcode);
-    const IrU32 address = readU32(inst.source0);
+    const IrU32 address = sharedAddress(inst);
     const IrU64 data0 = readU64(inst.source1);
     IrValue& active = ir.GetExec();
     IrValue* old;
@@ -267,7 +275,7 @@ bool TranslationContext::dsCondxchg32(const RdnaInstruction& inst) {
     memory.dataDwords = 1u;
     memory.componentCount = 1u;
     const auto data = readU32Pair(inst.source1);
-    const IrU32 address = readU32(inst.source0);
+    const IrU32 address = sharedAddress(inst);
     IrValue& active = ir.GetExec();
     std::array<IrValue*, 2> old{};
     for (std::uint32_t index = 0u; index < 2u; ++index) {

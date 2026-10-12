@@ -1,4 +1,6 @@
 #include <string>
+#include <utility>
+#include <functional>
 #include <optional>
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAW_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAW_HPP
@@ -7,7 +9,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -18,11 +22,46 @@ struct HostImport;
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+// Debug aid: APS5_TRACE_DRAW_IO=1 prints one [draw-io] line per draw with its bindings, as APS5_TRACE_DISPATCH_IO does
+// for dispatches: the tag the driver set on the drawing thread (queue, submission, packet, programs), then the color
+// and depth targets and ShaderResources::Describe(). tools/fidelity reads it.
+bool TraceDrawIo();
+// The pass being recorded on this thread while a trace is on: a draw's [draw-io] tag, or "program 0x..." for a
+// dispatch. Recorder::OnComplete keeps it with each completion, so a failing write-back names its pass.
+std::string& PassTag();
+struct PassTagScope {
+    explicit PassTagScope(std::string tag) : previous(std::exchange(PassTag(), std::move(tag))) {}
+    ~PassTagScope() { PassTag() = std::move(previous); }
+    PassTagScope(const PassTagScope&) = delete;
+    PassTagScope& operator=(const PassTagScope&) = delete;
+    std::string previous;
+};
+// APS5_CAPTURE_PASSES (tools/fidelity): set by the driver on the drawing thread around a captured draw. `before` gets
+// the guest ranges the draw reads and the ones it writes (targets and their metadata, written bindings) once its
+// bindings are resolved and before it is recorded; `after` runs when the draw leaves without an exception.
+struct DrawCaptureHook {
+    using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    // `snapshots`: the memory the driver captured at the packet (descriptor tables, user data), which a pipelined draw
+    // must be saved from: the game rewrites those rings before the draw is recorded.
+    std::function<void(const Ranges& reads, const Ranges& writes, std::span<const GuestMemorySnapshot> snapshots)> before;
+    std::function<void()> after;
+};
+const DrawCaptureHook*& CurrentDrawCapture();
+struct DrawCaptureScope {
+    explicit DrawCaptureScope(const DrawCaptureHook* hook) : previous(std::exchange(CurrentDrawCapture(), hook)) {}
+    ~DrawCaptureScope() { CurrentDrawCapture() = previous; }
+    DrawCaptureScope(const DrawCaptureScope&) = delete;
+    DrawCaptureScope& operator=(const DrawCaptureScope&) = delete;
+    const DrawCaptureHook* previous;
+};
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 
 struct DrawInputCopy {
     std::shared_ptr<Buffer> buffer;
+    VkDeviceSize offset = 0;
+    std::size_t bytes = 0;
+    std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
     bool reused = false;
     std::uint32_t derived = 0;
     std::uint64_t generation = 0;
@@ -32,6 +71,30 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment);
+
+struct DrawPreparation {
+    std::set<std::uint32_t> fragmentOutputs;
+    VkPipelineStageFlags shaderStages = 0;
+    VertexInputLayout vertexInput;
+    std::vector<std::uint32_t> contentKey;
+    bool keyed = false;
+    bool validateMemoized = false;
+    bool validateHit = false;
+    VkDevice device = VK_NULL_HANDLE;
+    const State* state = nullptr;
+    std::vector<const void*> programs;
+};
+bool PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawPreparation& prepared);
+class DrawPreparationScope {
+public:
+    explicit DrawPreparationScope(const DrawPreparation* prepared);
+    ~DrawPreparationScope();
+    DrawPreparationScope(const DrawPreparationScope&) = delete;
+    DrawPreparationScope& operator=(const DrawPreparationScope&) = delete;
+
+private:
+    const DrawPreparation* previous;
+};
 
 std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters& draw);
 

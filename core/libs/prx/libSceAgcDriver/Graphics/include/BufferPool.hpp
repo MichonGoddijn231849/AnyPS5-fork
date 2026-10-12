@@ -8,6 +8,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -63,6 +64,13 @@ public:
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     void Put(const BufferAllocation& allocation) noexcept;
+    VkDeviceSize Trim() noexcept;
+    std::pair<VkDeviceSize, VkDeviceSize> RetainedBytes();
+    // The device is about to be destroyed (VulkanDevice teardown): the retained slots are destroyed
+    // now, and every allocation that comes back later (a buffer kept by a static that outlives the
+    // device, such as an image mirror, destroyed at exit) is dropped without a Vulkan call, since its
+    // device and the loader's entry points may be gone by then.
+    void Retire() noexcept;
     static bool SlabEligible(std::size_t capacity, VkDeviceSize alignment, VkDeviceSize size, VkDeviceSize atom);
     static VkDeviceSize SlabBlockBytes(std::size_t capacity);
     SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable);
@@ -117,7 +125,10 @@ private:
     static bool DeviceTierEnabled();
     static bool DeviceTiered(VkMemoryPropertyFlags properties);
     static std::size_t NextCapacity(std::size_t capacity);
-    void destroy(const BufferAllocation& allocation) noexcept;
+    // `live`: the device stands (not retired), so the handles are destroyed and the memory freed.
+    void destroy(const BufferAllocation& allocation, bool live) noexcept;
+    // Body of Trim and Retire: every retained slot is destroyed; `retire` also marks the pool retired.
+    VkDeviceSize trim(bool retire) noexcept;
     // Moves the tier's least recently used slot (the oldest front of its lists) to `evicted`; the
     // caller destroys those after releasing the mutex, so builds taking buffers on other threads
     // do not wait behind the Vulkan destroy calls. Nothing changes when the vector cannot grow.
@@ -131,6 +142,8 @@ private:
     PFN_vkFreeMemory freeMemory;
     PFN_vkAllocateMemory allocateMemory;
     PFN_vkMapMemory mapMemory;
+    // Set by Retire, under the mutex.
+    bool retired = false;
     std::mutex mutex;
     // Not `small`/`large`: <rpcndr.h> (via <windows.h>) defines `small` as a macro.
     Tier smallTier;

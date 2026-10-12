@@ -63,6 +63,7 @@ void RunColorTargetLayoutTests() {
             standardSeen[address / 4] = true;
         }
     }
+    // Every element size and both standard block sizes cover their block once, sized like the texture layout.
     for (const auto mode : {ColorTileMode::Standard4KB, ColorTileMode::Standard64KB}) {
         for (const std::uint32_t bpe : {1u, 2u, 4u, 8u, 16u}) {
             const auto block = mode == ColorTileMode::Standard64KB ? 65536u : 4096u;

@@ -187,8 +187,8 @@ public:
         SYSTEM_INFO system{};
         GetSystemInfo(&system);
         for (std::size_t done = 0; done < bytes; done += pageBytes, ++view) {
-            if (view == views.end() || view->first != address + done || view->second.offset != offset + done) throw refuse("the range is not one contiguous run of views of a section");
-            if (view->second.section != section && !sameSection(view->second.section->handle, section->handle)) throw refuse("the range spans several sections");
+            if (view == views.end() || view->first != address + done) throw refuse("a page of the range is not a shared view");
+            if (view->second.offset != offset + done || (view->second.section != section && !sameSection(view->second.section->handle, section->handle))) return mapAliasPieces(address, bytes);
         }
         const auto lead = offset % system.dwAllocationGranularity;
         void* alias = map(section->handle, GetCurrentProcess(), nullptr, offset - lead, lead + bytes, 0, PAGE_READWRITE, nullptr, 0);
@@ -202,6 +202,17 @@ public:
 
     void UnmapAlias(void* alias) {
         if (alias == nullptr) return;
+        {
+            std::lock_guard lock(mutex);
+            const auto pieces = pieceAliases.find(reinterpret_cast<std::uintptr_t>(alias));
+            if (pieces != pieceAliases.end()) {
+                for (const auto piece : pieces->second) {
+                    if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(piece), 0)) fail("unmap a piece of a shared guest alias");
+                }
+                pieceAliases.erase(pieces);
+                return;
+            }
+        }
         SYSTEM_INFO system{};
         GetSystemInfo(&system);
         const auto base = reinterpret_cast<std::uintptr_t>(alias) & ~(static_cast<std::uintptr_t>(system.dwAllocationGranularity) - 1);
@@ -313,6 +324,40 @@ private:
         std::uint64_t offset;
         std::uint32_t hostWrites;
     };
+    void* mapAliasPieces(std::uintptr_t address, std::size_t bytes) {
+        void* reservation = allocate(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+        if (reservation == nullptr) fail("reserve a read-write alias of shared guest memory");
+        const auto base = reinterpret_cast<std::uintptr_t>(reservation);
+        std::vector<std::uintptr_t> pieces;
+        std::size_t done = 0;
+        const auto undo = [&] {
+            for (const auto piece : pieces) unmap(GetCurrentProcess(), reinterpret_cast<void*>(piece), 0);
+            for (auto cursor = base + done; cursor < base + bytes;) {
+                const auto memory = query(cursor);
+                VirtualFree(memory.BaseAddress, 0, MEM_RELEASE);
+                cursor = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+            }
+        };
+        while (done < bytes) {
+            const auto first = views.find(address + done);
+            std::size_t run = pageBytes;
+            for (auto next = std::next(first); done + run < bytes && next != views.end() && next->first == address + done + run && next->second.offset == first->second.offset + run && (next->second.section == first->second.section || sameSection(next->second.section->handle, first->second.section->handle)); ++next) run += pageBytes;
+            const auto piece = base + done;
+            if (done + run < bytes && !VirtualFree(reinterpret_cast<void*>(piece), run, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                undo();
+                fail("split a read-write alias placeholder");
+            }
+            if (map(first->second.section->handle, GetCurrentProcess(), reinterpret_cast<void*>(piece), first->second.offset, run, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == nullptr) {
+                undo();
+                fail("map a piece of a read-write alias of shared guest memory");
+            }
+            pieces.push_back(piece);
+            done += run;
+        }
+        pieceAliases.emplace(base, std::move(pieces));
+        return reservation;
+    }
+
     void forgetClean(std::uintptr_t start, std::uintptr_t end) {
         auto it = cleanRanges.lower_bound(start);
         if (it != cleanRanges.begin() && std::prev(it)->second > start) --it;
@@ -427,6 +472,7 @@ private:
 
     std::map<std::uintptr_t, std::uintptr_t> cleanRanges;
     std::map<std::uintptr_t, View> views;
+    std::map<std::uintptr_t, std::vector<std::uintptr_t>> pieceAliases;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::mutex mutex;
     AllocateFunction allocate = nullptr;

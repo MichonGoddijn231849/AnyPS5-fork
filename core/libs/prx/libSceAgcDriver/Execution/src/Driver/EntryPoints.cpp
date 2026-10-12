@@ -1,4 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include <atomic>
+#include <cstdio>
+#include <exception>
 #include <mutex>
 
 namespace AgcDriver {
@@ -18,7 +23,10 @@ void Shutdown() {
 }
 
 void RegisterShader(const Shader* shader) {
+    const bool profile = DriverDetail::PreparationProfile::Enabled();
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     DriverDetail::Driver::Get().RegisterShader(shader);
+    if (profile) DriverDetail::PreparationProfile::Add(DriverDetail::PreparationProfile::Phase::Registration, start);
 }
 
 void SuspendPoint() {
@@ -118,13 +126,35 @@ extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
     AgcDriver::ReportFailure(error);
 }
 
+namespace {
+
+// The ABI hints prepare shaders ahead of their draws. GTA V links stages whose headers or primitive state do not
+// match yet; a hint that fails is reported and dropped, and the draw checks its own state when it runs.
+template<typename TWork>
+void ResolveHint(const char* what, TWork&& work) {
+    using AgcDriver::DriverDetail::PreparationProfile::Phase;
+    const bool profile = AgcDriver::DriverDetail::PreparationProfile::Enabled();
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    try {
+        work();
+        if (profile) AgcDriver::DriverDetail::PreparationProfile::Add(Phase::AbiHint, start);
+    } catch (const std::exception& error) {
+        if (profile) AgcDriver::DriverDetail::PreparationProfile::Add(Phase::AbiHint, start, 0, true);
+        static std::atomic<std::uint32_t> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[shader-registry] %s hint dropped: %s\n", what, error.what());
+        AgcDriver::DriverDetail::ShaderPreparationTransaction::ForgiveFailure();
+    }
+}
+
+}
+
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
-    AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
+    ResolveHint("shader ABI", [&] { AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive); });
 }
 
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) {
-    AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
+    ResolveHint("graphics ABI", [&] { AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType); });
 }
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
-    AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
+    ResolveHint("graphics stages ABI", [&] { AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive); });
 }

@@ -168,9 +168,11 @@ struct ShaderPixelInputInfo {
     bool psPixelKillEnable = false;
     bool psDepthExportEnable = false;
     bool psSampleMaskExportEnable = false;
+    bool psStencilExportEnable = false;
     bool psSampleShading = false;
     bool psEarlyZ = false;
     bool psExecuteOnNoop = false;
+    std::uint8_t quadPixelMask = 0xf;
     ConservativeZExport psConservativeZExport = ConservativeZExport::AnyZ;
     bool psOrderedPixelShader = false;
     ShaderStageRuntime stage;

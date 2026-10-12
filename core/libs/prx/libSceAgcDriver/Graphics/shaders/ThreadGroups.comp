@@ -1,0 +1,20 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint value[3]; };
+layout(push_constant) uniform Parameters {
+    uvec2 threads;
+    uvec2 groups;
+    uvec4 groupSize;
+} parameters;
+
+void main() {
+    Words threads = Words(parameters.threads);
+    Words groups = Words(parameters.groups);
+    for (uint axis = 0u; axis < 3u; ++axis) {
+        uint size = max(parameters.groupSize[axis], 1u);
+        groups.value[axis] = (threads.value[axis] + size - 1u) / size;
+    }
+}

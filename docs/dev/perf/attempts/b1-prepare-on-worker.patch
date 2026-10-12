@@ -1,0 +1,594 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp b/core/libs/prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp
+index c03b9538..c6aec273 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp
+@@ -210,7 +210,7 @@ private:
+     void noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint32_t queue);
+     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);
+     static std::vector<std::pair<std::uint64_t, std::uint64_t>> drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages);
+-    void commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey);
++    void commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const std::shared_ptr<const Graphics::PreparedDrawPipeline>& prepared);
+     bool enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue);
+     // APS5_PIPELINE_DMA=1: queue 0's DMA_DATA to memory as an ordered commit item (see PacketMemory.cpp).
+     bool enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state);
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp b/core/libs/prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp
+index 40de5c2d..9c5c4887 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp
+@@ -281,7 +281,10 @@ public:
+     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
+     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
+     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
+-    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
++    // `prepared`: the worker's PrepareDraw result for this draw (APS5_PREPARE_ON_WORKER), null otherwise.
++    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const Graphics::PreparedDrawPipeline* prepared = nullptr);
++    // The worker's share of the draw's pipeline lookup (Graphics::PrepareDrawPipeline); takes no GPU lock.
++    std::shared_ptr<const Graphics::PreparedDrawPipeline> PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) const;
+     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
+     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
+     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/Draw.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/Draw.cpp
+index 5e2cc826..d0310824 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/Draw.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/Draw.cpp
+@@ -589,13 +589,18 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
+     if (pipelined && !drawParameters.indirect && deferredLabels().labels.empty()) {
+         phaseTiming.Phase(DrawRowVectors);
+         auto writes = drawWriteRanges(graphics, stages);
++        // APS5_PREPARE_ON_WORKER: the worker's share of the committer's pipeline lookup, from the stages the commit draws with
++        // and before the closure takes them. The state it names is decode->state, which the closure keeps alive. A draw with a
++        // recipe does not look the pipeline up (the recipe holds it), so it is not prepared.
++        std::shared_ptr<const Graphics::PreparedDrawPipeline> prepared;
++        if (recipe == nullptr && Graphics::PrepareOnWorker()) prepared = localDevice->PrepareDraw(graphics, drawParameters, stages);
+         const auto commitQueue = submission.queue;
+         const auto commitPacket = t.packetOpcode;
+         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), compiledStages = std::move(compiledStages), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry)] {
++        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), compiledStages = std::move(compiledStages), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), prepared = std::move(prepared)] {
+             DrawPipeline::FollowEpoch(epoch);
+             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
+-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
++            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, prepared);
+         };
+         auto held = std::make_shared<decltype(commit)>(std::move(commit));
+         if (t.helper) {
+@@ -664,7 +669,7 @@ void Driver::runDrawTailOnHelper(DrawTail& tail, std::uint64_t seq, std::uint64_
+     DrawPipeline::CurrentSeq() = 0;
+ }
+ 
+-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey) {
++void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const std::shared_ptr<const Graphics::PreparedDrawPipeline>& prepared) {
+     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+     CountDriverDrawCommitted();
+@@ -683,7 +688,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
+         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+     }
+     std::shared_ptr<const DrawRecipe> built;
+-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
++    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, prepared.get());
+     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+ }
+ 
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp
+index 492b6deb..7ddeeb11 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp
+@@ -2579,13 +2579,17 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
+     Graphics::RunColorMetadataPass(graphicsContext(), pass);
+ }
+ 
+-void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
++std::shared_ptr<const Graphics::PreparedDrawPipeline> VulkanDevice::PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) const {
++    return Graphics::PrepareDrawPipeline(graphicsContext(), graphics, draw, shaders);
++}
++
++void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const Graphics::PreparedDrawPipeline* prepared) {
+     // Two stdout lines per draw cost ~1.3 ms per frame of the queue-0 worker (part of it under the
+     // GPU mutex); APS5_TRACE_DRAWS=1 restores them.
+     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
+     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
+     const auto context = graphicsContext();
+-    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe);
++    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe, prepared);
+     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
+ }
+ 
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/include/Draw.hpp b/core/libs/prx/libSceAgcDriver/Graphics/include/Draw.hpp
+index ff58c61c..cc6b17df 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/include/Draw.hpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/include/Draw.hpp
+@@ -7,15 +7,44 @@
+ #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+ #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
+ #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
++#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+ #include <memory>
+ #include <vector>
+ 
+ namespace AgcDriver::Graphics {
+ 
++// APS5_PREPARE_ON_WORKER: the worker's share of a recorded draw's resource and pipeline lookups, made before the committer
++// runs (PrepareDrawPipeline). The committer uses `contentKey` and `peeked` (Draw's resolveDrawResources) only when the
++// inputs DrawResourceKey reads are the ones this was made from: the device, the same State object (the render target
++// follows from it), the same compiled shaders, and the index range when the key keeps it. It uses `pipeline` (Draw) only
++// when, in addition, the template is the same object, the device and buffer pool match, the masked fragment outputs and
++// the vertex input layout are equal, and the draw is lean (GENERAL attachment layout). The pipeline key is a function of
++// exactly those.
++struct PreparedDrawPipeline {
++    VkDevice device = VK_NULL_HANDLE;
++    std::weak_ptr<BufferPool> pool;
++    const State* state = nullptr;
++    const CompiledShader* shaders = nullptr;
++    std::size_t shaderCount = 0;
++    std::uint64_t indexAddress = 0;
++    std::uint64_t indexBytes = 0;
++    ResourceCache::Key contentKey;
++    ResourceCache::Peeked peeked;
++    std::set<std::uint32_t> fragmentOutputs;
++    VertexInputLayout vertexInput;
++    std::shared_ptr<Pipeline> pipeline;  // null when the store did not hold the pipeline
++};
++// Whether the worker prepares (APS5_PREPARE_ON_WORKER=1; `verify` also makes the committer check each reuse, see Draw).
++bool PrepareOnWorker();
++// The worker's part: null when nothing can be prepared (a draw the committer would not look up in the template cache, or
++// no template yet, or an error the committer will raise itself). Takes no GPU lock and creates no Vulkan object; it only
++// reads the caches under their own mutexes, and leaves them as the committer's lookups would find them.
++std::shared_ptr<const PreparedDrawPipeline> PrepareDrawPipeline(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
++
+ // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
+ // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
+-// APS5_NO_DRAW_RECIPE=1).
+-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
++// APS5_NO_DRAW_RECIPE=1). `prepared`, when given, is the worker's PrepareDrawPipeline result for this draw.
++void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const PreparedDrawPipeline* prepared = nullptr);
+ std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
+ 
+ struct DrawInputCopy {
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/include/Pipeline.hpp b/core/libs/prx/libSceAgcDriver/Graphics/include/Pipeline.hpp
+index 19392761..cc9f619b 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/include/Pipeline.hpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/include/Pipeline.hpp
+@@ -82,6 +82,10 @@ private:
+ // only evicted once no recorded draw holds them. Debug aid: APS5_NO_PIPELINE_CACHE=1 builds one per
+ // draw as before.
+ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++// The entry CachedPipeline would return for this configuration, if the store already holds it: a hit (counted and moved
++// to the LRU front as CachedPipeline's is), else null with nothing built, counted or moved. Used by the worker's
++// preparation (APS5_PREPARE_ON_WORKER) so that it never creates Vulkan objects; the committer then builds a miss itself.
++std::shared_ptr<Pipeline> PeekCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout);
+ // Destroys the cached pipelines of a device; to be called before the device goes away. Without it,
+ // entries of a gone device are recognised by their buffer pool (made and reset with the device, so
+ // it tells device instances apart when the loader reuses a VkDevice handle) and forgotten unused.
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp b/core/libs/prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp
+index 00c9763b..5f89004f 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp
+@@ -531,7 +531,22 @@ private:
+ class ResourceCache {
+ public:
+     using Key = std::vector<std::uint32_t>;
++    using Entries = std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>;
++    // What Peek saw for a key: the entry's object (null when there is none), the cache's generation then, and the
++    // entry's LRU position. The object is kept alive by the holder.
++    struct Peeked {
++        std::shared_ptr<ShaderResources> object;
++        std::uint64_t generation = 0;
++        Entries::iterator position;
++    };
+     std::shared_ptr<ShaderResources> Find(const Key& key);
++    // The entry's object with none of Find's effects: no LRU move, no miss statistics. The draw path's worker-side
++    // preparation (APS5_PREPARE_ON_WORKER) asks for the template the committer may find later.
++    Peeked Peek(const Key& key);
++    // Find's LRU move for a Peek made earlier, without the lookup: true, and the entry is at the LRU front, when no
++    // insert, remove or clear happened since that Peek (the generation holds, so the position is still the entry's);
++    // false otherwise, with nothing moved. Find's result is then `peeked.object`.
++    bool TouchPeeked(const Peeked& peeked);
+     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
+     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
+     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).
+@@ -559,8 +574,10 @@ private:
+         }
+     };
+     mutable std::mutex mutex;
+-    std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
+-    std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
++    Entries entries;
++    std::unordered_map<Key, Entries::iterator, KeyHash> index;
++    // Bumped by every insert, remove and clear (Find and Touch only reorder the LRU): a Peeked position is valid while it holds.
++    std::uint64_t generation = 0;
+ };
+ 
+ // The process-wide cache the device and the draw path share (keys name the device; a device clears
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp b/core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp
+index 882c9bd4..aa2e2e0b 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp
+@@ -537,12 +537,17 @@ std::map<std::vector<std::uint64_t>, std::string>& validationFailures() {
+     return failures;
+ }
+ 
++std::map<std::vector<std::uint64_t>, std::set<std::uint32_t>>& fragmentOutputMemo() {
++    static std::map<std::vector<std::uint64_t>, std::set<std::uint32_t>> memo;
++    return memo;
++}
++
+ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit) {
+     memoized = false;
+     hit = false;
+     std::vector<std::uint64_t> key;
+     const bool keyed = ValidationKey(context, shaders, state, key);
+-    static std::map<std::vector<std::uint64_t>, std::set<std::uint32_t>> memo;
++    auto& memo = fragmentOutputMemo();
+     if (keyed) {
+         memoized = true;
+         std::lock_guard lock(validationMutex());
+@@ -572,6 +577,19 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
+     return outputs;
+ }
+ 
++// The memoized outputs only, for the worker's preparation: nothing is validated there, so a failure is recorded (and a
++// later draw rejected) exactly when the committer's own validation would have recorded it.
++bool PeekFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, std::set<std::uint32_t>& outputs) {
++    std::vector<std::uint64_t> key;
++    if (!ValidationKey(context, shaders, state, key)) return false;
++    std::lock_guard lock(validationMutex());
++    const auto& memo = fragmentOutputMemo();
++    const auto found = memo.find(key);
++    if (found == memo.end()) return false;
++    outputs = found->second;
++    return true;
++}
++
+ // The resource cache key of a recorded draw: a marker no compute key starts with (those begin with
+ // the stage), the device handle (the cache is process-wide and the driver replaces the headless
+ // device with the windowed one while workers may still use the old one: an entry's descriptor set
+@@ -1033,6 +1051,47 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
+     return resident;
+ }
+ 
++namespace {
++
++// APS5_PREPARE_ON_WORKER outcomes: the worker's (prepared, not eligible, ...) and the committer's (reused, ...). Atomics:
++// the worker and the committer, and the parallel helpers, all count.
++struct PrepareCounts {
++    std::atomic<std::uint64_t> prepared{0};
++    std::atomic<std::uint64_t> notEligible{0};
++    std::atomic<std::uint64_t> noOutputs{0};
++    std::atomic<std::uint64_t> noTemplate{0};
++    std::atomic<std::uint64_t> noPipeline{0};
++    std::atomic<std::uint64_t> failed{0};
++    std::atomic<std::uint64_t> reused{0};
++    std::atomic<std::uint64_t> verified{0};
++    std::atomic<std::uint64_t> notLean{0};
++    std::atomic<std::uint64_t> otherTemplate{0};
++    std::atomic<std::uint64_t> otherInputs{0};
++    std::atomic<std::uint64_t> keyReused{0};
++    std::atomic<std::uint64_t> keyVerified{0};
++    std::atomic<std::uint64_t> keyOtherInputs{0};
++    std::atomic<std::uint64_t> findReused{0};
++    std::atomic<std::uint64_t> findVerified{0};
++    std::atomic<std::uint64_t> findStale{0};
++};
++
++PrepareCounts& prepareCounts() {
++    static PrepareCounts counts;
++    return counts;
++}
++
++// 0: off (unset, empty or "0"); 1: prepare on the worker; 2 (`verify`): also check each reuse against the committer's own lookup.
++int prepareMode() {
++    static const int mode = [] {
++        const char* text = std::getenv("APS5_PREPARE_ON_WORKER");
++        if (text == nullptr || text[0] == '\0' || text[0] == '0') return 0;
++        return std::strcmp(text, "verify") == 0 ? 2 : 1;
++    }();
++    return mode;
++}
++
++}
++
+ // A draw's resources (resolveDrawResources): the resource-cache template a recordable draw's
+ // stages repeat, or a fresh build.
+ struct ResolvedResources {
+@@ -1044,7 +1103,7 @@ struct ResolvedResources {
+     const ShaderResources::BuildTiming* built = nullptr;
+ };
+ 
+-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
++ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const PreparedDrawPipeline* prepared) {
+     ResolvedResources resolved;
+     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
+     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
+@@ -1060,9 +1119,45 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
+     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->variantId != 0; });
+     if (resolved.cacheable) {
+-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
++        // APS5_PREPARE_ON_WORKER: the worker's key, when every input DrawResourceKey reads is the one it was made from: the
++        // device, the same State (its render target follows) and compiled shaders, and the index range when the key keeps it.
++        // The template is then looked up by the worker's position while the cache's generation holds (TouchPeeked), which
++        // moves it to the LRU front as Find does; otherwise Find.
++        auto& counts = prepareCounts();
++        const bool preparedKey = prepared != nullptr && prepared->device == context.device && prepared->state == &state && prepared->shaders == shaders.data() && prepared->shaderCount == shaders.size() && (trimKey || (prepared->indexAddress == draw.indexAddress && prepared->indexBytes == indexBytes));
++        if (preparedKey) {
++            resolved.contentKey = prepared->contentKey;
++            ++counts.keyReused;
++            if (prepareMode() == 2) {
++                const auto keyed = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
++                if (keyed != resolved.contentKey) {
++                    std::fprintf(stderr, "[prepare] APS5_PREPARE_ON_WORKER=verify: the prepared draw key differs from the committer's key (%zu words and %zu words)\n", resolved.contentKey.size(), keyed.size());
++                    std::abort();
++                }
++                ++counts.keyVerified;
++            }
++        } else {
++            if (prepared != nullptr) ++counts.keyOtherInputs;
++            resolved.contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
++        }
+         timer.part(SplitLookupKey);
+-        auto cached = SharedResourceCache().Find(resolved.contentKey);
++        std::shared_ptr<ShaderResources> cached;
++        if (preparedKey && SharedResourceCache().TouchPeeked(prepared->peeked)) {
++            cached = prepared->peeked.object;
++            ++counts.findReused;
++            if (prepareMode() == 2) {
++                // verify: the cache's own lookup must return the same template object, or the reuse is wrong.
++                const auto looked = SharedResourceCache().Find(resolved.contentKey);
++                if (looked != cached) {
++                    std::fprintf(stderr, "[prepare] APS5_PREPARE_ON_WORKER=verify: the prepared template %p differs from the cache's lookup %p (generation unchanged)\n", static_cast<const void*>(cached.get()), static_cast<const void*>(looked.get()));
++                    std::abort();
++                }
++                ++counts.findVerified;
++            }
++        } else {
++            if (preparedKey) ++counts.findStale;
++            cached = SharedResourceCache().Find(resolved.contentKey);
++        }
+         timer.part(SplitLookupFind);
+         if (cached) {
+             const bool valid = cached->Revalidate(shaders);
+@@ -1596,7 +1691,125 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
+     return std::nullopt;
+ }
+ 
+-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
++namespace {
++
++bool sameVertexInput(const VertexInputLayout& a, const VertexInputLayout& b) {
++    if (a.bindings.size() != b.bindings.size() || a.attributes.size() != b.attributes.size()) return false;
++    for (std::size_t i = 0; i < a.bindings.size(); ++i) {
++        const auto& x = a.bindings[i];
++        const auto& y = b.bindings[i];
++        if (x.binding != y.binding || x.stride != y.stride || x.inputRate != y.inputRate) return false;
++    }
++    for (std::size_t i = 0; i < a.attributes.size(); ++i) {
++        const auto& x = a.attributes[i];
++        const auto& y = b.attributes[i];
++        if (x.location != y.location || x.binding != y.binding || x.format != y.format || x.offset != y.offset) return false;
++    }
++    return true;
++}
++
++// Whether the committer may use the prepared pipeline for this draw: the draw is lean (the GENERAL layout), and every input
++// the pipeline key is made of is the one it was prepared from. The `State` is compared by identity: the commit closure hands
++// the same decode's state to both, which is immutable, so its masked copy follows from the fragment outputs compared here.
++// A mismatch is counted by its first cause.
++bool preparedApplies(const PreparedDrawPipeline& prepared, const Context& context, const State& state, std::span<const CompiledShader> shaders, const DrawInputs& inputs, const ShaderResources& resources, bool lean) {
++    auto& counts = prepareCounts();
++    if (!lean) {
++        ++counts.notLean;
++        return false;
++    }
++    // The worker found no pipeline in the store: the committer's lookup is the only one (counted on the worker).
++    if (prepared.pipeline == nullptr) return false;
++    if (prepared.peeked.object.get() != &resources) {
++        ++counts.otherTemplate;
++        return false;
++    }
++    const bool sameDevice = prepared.device == context.device && (context.bufferPool == nullptr || prepared.pool.lock() == context.bufferPool);
++    const bool same = sameDevice && prepared.state == &state && prepared.shaders == shaders.data() && prepared.shaderCount == shaders.size() && prepared.fragmentOutputs == inputs.fragmentOutputs && sameVertexInput(prepared.vertexInput, inputs.vertexInput);
++    if (!same) {
++        ++counts.otherInputs;
++        return false;
++    }
++    return true;
++}
++
++// The [prepare] line, every 10 s under APS5_PROFILE_DRAW (from the committer, where the reuse is decided).
++void reportPrepare() {
++    static const char* mode = std::getenv("APS5_PREPARE_ON_WORKER");
++    static std::mutex reportMutex;
++    static auto lastReport = std::chrono::steady_clock::now();
++    std::lock_guard lock(reportMutex);
++    const auto now = std::chrono::steady_clock::now();
++    if (now - lastReport < std::chrono::seconds(10)) return;
++    lastReport = now;
++    auto& counts = prepareCounts();
++    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
++    std::fprintf(stderr, "[prepare] (10 s, APS5_PREPARE_ON_WORKER=%s) worker: %llu prepared, %llu not eligible, %llu without validated outputs, %llu without a template, %llu without a pipeline, %llu failed; committer: draw key %llu reused (%llu verified, %llu other inputs), template find %llu reused (%llu verified, %llu stale generation), pipeline %llu reused (%llu verified), %llu not lean, %llu other template, %llu other inputs\n",
++                 mode != nullptr ? mode : "", take(counts.prepared), take(counts.notEligible), take(counts.noOutputs), take(counts.noTemplate), take(counts.noPipeline), take(counts.failed), take(counts.keyReused), take(counts.keyVerified), take(counts.keyOtherInputs), take(counts.findReused), take(counts.findVerified), take(counts.findStale), take(counts.reused), take(counts.verified), take(counts.notLean), take(counts.otherTemplate), take(counts.otherInputs));
++}
++
++}
++
++bool PrepareOnWorker() {
++    return prepareMode() != 0;
++}
++
++std::shared_ptr<const PreparedDrawPipeline> PrepareDrawPipeline(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
++    if (!PrepareOnWorker()) return nullptr;
++    auto& counts = prepareCounts();
++    // The same conditions under which resolveDrawResources looks the template up (cacheable, direct, with records): a draw
++    // the committer cannot look up is not prepared. Whether it is recordable (its resident targets) is for the committer to
++    // decide; a draw it does not record gets a fresh template, which fails the identity check there.
++    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
++    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
++    // The same key as resolveDrawResources (APS5_NO_DRAW_KEY_TRIM keeps the ranges in it).
++    static const bool keyRanges = std::getenv("APS5_NO_DRAW_KEY_TRIM") != nullptr;
++    const bool eligible = !draw.indirect && !shaders.empty() && draw.indexCount != 0 && draw.instanceCount != 0 && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->variantId != 0; });
++    if (!eligible) {
++        ++counts.notEligible;
++        return nullptr;
++    }
++    // Any error here is left for the committer, which raises it as it would have without the worker's attempt.
++    try {
++        const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
++        auto prepared = std::make_shared<PreparedDrawPipeline>();
++        // The resource key and the template under it: no validation is needed for these, so they are prepared whether or not
++        // the fragment outputs are memoized yet.
++        prepared->contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, keyRanges);
++        prepared->peeked = SharedResourceCache().Peek(prepared->contentKey);
++        if (prepared->peeked.object == nullptr) {
++            ++counts.noTemplate;
++            return nullptr;
++        }
++        prepared->device = context.device;
++        prepared->pool = context.bufferPool;
++        prepared->state = &state;
++        prepared->shaders = shaders.data();
++        prepared->shaderCount = shaders.size();
++        prepared->indexAddress = draw.indexAddress;
++        prepared->indexBytes = indexBytes;
++        // The pipeline lookup needs the committer's masked outputs, so it is prepared only when they are memoized.
++        std::set<std::uint32_t> fragmentOutputs;
++        if (!PeekFragmentOutputs(context, shaders, state, fragmentOutputs)) {
++            ++counts.noOutputs;
++        } else {
++            auto vertexInput = BuildVertexInputLayout(context, shaders.front().program->vertexAttributes);
++            auto masked = maskedState(state, fragmentOutputs);
++            const State& pipelineState = masked.has_value() ? *masked : state;
++            prepared->pipeline = PeekCachedPipeline(context, pipelineState, vertexInput, *prepared->peeked.object, shaders, VK_IMAGE_LAYOUT_GENERAL);
++            if (prepared->pipeline == nullptr) ++counts.noPipeline;
++            prepared->fragmentOutputs = std::move(fragmentOutputs);
++            prepared->vertexInput = std::move(vertexInput);
++        }
++        ++counts.prepared;
++        return prepared;
++    } catch (const std::exception&) {
++        ++counts.failed;
++        return nullptr;
++    }
++}
++
++void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const PreparedDrawPipeline* prepared) {
+     PerformanceTimer timing("Graphics.Draw");
+     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
+     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+@@ -1735,7 +1948,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
+     const bool recordDraws = RecordDraws();
+     auto* recorder = Recorder::Active();
+     const bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
+-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
++    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared);
+     auto& resources = resolved.resources;
+     const auto& contentKey = resolved.contentKey;
+     const bool cacheable = resolved.cacheable;
+@@ -1856,7 +2069,24 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
+     // The state is copied only when a mask must change.
+     auto masked = maskedState(state, inputs.fragmentOutputs);
+     const State& pipelineState = masked.has_value() ? *masked : state;
+-    auto pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    std::shared_ptr<Pipeline> pipeline;
++    // APS5_PREPARE_ON_WORKER: the worker's lookup, when every input matches (preparedApplies); the lookup as before otherwise.
++    if (prepared != nullptr && preparedApplies(*prepared, context, state, shaders, inputs, *resources, lean)) {
++        pipeline = prepared->pipeline;
++        ++prepareCounts().reused;
++        if (prepareMode() == 2) {
++            // verify: the committer's own lookup must return the same pipeline object, or the reuse is wrong.
++            const auto looked = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
++            if (looked != pipeline) {
++                std::fprintf(stderr, "[prepare] APS5_PREPARE_ON_WORKER=verify: the prepared pipeline %p differs from the committer's lookup %p (template %p, %zu shaders, %zu fragment outputs)\n", static_cast<const void*>(pipeline.get()), static_cast<const void*>(looked.get()), static_cast<const void*>(resources.get()), shaders.size(), inputs.fragmentOutputs.size());
++                std::abort();
++            }
++            ++prepareCounts().verified;
++        }
++    } else {
++        pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    }
++    if (profile) reportPrepare();
+     // Resident targets' views are stable while their storage image lives, so the framebuffer is
+     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
+     std::vector<std::shared_ptr<StorageTexture>> owners;
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/src/Pipeline.cpp b/core/libs/prx/libSceAgcDriver/Graphics/src/Pipeline.cpp
+index e381c63e..e68ebe94 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/Pipeline.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/Pipeline.cpp
+@@ -637,6 +637,22 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
+     return pipeline;
+ }
+ 
++std::shared_ptr<Pipeline> PeekCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
++    static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
++    if (disabled) return nullptr;
++    auto& store = Pipelines();
++    std::lock_guard lock(store.mutex);
++    const auto key = pipelineKey(context, state, vertexInput, resources, shaders, attachmentLayout);
++    if (key.empty()) return nullptr;
++    const auto found = store.index.find(hashKey(key));
++    // A different configuration with the same hash, or an entry of another device, is no hit: CachedPipeline on the
++    // committer decides those as before.
++    if (found == store.index.end() || found->second->key != key || !alive(*found->second, context)) return nullptr;
++    ++store.hits;
++    store.entries.splice(store.entries.end(), store.entries, found->second);
++    return found->second->pipeline;
++}
++
+ void ClearCachedPipelines(VkDevice device) {
+     auto& store = Pipelines();
+     std::lock_guard lock(store.mutex);
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp b/core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp
+index cd2dee9e..8713e8e7 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp
+@@ -2165,6 +2165,26 @@ std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
+     return found->second->second;
+ }
+ 
++ResourceCache::Peeked ResourceCache::Peek(const Key& key) {
++    std::lock_guard lock(mutex);
++    Peeked peeked;
++    peeked.generation = generation;
++    const auto found = index.find(key);
++    if (found != index.end()) {
++        peeked.object = found->second->second;
++        peeked.position = found->second;
++    }
++    return peeked;
++}
++
++bool ResourceCache::TouchPeeked(const Peeked& peeked) {
++    if (peeked.object == nullptr) return false;
++    std::lock_guard lock(mutex);
++    if (peeked.generation != generation) return false;
++    entries.splice(entries.begin(), entries, peeked.position);
++    return true;
++}
++
+ void ResourceCache::noteMiss(const Key& key) {
+     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+     if (!profile || key.size() < 5) return;
+@@ -2238,6 +2258,7 @@ void ResourceCache::noteMiss(const Key& key) {
+ 
+ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+     std::lock_guard lock(mutex);
++    ++generation;
+     if (const auto found = index.find(key); found != index.end()) {
+         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
+         entries.erase(found->second);
+@@ -2288,6 +2309,7 @@ std::uint64_t ResourceCache::Touches() {
+ 
+ void ResourceCache::Clear() {
+     std::lock_guard lock(mutex);
++    ++generation;
+     index.clear();
+     entries.clear();
+ }
+@@ -2300,6 +2322,7 @@ std::size_t ResourceCache::Size() const {
+ void ResourceCache::erase(const Key& key) {
+     const auto found = index.find(key);
+     if (found == index.end()) return;
++    ++generation;
+     entries.erase(found->second);
+     index.erase(found);
+ }

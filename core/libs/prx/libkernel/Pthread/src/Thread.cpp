@@ -403,6 +403,8 @@ static unsigned __stdcall StartNativeThread(void* opaque) {
                 throw std::runtime_error("Guest thread stack is not fully committed");
             cursor = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
         }
+        static const bool traceStacks = std::getenv("APS5_TRACE_MEMORY") != nullptr;
+        if (traceStacks) std::fprintf(stderr, "[thread] '%s' stack 0x%llx-0x%llx\n", self->name.c_str(), static_cast<unsigned long long>(low), static_cast<unsigned long long>(high));
         self->threadId = std::this_thread::get_id();
         CurrentGuestState().current = self;
         if (!self->name.empty()) {
@@ -484,7 +486,8 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
     GetSystemInfo(&system);
     if (p->stackSize < 16384 || p->stackSize > std::numeric_limits<unsigned>::max() - HOST_STACK_MARGIN - system.dwPageSize)
         throw std::runtime_error("scePthreadCreate: invalid Windows stack size");
-    const std::size_t nativeStack = (p->stackSize + HOST_STACK_MARGIN + system.dwPageSize - 1) / system.dwPageSize * system.dwPageSize;
+    constexpr std::size_t HostStackMinimum = std::size_t{4} << 20u;
+    const std::size_t nativeStack = (std::max(p->stackSize + HOST_STACK_MARGIN, HostStackMinimum) + system.dwPageSize - 1) / system.dwPageSize * system.dwPageSize;
     auto native = std::make_unique<NativeThreadArgs>(NativeThreadArgs{std::move(args), start.get_future(), {}});
     auto initialized = native->initialized.get_future();
     const auto handle = _beginthreadex(nullptr, static_cast<unsigned>(nativeStack), StartNativeThread, native.get(), 0, nullptr);

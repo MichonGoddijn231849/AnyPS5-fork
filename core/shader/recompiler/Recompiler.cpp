@@ -6,6 +6,7 @@
 #include <cstdio>
 #include "CacheKey.hpp"
 #include "CompiledVariant.hpp"
+#include "DeepStack.hpp"
 #include "VertexInputSpecialization.hpp"
 #include "FragmentOutputSpecialization.hpp"
 #include "SpirvBackend/SpirvSpecialization.hpp"
@@ -20,6 +21,7 @@
 #include <unordered_map>
 #include "ControlFlow/include/ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/include/ControlFlow/Structurizer.hpp"
+#include "ControlFlow/include/ControlFlow/SubroutineCalls.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "IntermediateRepresentation/include/IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/include/Optimization/BindingAllocator.hpp"
@@ -106,10 +108,24 @@ std::uint32_t DeviceMemoryLdsBytes(const RecompileRequest& request) {
 
 }
 
+namespace {
+
+bool CallsInlined(const RecompileRequest& request) {
+    return request.shader.stage == ShaderStage::Compute && SubroutineCallsEnabled();
+}
+
+RdnaProgram DecodeForRequest(const RecompileRequest& request, std::span<const std::uint32_t> code) {
+    auto decoded = RdnaInstructionDecoder{}.Decode(code);
+    if (CallsInlined(request)) InlineSubroutineCalls(decoded, request.shader.codeAddress, request.context.userData, request.context.userDataBaseRegister, request.context.memory, request.context.waveSize);
+    return decoded;
+}
+
+}
+
 struct PreparedControlFlow {
     PreparedControlFlow(const RecompileRequest& request, const SwappcInfo& swappcInfo)
         : stage(request.shader.stage), swappc(swappcInfo), code(request.shader.code.begin(), request.shader.code.end()),
-          decoded(RdnaInstructionDecoder{}.Decode(code)), cfg(GraphBuilder{}.Build(decoded, &swappc)) {
+          decoded(DecodeForRequest(request, code)), cfg(GraphBuilder{}.Build(decoded, &swappc)) {
         Structurizer{}.Structurize(cfg);
     }
 
@@ -133,7 +149,7 @@ std::shared_ptr<const PreparedControlFlow> ShaderPreparationContext::AcquireFron
     const auto inputInfo = RequestInputInfo(request);
     const SwappcInfo swappc{inputInfo.vertex != nullptr, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size())};
     static const bool reuse = std::getenv("APS5_NO_PERF_FRONTEND_PAIR") == nullptr;
-    if (reuse && frontend != nullptr && frontend->Matches(request, swappc)) {
+    if (reuse && !CallsInlined(request) && frontend != nullptr && frontend->Matches(request, swappc)) {
         return frontend;
     }
     auto prepared = std::make_shared<const PreparedControlFlow>(request, swappc);
@@ -405,7 +421,8 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     result.imageMetadataDword = bindings.layout.ImageMetadataDword();
     result.runtimeImageCount = bindings.layout.runtimeImageCount;
     for (std::uint32_t index = 0; index < program.Info().images.size(); ++index) {
-        if (program.Info().images[index].indirectRoot != ImageResource::NoIndirectImage) result.runtimeImageResources.push_back(index);
+        // A wide table root reads no runtime metadata (its entries have the native mode).
+        if (program.Info().images[index].indirectRoot != ImageResource::NoIndirectImage && !program.Info().images[index].wideTable) result.runtimeImageResources.push_back(index);
     }
     result.hostSubgroupSize = HostSubgroupSize(request);
     result.vertexOffsetSgpr = program.Info().vertexOffsetSgpr;
@@ -603,6 +620,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     key.push_back(exports.size());
     for (const auto mapping : exports) key.push_back(mapping);
+    key.push_back(snapshot.wideImages.empty() ? 0u : WideImageElements(snapshot.wideImages.size()));
     static std::shared_mutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>> plans;
     std::shared_ptr<PreparedBindingPlan> plan;
@@ -626,6 +644,29 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     return plan;
 }
 
+void countSpecialization(std::chrono::steady_clock::duration spent) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::atomic<std::uint64_t> builds{0};
+    static std::atomic<std::uint64_t> windowBuilds{0};
+    static std::atomic<std::uint64_t> nanoseconds{0};
+    static std::atomic<std::uint64_t> windowNanoseconds{0};
+    static std::atomic<std::uint64_t> longest{0};
+    static std::atomic<std::int64_t> lastReport{0};
+    const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(spent).count());
+    const auto total = builds.fetch_add(1, std::memory_order_relaxed) + 1;
+    windowBuilds.fetch_add(1, std::memory_order_relaxed);
+    nanoseconds.fetch_add(ns, std::memory_order_relaxed);
+    windowNanoseconds.fetch_add(ns, std::memory_order_relaxed);
+    auto previous = longest.load(std::memory_order_relaxed);
+    while (ns > previous && !longest.compare_exchange_weak(previous, ns, std::memory_order_relaxed)) {
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10 || !lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    std::fprintf(stderr, "[specialize] %llu modules built in the last 10 s (%.1f ms), %llu in total (%.1f ms), the longest %.1f ms\n", static_cast<unsigned long long>(windowBuilds.exchange(0, std::memory_order_relaxed)), windowNanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(total), nanoseconds.load(std::memory_order_relaxed) / 1e6, longest.load(std::memory_order_relaxed) / 1e6);
+}
+
 std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     struct ModuleKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
@@ -646,7 +687,9 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     }
     std::call_once(entry->ready, [&] {
         try {
+            const auto started = std::chrono::steady_clock::now();
             entry->module = buildSpecializedModule(artifact, classes, constants, target);
+            countSpecialization(std::chrono::steady_clock::now() - started);
         } catch (...) {
             entry->failure = std::current_exception();
         }
@@ -1073,22 +1116,27 @@ std::shared_ptr<const SourceHandle> ResolveSource(const RecompileRequest& reques
     return std::make_shared<const SourceHandle>(SourceHandle{getSource(request)});
 }
 
+// Called on the game's thread at registration, which may be a fiber with a small stack.
 std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& request) {
     return PrepareShader(request, nullptr);
 }
 
 std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& request, ShaderPreparationContext* preparation) {
-    return recompileReporting(request, [&]() -> std::shared_ptr<const SourceHandle> {
-        static_cast<void>(RequestInputInfo(request));
-        auto handle = std::make_shared<SourceHandle>();
-        handle->source = getSource(request, preparation);
-        RecompileCacheKey::BuildInterface(request, handle->staticKey);
-        handle->staticKey.push_back(HostSubgroupSize(request));
-        bool cacheHit = false;
-        std::lock_guard lock(handle->source->mutex);
-        handle->artifact = findOrCompileVariant(*handle->source, request, cacheHit, preparation);
-        return handle;
+    std::shared_ptr<const SourceHandle> prepared;
+    RunWithDeepStack([&] {
+        prepared = recompileReporting(request, [&]() -> std::shared_ptr<const SourceHandle> {
+            static_cast<void>(RequestInputInfo(request));
+            auto handle = std::make_shared<SourceHandle>();
+            handle->source = getSource(request, preparation);
+            RecompileCacheKey::BuildInterface(request, handle->staticKey);
+            handle->staticKey.push_back(HostSubgroupSize(request));
+            bool cacheHit = false;
+            std::lock_guard lock(handle->source->mutex);
+            handle->artifact = findOrCompileVariant(*handle->source, request, cacheHit, preparation);
+            return handle;
+        });
     });
+    return prepared;
 }
 
 bool MatchesPreparedShader(const RecompileRequest& request, const SourceHandle& handle) {
@@ -1110,7 +1158,8 @@ bool MatchesPreparedShader(const RecompileRequest& request, const SourceHandle& 
     if (layout.descriptorSet != handle.artifact->layout.descriptorSet || layout.firstBinding != handle.artifact->layout.firstBinding) return false;
     if (layout.pushConstantOffsetBytes % 4u != 0u || layout.pushConstantSizeBytes % 4u != 0u || layout.pushConstantOffsetBytes > NativePushConstantSize || layout.pushConstantSizeBytes > NativePushConstantSize - layout.pushConstantOffsetBytes) return false;
     const auto words = prepared.ShaderDataDwords();
-    const bool usesPush = prepared.runtimeImageCount == 0u && words != 0u && words <= layout.pushConstantSizeBytes / 4u;
+    // As BindingAllocator decides it: a program with a dispatch thread limit keeps its data out of the push constants.
+    const bool usesPush = prepared.runtimeImageCount == 0u && !prepared.dispatchThreadLimit && words != 0u && words <= layout.pushConstantSizeBytes / 4u;
     if (prepared.UsesPushData() != usesPush) return false;
     if (!std::ranges::equal(key, handle.staticKey) || handle.source->code.size() != request.shader.code.size()) return false;
     return handle.source->code.data() == request.shader.code.data() || std::ranges::equal(handle.source->code, request.shader.code);
@@ -1188,6 +1237,10 @@ RecompileResult Recompile(const RecompileRequest& request) {
 std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit) {
     if (memoHit != nullptr) *memoHit = false;
     return recompileReporting(request, [&] { return RecompileImpl(request, capture, memoHit); });
+}
+
+std::uint64_t NewVariantId() {
+    return nextVariantId();
 }
 
 }

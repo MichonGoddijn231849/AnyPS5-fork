@@ -29,6 +29,7 @@ std::uint32_t standardOffset(std::uint32_t x, std::uint32_t y, std::uint32_t ele
     }
 }
 
+// The bits above the first 4 KiB of a SW_64KB_S block (the texture detiler's standard64Extra).
 std::uint32_t standard64Extra(std::uint32_t x, std::uint32_t y, std::uint32_t elementBytes) {
     switch (elementBytes) {
         case 1u: return ((x << 7) & 0x2000u) ^ ((x << 8) & 0x8000u) ^ ((y << 6) & 0x1000u) ^ ((y << 7) & 0x4000u);
@@ -127,6 +128,7 @@ ColorTargetLayout::ColorTargetLayout(std::uint32_t width, std::uint32_t height, 
         }
         case ColorTileMode::Standard4KB:
         case ColorTileMode::Standard64KB: {
+            // SW_4KB_S / SW_64KB_S: the texture detiler's standard element order, wider than tall for odd log2(bpe).
             const auto log2Bytes = static_cast<std::uint32_t>(std::countr_zero(bytesPerElement));
             const bool block64KB = mode == ColorTileMode::Standard64KB;
             const auto log2Side = block64KB ? 8u : 6u;

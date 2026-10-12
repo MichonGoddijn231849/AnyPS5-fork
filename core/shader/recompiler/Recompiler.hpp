@@ -38,6 +38,8 @@ struct ShaderBinary {
     std::span<const std::uint32_t> code;
     std::uint64_t headerAddress;
     std::span<const std::byte> header;
+    // RecompileCacheKey::HashCode of `code` when the caller knows it (a registered shader's memo), else 0.
+    std::uint64_t codeHash = 0;
 };
 
 struct ShaderComputeStageInfo {
@@ -47,6 +49,7 @@ struct ShaderComputeStageInfo {
     bool tgSizeEnable;
     std::uint32_t threadIdComponentCount;
     std::array<std::uint32_t, 3> partialThreads;
+    // Per-lane private (scratch) memory in dwords when COMPUTE_PGM_RSRC2.SCRATCH_EN is set.
     std::uint32_t scratchDwords = 0;
 
     [[nodiscard]] bool PartialGroups() const {
@@ -140,6 +143,8 @@ struct ShaderPixelStageInfo {
     std::array<std::uint8_t, 8> targetExportMapping;
     std::array<ColorExportPacking, 8> targetExportPacking;
     bool dualSourceBlend;
+    std::uint8_t quadPixelMask = 0xf;
+    bool stencilExportEnable = false;
 };
 
 struct ShaderVertexBufferResource {
@@ -161,6 +166,7 @@ struct ShaderVertexStageInfo {
     std::uint32_t fetchAttribReg;
     std::uint32_t fetchBufferReg;
     bool fetchEmbedded;
+    std::uint32_t paClVsOutCntl = 0;
 };
 
 struct ShaderFloatMode {
@@ -332,7 +338,9 @@ enum class DescriptorRole {
     BdaPagetable,
     FaultBuffer,
     FlattenedSrt,
-    ShaderData
+    ShaderData,
+    // The device's wide bindless feedback buffer (see WideFeedback); no guest descriptor.
+    WideFeedback
 };
 
 struct DescriptorBinding {
@@ -526,6 +534,7 @@ struct GeometryStageLimits {
     std::uint32_t maxFragmentInputComponents;
 };
 
+[[nodiscard]] std::uint64_t NewVariantId();
 [[nodiscard]] RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
 
 }

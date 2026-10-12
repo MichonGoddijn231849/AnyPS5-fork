@@ -36,8 +36,12 @@ int APS5_VABI sceKernelPollSema(KernelSema sem, int need) {
 }
 
 int APS5_VABI sceKernelSignalSema(KernelSema sem, int count) {
- if (sem == nullptr || count <= 0) {
+ if (sem == nullptr) {
   APS5_INVALID_ARG_EX;
+ }
+ // Wolverine signals with a count of 0 and handles the error code.
+ if (count <= 0) {
+  return SCE_KERNEL_ERROR_EINVAL;
  }
 
  std::lock_guard<std::mutex> lock(sem->mutex);

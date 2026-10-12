@@ -3,9 +3,11 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -21,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -824,6 +827,8 @@ void DepthStencilTests() {
     queue.context[0x011] = 0x20000181;
     for (const auto offset : {0x012u, 0x014u}) queue.context[offset] = 0x100;
     for (const auto offset : {0x013u, 0x015u}) queue.context[offset] = 0x200;
+    queue.context[0x005] = 0x300;
+    queue.context[0x01e] = 0x1;
     queue.context[0x10b] = 0x00050050;
     queue.context[0x10c] = 0x01ffff01;
     queue.context[0x10d] = 0x01000001;
@@ -837,10 +842,40 @@ void DepthStencilTests() {
     queue.context[0x1b4] = 2;
     const auto rejection = AgcDriver::Graphics::DrawRejection(queue, false);
     Require(rejection.empty(), "precheck rejected a stencil draw with a surface: " + rejection);
-    Require(state.depth && state.depth->address == 0x10000 && state.depth->stencilAddress == 0x20000 && state.depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT && state.depth->clearStencil == 7, "depth surface decode changed");
+    Require(state.depth && state.depth->address == 0x10000 && state.depth->stencilAddress == 0x20000 && state.depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT && state.depth->clearStencil == 7 && state.depth->htileAddress == 0x10000030000ull && !state.depth->htileStencil, "depth surface decode changed");
+    {
+        queue.context[0x011] &= ~(1u << 29u);
+        const auto stencilTiled = AgcDriver::Graphics::DecodeState(queue);
+        Require(stencilTiled.depth && stencilTiled.depth->htileStencil, "HTILE holds the stencil state without TILE_STENCIL_DISABLE");
+        queue.context[0x011] |= 1u << 29u;
+        queue.context[0x011] &= ~1u;
+        const auto noStencil = AgcDriver::Graphics::DecodeState(queue);
+        Require(noStencil.depth && noStencil.depth->stencilAddress == 0 && !noStencil.stencilTest, "a stencil test without a stencil plane must pass without a stencil aspect");
+        queue.context[0x011] |= 1u;
+        queue.context[0x010] &= ~(1u << 29u);
+        const auto untiled = AgcDriver::Graphics::DecodeState(queue);
+        Require(untiled.depth && untiled.depth->htileAddress == 0, "HTILE must be ignored without TILE_SURFACE_ENABLE");
+        queue.context[0x010] |= 1u << 29u;
+        using AgcDriver::Graphics::HtileFillClears;
+        using AgcDriver::Graphics::HtileFillCovers;
+        constexpr VkImageAspectFlags both = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        Require(HtileFillClears(0x0003fff0u, false) == VK_IMAGE_ASPECT_DEPTH_BIT, "a depth-only HTILE fill with ZMask 0 clears the depth");
+        Require(HtileFillClears(0x000000f0u, true) == both, "a depth and stencil fast clear (ZMask 0, SMem 0) clears both aspects");
+        Require(HtileFillClears(0x000003f0u, true) == VK_IMAGE_ASPECT_DEPTH_BIT, "SMem 3 leaves the stencil uncleared");
+        Require(HtileFillClears(0xfffff0ffu, true) == VK_IMAGE_ASPECT_STENCIL_BIT, "ZMask 0xf with SMem 0 clears only the stencil");
+        Require(HtileFillClears(0xffffffffu, true) == 0 && HtileFillClears(0xffffffffu, false) == 0, "an expanded fill clears nothing");
+        const VkExtent2D extent{16, 8};
+        Require(HtileFillCovers(0x1000, extent, 0x1000, 8) && HtileFillCovers(0x1000, extent, 0xff0, 0x20), "a fill over every HTILE word covers the surface");
+        Require(!HtileFillCovers(0x1000, extent, 0x1000, 4) && !HtileFillCovers(0x1000, extent, 0x1004, 8) && !HtileFillCovers(0, extent, 0, 64), "a partial fill, one starting past the HTILE base, or no HTILE covers nothing");
+    }
     Require(state.renderExtent.width == 4 && state.renderExtent.height == 2, "render extent ignores the depth surface");
     Require(!state.depthTest && !state.depthWrite && state.stencilTest, "depth/stencil enables changed");
-    Require(state.depth->htileAddress == 0, "an HTILE surface without DB_HTILE_DATA_BASE decoded an HTILE address");
+    {
+        auto withoutBase = queue;
+        withoutBase.context.erase(0x005);
+        withoutBase.context.erase(0x01e);
+        Require(AgcDriver::Graphics::DecodeState(withoutBase).depth->htileAddress == 0, "an HTILE surface without DB_HTILE_DATA_BASE decoded an HTILE address");
+    }
     queue.context[0x005] = 0x300;
     queue.context[0x01e] = 0x01;
     log.clear();
@@ -877,6 +912,22 @@ void DepthStencilTests() {
     queue.context[0x200] = 0x00700711;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "stencil add/subtract");
     queue.context[0x10b] = 0;
+    // APS5_DEPTH_CLEAR_DRAWS decodes DB_RENDER_CONTROL's clear bits (Wolverine's 1, 2 and 3) into the state; copies and
+    // the rest stay refused.
+    const char* clearDraws = std::getenv("APS5_DEPTH_CLEAR_DRAWS");
+    if (clearDraws != nullptr && clearDraws[0] != '\0' && clearDraws[0] != '0') {
+        queue.context[0x00b] = std::bit_cast<std::uint32_t>(0.75f);
+        for (const std::uint32_t control : {1u, 2u, 3u}) {
+            queue.context[0x000] = control;
+            const auto clearing = AgcDriver::Graphics::DecodeState(queue);
+            Require(clearing.depthClearDraw == ((control & 1u) != 0) && clearing.stencilClearDraw == ((control & 2u) != 0), "DB_RENDER_CONTROL clear bits decoded wrongly");
+            Require(!clearing.depthClearDraw || (clearing.depthWrite && clearing.depth->clearDepth == 0.75f), "a depth clear draw does not write the clear value");
+            Require(!clearing.stencilClearDraw || (clearing.stencilTest && clearing.stencilFront.passOp == VK_STENCIL_OP_REPLACE && clearing.stencilFront.reference == 7), "a stencil clear draw does not replace with the clear value");
+        }
+        queue.context[0x000] = 4;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "DB_RENDER_CONTROL");
+        queue.context[0x00b] = 0;
+    }
     queue.context[0x000] = 1;
     queue.context[0x00b] = std::bit_cast<std::uint32_t>(0.25f);
     state = AgcDriver::Graphics::DecodeState(queue);
@@ -1392,6 +1443,86 @@ void cmaskTests() {
     cmaskMemory.fill(0);
     expectFailure([&] { AgcDriver::Graphics::RunColorMetadataPass(context, *pass); }, "DCC color target");
     Require(texels(0x5a5a5a5au), "a refused pass changed the texels of a DCC target");
+}
+
+void clipDistanceTests() {
+    auto queue = makeState();
+    queue.context[0x207] = 0x0040000f;
+    static_cast<void>(AgcDriver::Graphics::DecodeState(queue));
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "four clip distances were rejected by the precheck");
+    queue.context[0x207] = 0x004001ff;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "more than eight clip and cull distances");
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("more than eight") != std::string::npos, "nine clip distances passed the precheck");
+}
+
+void quadPixelMaskTests() {
+    auto queue = makeState();
+    queue.context[0x30e] = 0xffff0000u;
+    queue.context[0x30f] = 0u;
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    static_cast<void>(AgcDriver::Graphics::DecodeState(queue));
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "a single-sample quad pixel mask was refused by the precheck");
+    Require(AgcDriver::Graphics::DecodePixelStageInfo(queue.context, {}).quadPixelMask == 0x2u, "PA_SC_AA_MASK did not decode to the covered quad pixel");
+    queue = makeState();
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    Require(AgcDriver::Graphics::DecodePixelStageInfo(queue.context, {}).quadPixelMask == 0xfu, "full sample masks did not cover the whole quad");
+}
+
+void multisampleTests() {
+    using AgcDriver::Graphics::ColorMetadataPass;
+    using AgcDriver::Graphics::DecodeColorMetadataPass;
+    using AgcDriver::Graphics::DecodeState;
+    const auto multisampled = [] {
+        auto queue = makeState();
+        queue.context[0x2f8] = 0x00100001;
+        queue.context[0x292] = 3;
+        for (std::uint32_t pixel = 0; pixel < 4; ++pixel) queue.context[0x2fe + pixel * 4u] = 0xcc44;
+        queue.context[0x31d] = 0x9000;
+        queue.context[0x1b3] = 2;
+        queue.context[0x1b4] = 2;
+        return queue;
+    };
+    auto queue = multisampled();
+    auto state = DecodeState(queue);
+    Require(state.samples == 2 && state.colors.size() == 1 && state.colors[0].samples == 2 && state.colors[0].cmaskAddress == 0, "2x multisampling did not decode");
+    const auto rejection = AgcDriver::Graphics::DrawRejection(queue, false);
+    Require(rejection.empty(), "the precheck refused 2x multisampling: " + rejection);
+    queue.context[0x302] = 0x44cc;
+    expectFailure([&] { DecodeState(queue); }, "nonstandard sample locations");
+    queue = multisampled();
+    queue.context[0x31d] = 0x1000;
+    expectFailure([&] { DecodeState(queue); }, "fewer fragments than samples");
+    queue.context[0x31d] = 0;
+    expectFailure([&] { DecodeState(queue); }, "sample count differs");
+    queue = multisampled();
+    queue.context[0x292] = 2;
+    expectFailure([&] { DecodeState(queue); }, "without MSAA_ENABLE");
+    queue = multisampled();
+    queue.context[0x2f8] |= 0x10;
+    expectFailure([&] { DecodeState(queue); }, "coverage conversion");
+    queue = multisampled();
+    queue.context[0x31c] |= 0x6000;
+    queue.context[0x31f] = 0x1234;
+    Require(DecodeState(queue).colors[0].cmaskAddress == 0x123400, "the CMASK address of a multisampled target did not decode");
+    queue = makeState();
+    queue.context[0x31c] |= 0x4000;
+    expectFailure([&] { DecodeState(queue); }, "color compression");
+
+    queue = multisampled();
+    queue.context[0x0] = 0;
+    queue.context[0x202] = 0xcc0030;
+    for (const auto offset : {0x318u, 0x31bu, 0x31cu, 0x390u}) queue.context[offset + (offset >= 0x390u ? 1u : 0xfu)] = queue.context[offset];
+    queue.context[0x32c] = 0;
+    queue.context[0x3b1] = queue.context[0x3b0];
+    queue.context[0x3b9] = queue.context[0x3b8];
+    auto pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::Resolve && pass->source.has_value() && pass->source->samples == 2 && pass->targets.size() == 1 && pass->targets[0].samples == 1, "a CB resolve of a multisampled target did not decode");
+    queue.context[0x32b] = queue.context[0x31c] ^ (1u << 8u);
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "different formats or extents");
 }
 
 void uint8x4TargetTests() {
@@ -1972,10 +2103,12 @@ void descriptorSnapshotTests() {
             ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
             const auto original = findWrite(0).buffers;
             std::vector<ShaderResources::MovedBuffer> moved;
+            std::array<std::vector<std::uint32_t>, 2> movedWords;
             for (std::size_t index = 0; index < 2; ++index) {
                 if ((selected & (1u << index)) == 0) continue;
                 const std::size_t bytes = index == 0 ? 24 : 12;
-                moved.push_back({index, 0, bytes, std::vector<std::uint32_t>(bytes / 4, static_cast<std::uint32_t>(0x12340000u + index))});
+                movedWords[index].assign(bytes / 4, static_cast<std::uint32_t>(0x12340000u + index));
+                moved.push_back({index, 0, bytes, movedWords[index]});
             }
             mock.writes.clear();
             const auto snapshots = resources.PrepareDrawBindings(recorder, moved);
@@ -1991,8 +2124,8 @@ void descriptorSnapshotTests() {
                     Require(descriptor.buffer == original[index].buffer && descriptor.offset == original[index].offset && descriptor.range == original[index].range, "snapshot update changed an untouched buffer descriptor");
                 } else {
                     const auto& item = snapshots->snapshots[snapshot];
-                    Require(descriptor.buffer == item.buffer->Handle() && descriptor.offset == 0 && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
-                    Require(sameBytes(bufferBytes(descriptor.buffer), moved[snapshot].words.data(), moved[snapshot].size), "snapshot descriptor lost its buffer data");
+                    Require(descriptor.buffer == item.buffer->Handle() && descriptor.offset == item.offset && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
+                    Require(sameBytes(bufferBytes(descriptor.buffer).subspan(static_cast<std::size_t>(descriptor.offset)), moved[snapshot].words.data(), moved[snapshot].size), "snapshot descriptor lost its buffer data");
                     ++snapshot;
                 }
             }
@@ -2362,6 +2495,7 @@ struct ModuleShape {
     bool layer = false;
     bool fragDepth = false;
     std::uint32_t sampleMaskLength = 0;
+    std::uint32_t clipDistanceLength = 0;
     std::uint32_t floatControlsWidth = 0;
 };
 
@@ -2462,6 +2596,18 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
         emit(annotations, spv::OpDecorate, {variable, spv::DecorationBuiltIn, spv::BuiltInSampleMask});
         extraInterface.push_back(variable);
     }
+    if (shape.clipDistanceLength != 0) {
+        const auto length = id();
+        const auto array = id();
+        const auto pointer = id();
+        const auto variable = id();
+        emit(declarations, spv::OpConstant, {uintType, length, shape.clipDistanceLength});
+        emit(declarations, spv::OpTypeArray, {array, floatType, length});
+        emit(declarations, spv::OpTypePointer, {pointer, spv::StorageClassOutput, array});
+        emit(declarations, spv::OpVariable, {pointer, variable, spv::StorageClassOutput});
+        emit(annotations, spv::OpDecorate, {variable, spv::DecorationBuiltIn, spv::BuiltInClipDistance});
+        extraInterface.push_back(variable);
+    }
     if (shape.perVertex) {
         const auto length = id();
         const auto array = id();
@@ -2531,6 +2677,7 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
     emit(words, spv::OpCapability, {spv::CapabilityShader});
     if (shape.sampleId) emit(words, spv::OpCapability, {spv::CapabilitySampleRateShading});
     if (shape.layer) emit(words, spv::OpCapability, {spv::CapabilityGeometry});
+    if (shape.clipDistanceLength != 0) emit(words, spv::OpCapability, {spv::CapabilityClipDistance});
     if (shape.barycentric) {
         emit(words, spv::OpCapability, {spv::CapabilityFragmentBarycentricKHR});
         const std::string extension = "SPV_KHR_fragment_shader_barycentric";
@@ -2645,6 +2792,11 @@ void barycentricEmulationTests() {
     target.supportedCapabilities = capabilities;
     const GeometryStageLimits limits{64u, 128u, 256u, 1024u, 128u};
     auto geometry = BuildBarycentricGeometryShader(vertex, fragment, target, limits);
+    Require(BuildBarycentricGeometryShader(vertex, fragment, target, limits).spirv == geometry.spirv, "a second build of the same barycentric geometry stage differs");
+    auto otherTarget = target;
+    otherTarget.vulkanVersion = VK_API_VERSION_1_2;
+    otherTarget.spirvVersion = 0x00010500u;
+    Require(BuildBarycentricGeometryShader(vertex, fragment, otherTarget, limits).spirv != geometry.spirv, "the barycentric geometry memo answered another SPIR-V version");
     const std::array<CompiledShader, 3> shaders{{{ShaderStage::Vertex, &vertex, 0}, {ShaderStage::Geometry, &geometry, 0}, {ShaderStage::Fragment, &fragment, 0}}};
     const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     auto state = DecodeState(makeState());
@@ -2812,6 +2964,52 @@ std::set<std::uint32_t> depthModes(const ShaderRecompiler::RecompileRequest& req
         if (mode == spv::ExecutionModeDepthReplacing || mode == spv::ExecutionModeDepthGreater || mode == spv::ExecutionModeDepthLess || mode == spv::ExecutionModeDepthUnchanged) modes.insert(mode);
     }
     return modes;
+}
+
+void stencilExportTests() {
+    static constexpr std::array<std::uint32_t, 3> StencilExportCode{0xf8001883u, 0x302u, 0xbf810000u};
+    static constexpr std::array<std::uint32_t, 1> StencilCapability{spv::CapabilityStencilExportEXT};
+    static constexpr std::array<std::string_view, 1> StencilExtension{"SPV_EXT_shader_stencil_export"};
+    const auto request = [](std::uint32_t shaderControl, bool capable) {
+        auto value = depthExportRequest(shaderControl);
+        value.shader.code = StencilExportCode;
+        if (capable) {
+            value.target.supportedCapabilities = StencilCapability;
+            value.target.supportedExtensions = StencilExtension;
+        }
+        return value;
+    };
+    const auto stencilRequest = request(0x0023u, true);
+    Require(stencilRequest.context.pixel->stencilExportEnable && stencilRequest.context.pixel->depthExportEnable && !stencilRequest.context.pixel->earlyZ, "DB_SHADER_CONTROL 0x23 did not decode as depth and stencil export");
+    const auto inspect = [](const ShaderRecompiler::RecompileRequest& value) {
+        const auto result = ShaderRecompiler::Recompile(value);
+        const auto& words = result.spirv.Words();
+        bool capability = false, mode = false, builtIn = false;
+        for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {
+            const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+            if (op == spv::OpCapability && words[at + 1] == spv::CapabilityStencilExportEXT) capability = true;
+            if (op == spv::OpExecutionMode && words[at + 2] == spv::ExecutionModeStencilRefReplacingEXT) mode = true;
+            if (op == spv::OpDecorate && words[at + 2] == spv::DecorationBuiltIn && words[at + 3] == spv::BuiltInFragStencilRefEXT) builtIn = true;
+        }
+        return std::array{capability, mode, builtIn};
+    };
+    Require(inspect(stencilRequest) == std::array{true, true, true}, "a stencil export did not declare FragStencilRefEXT with StencilRefReplacingEXT");
+    Require(inspect(request(0x0021u, true)) == std::array{false, false, false}, "a depth-only export declared a stencil export");
+    expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(request(0x0023u, false))); }, "VK_EXT_shader_stencil_export");
+    const ShaderRecompiler::RequestSerializer serializer;
+    const auto replayed = serializer.Deserialize(serializer.Serialize(stencilRequest));
+    Require(replayed.request.context.pixel->stencilExportEnable, "the stencil export flag was lost in serialization");
+    std::vector<std::uint64_t> stencilKey, depthKey;
+    ShaderRecompiler::RecompileCacheKey::Build(stencilRequest, stencilKey);
+    ShaderRecompiler::RecompileCacheKey::Build(request(0x0021u, true), depthKey);
+    Require(stencilKey != depthKey, "the recompile cache key ignores STENCIL_TEST_VAL_EXPORT_ENABLE");
+    auto queue = depthExportQueue(0x0023u);
+    queue.context[0x1c4] = 2u;
+    const bool allowed = std::getenv("APS5_STENCIL_EXPORT") != nullptr;
+    if (allowed) static_cast<void>(AgcDriver::Graphics::DecodeState(queue));
+    else expectFailure([&] { static_cast<void>(AgcDriver::Graphics::DecodeState(queue)); }, "depth export, shader coverage or ordered fragment execution");
+    queue.context[0x1c4] = 1u;
+    expectFailure([&] { static_cast<void>(AgcDriver::Graphics::DecodeState(queue)); }, "depth export, shader coverage or ordered fragment execution");
 }
 
 void conservativeZExportTests() {
@@ -3478,6 +3676,11 @@ void validationTests() {
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, true, false); }, "unsupported device capability 35");
         pixel.spirv = makeModule({.fragment = true, .sampleMaskLength = 2});
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported fragment built-in");
+        pixel.spirv = makeModule({.fragment = true});
+        vertex.spirv = makeModule({.parameterOutput = true, .clipDistanceLength = 4});
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false);
+        vertex.spirv = makeModule({.parameterOutput = true, .clipDistanceLength = 9});
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "clip or cull distance");
         vertex.spirv = makeModule({.parameterOutput = true, .sampleId = true});
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported device capability 35");
         vertex.spirv = makeModule({.parameterOutput = true});
@@ -3904,6 +4107,66 @@ void vertexZeroFillMergeTests() {
     Require(solo.size() == 1 && solo[0] == 1, "a fetch past the records is copied alone");
 }
 
+void pipelineCacheSaveScheduleTests() {
+    using AgcDriver::Graphics::PipelineCacheSaveSchedule;
+    using Clock = PipelineCacheSaveSchedule::Clock;
+    struct Run {
+        std::vector<int> saveSeconds;
+        std::size_t bytes;
+        std::size_t savedBytes;
+    };
+    const auto simulate = [](int seconds, const auto& createdAt, std::size_t initialBytes) {
+        constexpr std::size_t mib = std::size_t{1} << 20u;
+        PipelineCacheSaveSchedule::Settings settings;
+        settings.minSpacing = std::chrono::seconds(AgcDriver::Graphics::PipelineCache::SaveIntervalSeconds);
+        const Clock::time_point start{};
+        PipelineCacheSaveSchedule schedule(settings, initialBytes, start);
+        Run run{{}, initialBytes, initialBytes};
+        std::uint64_t creations = 0;
+        Clock::time_point lastCreation{};
+        for (int tenth = 0; tenth < seconds * 10; ++tenth) {
+            const auto now = start + std::chrono::milliseconds(100 * tenth);
+            if (createdAt(tenth)) {
+                ++creations;
+                run.bytes += mib;
+                lastCreation = now;
+            }
+            if (tenth == 0 || tenth % 10 != 0) continue;
+            if (schedule.Tick(now, creations, lastCreation, [&] { return run.bytes; }, [&](std::size_t& saved) {
+                saved = run.bytes;
+                return true;
+            })) {
+                run.saveSeconds.push_back(tenth / 10);
+                run.savedBytes = run.bytes;
+            }
+        }
+        return std::pair{run, schedule};
+    };
+    {
+        const auto [run, schedule] = simulate(300, [](int tenth) { return tenth < 1200 && tenth % 2 == 0; }, 0);
+        Require(run.saveSeconds == std::vector<int>({60, 120}), "a two-minute compile burst was not saved every minute while it ran");
+        Require(run.savedBytes == run.bytes && !schedule.WorthAtTeardown(run.bytes), "an unchanged cache would be saved again at teardown");
+    }
+    {
+        const auto [run, schedule] = simulate(120, [](int tenth) { return tenth < 100 || (tenth >= 300 && tenth < 400); }, 64u << 20u);
+        Require(run.saveSeconds == std::vector<int>{60}, "two bursts before the first minute were not saved together once the minute had passed");
+    }
+    {
+        const auto [run, schedule] = simulate(601, [](int tenth) { return tenth % 5 == 0; }, 0);
+        Require(run.saveSeconds == std::vector<int>({60, 120, 180, 240, 300, 360, 420, 480, 540, 600}), "a compile burst that never goes quiet was not saved every minute");
+    }
+    {
+        const auto [run, schedule] = simulate(110, [](int tenth) { return tenth == 10 || tenth == 20 || tenth == 30 || tenth == 1000; }, 100u << 20u);
+        Require(run.saveSeconds == std::vector<int>{60}, "a cache that grew by 3 MiB was not saved at the minute");
+        Require(schedule.WorthAtTeardown(run.bytes), "teardown does not save a cache that grew since the last save");
+        Require(!schedule.WorthAtTeardown(0), "teardown saves an empty cache");
+    }
+    {
+        const auto [run, schedule] = simulate(600, [](int) { return false; }, 100u << 20u);
+        Require(run.saveSeconds.empty() && !schedule.WorthAtTeardown(run.bytes), "a cache with no new pipelines was saved");
+    }
+}
+
 void parallelCompareTests() {
     using AgcDriver::Graphics::CompareSpan;
     using AgcDriver::Graphics::CompareSpansFrom;
@@ -3991,6 +4254,7 @@ int main() {
         unorm10_11_11TargetTests();
         DepthBoundsBiasTests();
         conservativeZExportTests();
+        stencilExportTests();
         orderedPixelShaderTests();
         ProvokingVertexTests();
         ProvokingVertexRenderPassTests();
@@ -4001,6 +4265,9 @@ int main() {
         ReversedComponentOrderTests();
         DualSourceBlendTests();
         metadataPassTests();
+        clipDistanceTests();
+        quadPixelMaskTests();
+        multisampleTests();
         cmaskTests();
         uint16ExportTests();
         uint8x4TargetTests();
@@ -4031,6 +4298,7 @@ int main() {
         vertexZeroFillTests();
         vertexZeroFillMergeTests();
         parallelCompareTests();
+        pipelineCacheSaveScheduleTests();
         pixelParameterSlotTests();
         rectListTests();
         floatControlsModeTests();

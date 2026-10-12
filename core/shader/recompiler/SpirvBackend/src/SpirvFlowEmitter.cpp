@@ -225,6 +225,12 @@ void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& progr
             static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
             if (debug) std::fprintf(stderr, "[spirv] block %u branches on %%%u = %s (kind %d)\n", static_cast<unsigned>(info.id), condition, std::string(IrOpcodeName(info.condition->Resolve()->Opcode())).c_str(), static_cast<int>(info.terminator.condition));
             emitMerge();
+            if (ctx.Label(trueBlock) == ctx.Label(falseBlock)) {
+                const bool selectionMerge = !term.loopHeader && term.mergeBlock != InvalidControlFlowId && TargetBlock(program, term.mergeBlock) != nullptr;
+                if (selectionMerge) state.module.AddFunction(spv::OpSwitch, ConstantU32(state, 0u), ctx.Label(trueBlock));
+                else state.module.AddFunction(spv::OpBranch, ctx.Label(trueBlock));
+                return;
+            }
             state.module.AddFunction(spv::OpBranchConditional, condition, ctx.Label(trueBlock), ctx.Label(falseBlock));
             return;
         }
