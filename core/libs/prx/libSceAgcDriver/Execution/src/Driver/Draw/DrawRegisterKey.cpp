@@ -33,7 +33,7 @@ const auto& registerMasks() {
 
 }
 
-std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental) {
+std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental, std::uint64_t* shapeKey) {
     const auto& masks = registerMasks();
     const auto fingerprint = [&](const Registers& registers, Graphics::RegisterBank bank) {
         const auto& mask = masks[static_cast<std::size_t>(bank)];
@@ -42,6 +42,7 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
     auto shape = (0xcbf29ce484222325ull ^ fingerprint(queue.context, Graphics::RegisterBank::Context)) * 0x100000001b3ull;
     shape = (shape ^ fingerprint(queue.shader, Graphics::RegisterBank::Shader)) * 0x100000001b3ull;
     shape = (shape ^ fingerprint(queue.userConfig, Graphics::RegisterBank::UserConfig)) * 0x100000001b3ull;
+    if (shapeKey != nullptr) *shapeKey = shape;
     auto exact = shape;
     const auto words = [&](std::uint32_t base, std::uint32_t count) {
         for (auto it = queue.shader.lower_bound(base); it != queue.shader.end() && it->first < base + count; ++it) {
@@ -60,14 +61,17 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
 }
 
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
     static const bool verify = std::getenv("APS5_VERIFY_REGISTER_KEYS") != nullptr;
-    auto key = RegisterStateKey(queue, allUserWords);
+    std::uint64_t shapeKey = 0;
+    auto key = RegisterStateKey(queue, allUserWords, true, &shapeKey);
     if (verify && key != RegisterStateKey(queue, allUserWords, false)) throw std::runtime_error("incremental register fingerprint disagrees with full state");
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
         key *= 0x100000001b3ull;
+        shapeKey ^= value;
+        shapeKey *= 0x100000001b3ull;
     };
     mix(deviceSerial);
     for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
@@ -87,6 +91,7 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
         mix(address - it->first);
     }
+    if (shape != nullptr) *shape = shapeKey;
     return key;
 }
 
